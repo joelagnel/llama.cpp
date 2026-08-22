@@ -297,6 +297,12 @@ public:
         return seq[i].count();
     }
 
+    bool seq_is_same(uint32_t i, uint32_t j) const {
+        assert(i < pos.size());
+        assert(j < pos.size());
+        return seq[i] == seq[j];
+    }
+
     // check if the cell contains seq_id
     bool seq_has(uint32_t i, llama_seq_id seq_id) const {
         assert(i < pos.size());

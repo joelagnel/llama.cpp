@@ -54,6 +54,10 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    const llama_memory_churn_data & get_churn() const { return churn; }
+    uint64_t membership_count() const;
+    void record_apply_churn(uint64_t used_before, uint64_t memberships_before);
+
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
     // find a contiguous slot of memory cells and emplace the ubatch there
@@ -117,6 +121,8 @@ private:
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+
+    llama_memory_churn_data churn;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

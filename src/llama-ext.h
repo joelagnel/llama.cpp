@@ -6,8 +6,11 @@
 
 #include "llama.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
+#include <string>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -89,6 +92,101 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+// Physical micro-batches actually submitted to the compute graph. These are
+// distinct from the logical llama_decode() batch supplied by the caller.
+// Histogram buckets are cumulative and use the bounds returned by
+// llama_ubatch_histogram_bounds().
+constexpr size_t LLAMA_UBATCH_HISTOGRAM_BUCKET_COUNT = 14;
+
+struct llama_ubatch_stats {
+    uint64_t attempted = 0;
+    uint64_t successful = 0;
+    uint64_t tokens = 0;
+    uint64_t sequence_tokens = 0;
+    uint64_t sequences = 0;
+    uint64_t unique_sequences = 0;
+    uint64_t max_tokens = 0;
+    std::array<uint64_t, LLAMA_UBATCH_HISTOGRAM_BUCKET_COUNT> token_buckets {};
+};
+
+LLAMA_API const std::array<uint32_t, LLAMA_UBATCH_HISTOGRAM_BUCKET_COUNT> & llama_ubatch_histogram_bounds();
+LLAMA_API llama_ubatch_stats llama_get_ubatch_stats(const struct llama_context * ctx);
+
+struct llama_memory_churn_data {
+    uint64_t entries_allocated = 0;
+    uint64_t entries_released = 0;
+    uint64_t entries_overwritten = 0;
+    uint64_t memberships_added = 0;
+    uint64_t memberships_removed = 0;
+    uint64_t sequence_remove_operations = 0;
+    uint64_t sequence_copy_operations = 0;
+    uint64_t shared_copy_entries = 0;
+    uint64_t copied_entries = 0;
+    uint64_t reset_operations = 0;
+    uint64_t context_shift_operations = 0;
+    uint64_t shifted_entries = 0;
+    uint64_t prepare_failures = 0;
+    uint64_t optimize_attempts = 0;
+
+    llama_memory_churn_data & operator+=(const llama_memory_churn_data & other) {
+        entries_allocated          += other.entries_allocated;
+        entries_released           += other.entries_released;
+        entries_overwritten        += other.entries_overwritten;
+        memberships_added          += other.memberships_added;
+        memberships_removed        += other.memberships_removed;
+        sequence_remove_operations += other.sequence_remove_operations;
+        sequence_copy_operations   += other.sequence_copy_operations;
+        shared_copy_entries        += other.shared_copy_entries;
+        copied_entries             += other.copied_entries;
+        reset_operations           += other.reset_operations;
+        context_shift_operations   += other.context_shift_operations;
+        shifted_entries            += other.shifted_entries;
+        prepare_failures           += other.prepare_failures;
+        optimize_attempts          += other.optimize_attempts;
+        return *this;
+    }
+};
+
+struct llama_memory_component_diagnostics {
+    std::string name;
+    std::string kind;
+    std::string entry_semantics;
+    std::string state = "available";
+    bool logical_primary = true;
+    bool resident_tokens_supported = false;
+    bool physical_sharing_supported = false;
+    bool occupied_bytes_is_estimate = true;
+    uint64_t capacity_entries = 0;
+    uint64_t used_entries = 0;
+    uint64_t resident_tokens = 0;
+    uint64_t sequences_represented = 0;
+    uint64_t sequences_sharing = 0;
+    uint64_t shared_entries = 0;
+    uint64_t shared_memberships = 0;
+    uint64_t shared_groups = 0;
+    uint64_t max_fanout = 0;
+    uint64_t allocated_bytes = 0;
+    uint64_t occupied_bytes_estimate = 0;
+    llama_memory_churn_data churn;
+};
+
+struct llama_memory_diagnostics {
+    std::string state = "unsupported";
+    std::vector<llama_memory_component_diagnostics> components;
+    llama_memory_churn_data churn;
+};
+
+LLAMA_API llama_memory_diagnostics llama_get_memory_diagnostics(const struct llama_context * ctx);
+
+// Returns the number of leading token positions represented by one physical
+// memory entry shared by every supplied sequence. Sequence identifiers are
+// inputs only and are never exposed by telemetry endpoints.
+LLAMA_API uint64_t llama_get_memory_shared_prefix_length(
+        const struct llama_context * ctx,
+        const llama_seq_id * sequence_ids,
+        size_t sequence_count,
+        uint64_t maximum_prefix_tokens);
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0

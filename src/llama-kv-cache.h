@@ -165,6 +165,8 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+    const llama_kv_cells & get_cells_by_stream(uint32_t stream_id) const;
+    const llama_memory_churn_data & get_churn() const;
 
     //
     // graph_build API
@@ -196,7 +198,7 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool record_churn = true);
 
     //
     // input API
@@ -288,6 +290,8 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    llama_memory_churn_data churn;
 
     size_t total_size() const;
 

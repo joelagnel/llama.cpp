@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-ext.h"
 #include "llama-graph.h"
 
 #include <map>
@@ -127,3 +128,10 @@ struct llama_memory_i {
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
+
+llama_memory_diagnostics llama_memory_diagnostics_collect(const llama_memory_i * memory);
+uint64_t llama_memory_shared_prefix_length(
+        const llama_memory_i * memory,
+        const llama_seq_id * sequence_ids,
+        size_t sequence_count,
+        uint64_t maximum_prefix_tokens);
