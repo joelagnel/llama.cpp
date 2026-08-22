@@ -368,6 +368,20 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    uint64_t released = 0;
+    uint64_t memberships = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        released += v_cells[s].get_used();
+        for (uint32_t i = 0; i < v_cells[s].size(); ++i) {
+            if (!v_cells[s].is_empty(i)) {
+                memberships += v_cells[s].seq_count(i);
+            }
+        }
+    }
+    churn.reset_operations++;
+    churn.entries_released += released;
+    churn.memberships_removed += memberships;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -389,6 +403,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
+    churn.sequence_remove_operations++;
+
     if (p0 < 0) {
         p0 = 0;
     }
@@ -408,9 +424,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 continue;
             }
 
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
+            if (cells.seq_has(i, seq_id)) {
+                churn.memberships_removed++;
+                if (cells.seq_rm(i, seq_id)) {
+                    churn.entries_released++;
+                    if (new_head == cells.size()) {
+                        new_head = i;
+                    }
                 }
             }
         }
@@ -432,6 +452,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                     continue;
                 }
 
+                if (cells.is_empty(i)) {
+                    continue;
+                }
+                churn.memberships_removed += cells.seq_count(i);
+                churn.entries_released++;
                 cells.rm(i);
 
                 if (new_head == cells.size()) {
@@ -457,6 +482,8 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
+
+    churn.sequence_copy_operations++;
 
     const auto s0 = seq_to_stream[seq_id_src];
     const auto s1 = seq_to_stream[seq_id_dst];
@@ -486,6 +513,8 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
             if (cells.seq_has(i, seq_id_src)) {
                 cells.seq_add(i, seq_id_dst);
+                churn.memberships_added++;
+                churn.shared_copy_entries++;
             }
         }
 
@@ -510,6 +539,12 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     sc_info.ssrc.push_back(s0);
     sc_info.sdst.push_back(s1);
 
+    churn.entries_released += v_cells[s1].get_used();
+    for (uint32_t i = 0; i < v_cells[s1].size(); ++i) {
+        if (!v_cells[s1].is_empty(i)) {
+            churn.memberships_removed += v_cells[s1].seq_count(i);
+        }
+    }
     v_cells[s1].reset();
     for (uint32_t i = 0; i < v_cells[s0].size(); ++i) {
         if (v_cells[s0].seq_has(i, seq_id_src)) {
@@ -525,6 +560,9 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
             v_cells[s1].pos_set(i, pos);
             v_cells[s1].seq_add(i, seq_id_dst);
+            churn.entries_allocated++;
+            churn.memberships_added++;
+            churn.copied_entries++;
 
             if (shift != 0) {
                 v_cells[s1].pos_add(i, shift);
@@ -555,10 +593,16 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = cells.size();
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
+        const bool was_used = !cells.is_empty(i);
+        const int memberships_before = was_used ? cells.seq_count(i) : 0;
         if (cells.seq_keep(i, seq_id)) {
+            churn.entries_released++;
+            churn.memberships_removed += memberships_before;
             if (new_head == cells.size()) {
                 new_head = i;
             }
+        } else if (was_used && memberships_before > 1 && cells.seq_has(i, seq_id)) {
+            churn.memberships_removed += memberships_before - 1;
         }
     }
 
@@ -584,6 +628,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
+    churn.context_shift_operations++;
+
     uint32_t new_head = cells.size();
 
     if (p0 < 0) {
@@ -605,7 +651,10 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
+            churn.shifted_entries++;
             if (cells.pos_add(i, shift)) {
+                churn.memberships_removed++;
+                churn.entries_released++;
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -734,6 +783,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
                 this, std::move(sinfos), std::move(ubatches));
     } while (false);
 
+    churn.prepare_failures++;
     return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
@@ -742,7 +792,9 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
 }
 
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
-    GGML_UNUSED(optimize);
+    if (optimize) {
+        churn.optimize_attempts++;
+    }
 
     bool do_shift = get_has_shift();
 
@@ -790,7 +842,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        apply_ubatch(sinfo_new, ubatch, false);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -1095,7 +1147,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool record_churn) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1119,6 +1171,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             const auto idx = sinfo.idxs[s][ii];
 
             if (!cells.is_empty(idx)) {
+                if (record_churn) {
+                    churn.entries_released++;
+                    churn.entries_overwritten++;
+                    churn.memberships_removed += cells.seq_count(idx);
+                }
                 assert(cells.seq_count(idx) == 1);
 
                 const llama_seq_id seq_id = cells.seq_get(idx);
@@ -1130,6 +1187,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             }
 
             cells.pos_set(idx, ubatch.pos[i]);
+
+            if (record_churn) {
+                churn.entries_allocated++;
+                churn.memberships_added += ubatch.n_seq_id[i];
+            }
 
             if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
                 llama_kv_cell_ext ext;
@@ -1246,6 +1308,15 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return v_cells[seq_to_stream[seq_id]];
+}
+
+const llama_kv_cells & llama_kv_cache::get_cells_by_stream(uint32_t stream_id) const {
+    GGML_ASSERT(stream_id < v_cells.size());
+    return v_cells[stream_id];
+}
+
+const llama_memory_churn_data & llama_kv_cache::get_churn() const {
+    return churn;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {

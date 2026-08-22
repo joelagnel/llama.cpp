@@ -187,7 +187,10 @@ struct llama_context {
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
 
+    llama_ubatch_stats ubatch_stats_get_data() const;
+
     llama_memory_breakdown memory_breakdown() const;
+    llama_memory_diagnostics memory_diagnostics() const;
 
     //
     // training
@@ -391,4 +394,8 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // Cumulative physical micro-batch observations. Kept separate from the
+    // resettable timing counters because server telemetry is cumulative.
+    llama_ubatch_stats ubatch_stats;
 };

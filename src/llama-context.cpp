@@ -1803,6 +1803,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     do {
         const auto & ubatch = mctx->get_ubatch();
 
+        ubatch_stats.attempted++;
+
         // count the outputs in this ubatch
         {
             int32_t n_outputs_new = 0;
@@ -1851,6 +1853,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_ALLOC_FAILED: return -2;
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+            }
+        }
+
+        ubatch_stats.successful++;
+        ubatch_stats.tokens += ubatch.n_tokens;
+        ubatch_stats.sequence_tokens += ubatch.n_seq_tokens;
+        ubatch_stats.sequences += ubatch.n_seqs;
+        ubatch_stats.unique_sequences += ubatch.n_seqs_unq;
+        ubatch_stats.max_tokens = std::max<uint64_t>(ubatch_stats.max_tokens, ubatch.n_tokens);
+        const auto & ubatch_bounds = llama_ubatch_histogram_bounds();
+        for (size_t i = 0; i < ubatch_bounds.size(); ++i) {
+            if (ubatch.n_tokens <= ubatch_bounds[i]) {
+                ubatch_stats.token_buckets[i]++;
             }
         }
 
@@ -3341,6 +3356,10 @@ void llama_context::perf_reset() {
     n_reused    = 0;
 }
 
+llama_ubatch_stats llama_context::ubatch_stats_get_data() const {
+    return ubatch_stats;
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -3365,6 +3384,10 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         }
     }
     return ret;
+}
+
+llama_memory_diagnostics llama_context::memory_diagnostics() const {
+    return llama_memory_diagnostics_collect(memory.get());
 }
 
 //
@@ -4291,6 +4314,30 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+llama_memory_diagnostics llama_get_memory_diagnostics(const struct llama_context * ctx) {
+    return ctx ? ctx->memory_diagnostics() : llama_memory_diagnostics {};
+}
+
+uint64_t llama_get_memory_shared_prefix_length(
+        const struct llama_context * ctx,
+        const llama_seq_id * sequence_ids,
+        size_t sequence_count,
+        uint64_t maximum_prefix_tokens) {
+    return ctx ? llama_memory_shared_prefix_length(
+        ctx->get_memory(), sequence_ids, sequence_count, maximum_prefix_tokens) : 0;
+}
+
+const std::array<uint32_t, LLAMA_UBATCH_HISTOGRAM_BUCKET_COUNT> & llama_ubatch_histogram_bounds() {
+    static const std::array<uint32_t, LLAMA_UBATCH_HISTOGRAM_BUCKET_COUNT> bounds {
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+    };
+    return bounds;
+}
+
+llama_ubatch_stats llama_get_ubatch_stats(const struct llama_context * ctx) {
+    return ctx ? ctx->ubatch_stats_get_data() : llama_ubatch_stats {};
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

@@ -139,6 +139,10 @@ llama_memory_recurrent::llama_memory_recurrent(
 }
 
 void llama_memory_recurrent::clear(bool data) {
+    churn.reset_operations++;
+    churn.entries_released += used;
+    churn.memberships_removed += membership_count();
+
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
         cells[i].seq_id.clear();
@@ -159,6 +163,7 @@ void llama_memory_recurrent::clear(bool data) {
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    churn.sequence_remove_operations++;
     uint32_t new_head = size;
 
     if (p0 < 0) {
@@ -218,8 +223,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     for (uint32_t i = 0; i < size; ++i) {
         if (cells[i].pos >= p0 && cells[i].pos < p1) {
             if (seq_id < 0) {
+                churn.memberships_removed += cells[i].seq_id.size();
                 cells[i].seq_id.clear();
             } else if (cells[i].has_seq_id(seq_id)) {
+                churn.memberships_removed++;
                 cells[i].seq_id.erase(seq_id);
             } else {
                 continue;
@@ -228,6 +235,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 // keep count of the number of used cells
                 if (cells[i].pos >= 0) {
                     used--;
+                    churn.entries_released++;
                 }
                 cells[i].pos = -1;
                 cells[i].src = -1;
@@ -251,6 +259,8 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         return;
     }
 
+    churn.sequence_copy_operations++;
+
     if (p0 < 0) {
         p0 = 0;
     }
@@ -267,17 +277,21 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             auto & cell_dst = cells[tail_dst.tail];
 
             cell_dst.seq_id.erase(seq_id_dst);
+            churn.memberships_removed++;
             tail_dst.tail = -1;
             if (cell_dst.seq_id.empty()) {
                 cell_dst.pos = -1;
                 cell_dst.src = -1;
                 used -= 1;
+                churn.entries_released++;
             }
         }
         if (tail_src.tail >= 0) {
             auto & cell_src = cells[tail_src.tail];
 
             cell_src.seq_id.insert(seq_id_dst);
+            churn.memberships_added++;
+            churn.shared_copy_entries++;
             tail_dst.tail = tail_src.tail;
         }
     }
@@ -292,8 +306,10 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
         }
 
         if (!cells[i].has_seq_id(seq_id)) {
+            churn.memberships_removed += cells[i].seq_id.size();
             if (cells[i].pos >= 0) {
                 used--;
+                churn.entries_released++;
             }
 
             cells[i].pos = -1;
@@ -304,6 +320,9 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
                 new_head = i;
             }
         } else {
+            if (cells[i].seq_id.size() > 1) {
+                churn.memberships_removed += cells[i].seq_id.size() - 1;
+            }
             cells[i].seq_id.clear();
             cells[i].seq_id.insert(seq_id);
         }
@@ -319,6 +338,8 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
     if (shift == 0) {
         return;
     }
+
+    churn.context_shift_operations++;
 
     if (p0 < 0) {
         p0 = 0;
@@ -340,6 +361,7 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
             auto & cell = cells[tail_id];
             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
                 cell.pos += shift;
+                churn.shifted_entries++;
             }
         }
     }
@@ -425,6 +447,29 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
     return ret;
 }
 
+uint64_t llama_memory_recurrent::membership_count() const {
+    uint64_t result = 0;
+    for (const auto & cell : cells) {
+        result += cell.seq_id.size();
+    }
+    return result;
+}
+
+void llama_memory_recurrent::record_apply_churn(uint64_t used_before, uint64_t memberships_before) {
+    const uint64_t used_after = used;
+    const uint64_t memberships_after = membership_count();
+    if (used_after >= used_before) {
+        churn.entries_allocated += used_after - used_before;
+    } else {
+        churn.entries_released += used_before - used_after;
+    }
+    if (memberships_after >= memberships_before) {
+        churn.memberships_added += memberships_after - memberships_before;
+    } else {
+        churn.memberships_removed += memberships_before - memberships_after;
+    }
+}
+
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         balloc.split_reset();
@@ -464,6 +509,7 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
         return std::make_unique<llama_memory_recurrent_context>(this, std::move(ubatches));
     } while (false);
 
+    churn.prepare_failures++;
     return std::make_unique<llama_memory_recurrent_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
@@ -473,7 +519,9 @@ llama_memory_context_ptr llama_memory_recurrent::init_full() {
 
 llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(lctx);
-    GGML_UNUSED(optimize);
+    if (optimize) {
+        churn.optimize_attempts++;
+    }
 
     return std::make_unique<llama_memory_recurrent_context>(LLAMA_MEMORY_STATUS_NO_UPDATE);
 }
@@ -1260,7 +1308,10 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
+    const uint64_t used_before = mem->used;
+    const uint64_t memberships_before = mem->membership_count();
     mem->find_slot(ubatches[i_next]);
+    mem->record_apply_churn(used_before, memberships_before);
 
     return true;
 }
