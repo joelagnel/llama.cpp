@@ -101,6 +101,9 @@ class ServerProcess:
     spec_draft_n_max: int | None = None
     spec_synth_len: float | None = None
     spec_synth_rates: List[float] | None = None
+    spec_ngram_simple_size_n: int | None = None
+    spec_ngram_simple_size_m: int | None = None
+    spec_ngram_simple_min_hits: int | None = None
     no_ui: bool | None = None
     jinja: bool | None = None
     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
@@ -252,6 +255,12 @@ class ServerProcess:
         if self.spec_synth_rates is not None:
             rates = ",".join(str(rate) for rate in self.spec_synth_rates)
             server_args.extend(["--spec-synth-rates", rates])
+        if self.spec_ngram_simple_size_n:
+            server_args.extend(["--spec-ngram-simple-size-n", self.spec_ngram_simple_size_n])
+        if self.spec_ngram_simple_size_m:
+            server_args.extend(["--spec-ngram-simple-size-m", self.spec_ngram_simple_size_m])
+        if self.spec_ngram_simple_min_hits:
+            server_args.extend(["--spec-ngram-simple-min-hits", self.spec_ngram_simple_min_hits])
         if self.no_ui:
             server_args.append("--no-ui")
         if self.no_models_autoload:

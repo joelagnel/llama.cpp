@@ -30,8 +30,11 @@ def parse_metrics(text: str) -> dict:
             types[name] = kind
         elif line.startswith("llamacpp:") and "{" not in line:
             name, value = line.split(" ", 1)
-            assert name in types, f"{name} has no # TYPE line"
-            out[name] = (types[name], float(value))
+            metric_type = types.get(name)
+            if metric_type is None and (name.endswith("_sum") or name.endswith("_count")):
+                metric_type = types.get(name.rsplit("_", 1)[0])
+            assert metric_type is not None, f"{name} has no # TYPE line"
+            out[name] = (metric_type, float(value))
     return out
 
 
@@ -56,6 +59,7 @@ def test_metrics_prometheus_format():
         "llamacpp:prompt_tokens_cached_total",
         "llamacpp:prompt_seconds_total",
         "llamacpp:tokens_predicted_total",
+        "llamacpp:server_output_tokens_total",
         "llamacpp:tokens_predicted_seconds_total",
         "llamacpp:n_decode_total",
         "llamacpp:n_tokens_max",
@@ -121,6 +125,7 @@ def test_metrics_predicted_total_matches_requests():
 
     metrics = parse_metrics(fetch_metrics(server))
     assert metrics["llamacpp:tokens_predicted_total"][1] == n_predicted
+    assert metrics["llamacpp:server_output_tokens_total"][1] == n_predicted
 
 
 def test_metrics_generation_rate_excludes_first_token():
