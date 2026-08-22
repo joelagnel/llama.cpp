@@ -53,6 +53,8 @@ struct server_http_req {
     std::string query_string; // query parameters string (e.g. "action=save")
     std::string body;
     std::map<std::string, uploaded_file> files; // used for file uploads (form data)
+    int64_t t_arrival = 0;
+    int64_t t_arrival_unix_ms = 0;
     const std::function<bool()> & should_stop;
 
     std::string get_param(const std::string & key, const std::string & def = "") const {

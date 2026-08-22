@@ -67,6 +67,8 @@ json format_error_response(const std::string & message, const enum error_type ty
 json server_slot_stats::to_json() const {
     json base = {
         {"cache_n",                n_prompt_cached},
+        {"cache_matched_n",        n_prompt_matched},
+        {"cache_reuse_ratio",      cache_reuse_ratio()},
 
         {"prompt_n",               n_prompt_processed},
         {"prompt_ms",              t_prompt_ms()},
@@ -77,6 +79,14 @@ json server_slot_stats::to_json() const {
         {"predicted_ms",           t_gen_ms()},
         {"predicted_per_token_ms", t_gen_per_token_ms()},
         {"predicted_per_second",   n_gen_tps()},
+        {"queue_ms",               t_queue_ms()},
+        {"cache_lookup_ms",        t_cache_ms()},
+        {"prefill_actual_ms",      t_prefill_actual_ms()},
+        {"prefill_actual_per_token_ms", t_prefill_actual_per_token_ms()},
+        {"prefill_actual_per_second", n_prefill_actual_tps()},
+        {"ttft_ms",                t_ttft_ms()},
+        {"e2e_ms",                 t_e2e_ms()},
+        {"arrival_unix_ms",        t_arrival_unix_ms},
     };
 
     if (n_draft_tokens > 0) {

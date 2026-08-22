@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -18,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -25,6 +27,11 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <deque>
+#include <cstring>
+#include <limits>
+#include <set>
+#include <sstream>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -64,6 +71,33 @@ enum slot_state {
 };
 
 struct server_slot; // forward declaration
+
+struct telemetry_probability_accumulator {
+    uint64_t count = 0;
+    double nll_sum = 0.0;
+    double min_logprob = std::numeric_limits<double>::infinity();
+    double max_logprob = -std::numeric_limits<double>::infinity();
+    std::string unavailable_reason;
+
+    void reset() {
+        count = 0;
+        nll_sum = 0.0;
+        min_logprob = std::numeric_limits<double>::infinity();
+        max_logprob = -std::numeric_limits<double>::infinity();
+        unavailable_reason.clear();
+    }
+
+    void observe(double logprob) {
+        if (!std::isfinite(logprob)) {
+            unavailable_reason = "selected_token_log_probability_not_finite";
+            return;
+        }
+        count++;
+        nll_sum -= logprob;
+        min_logprob = std::min(min_logprob, logprob);
+        max_logprob = std::max(max_logprob, logprob);
+    }
+};
 
 struct server_batch {
     llama_batch batch;
@@ -238,6 +272,8 @@ struct server_slot {
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
 
     std::vector<completion_token_output> generated_token_probs;
+    telemetry_probability_accumulator response_probability;
+    telemetry_probability_accumulator prompt_probability;
 
     bool has_next_token = true;
     bool has_new_line   = false;
@@ -310,10 +346,16 @@ struct server_slot {
     std::vector<float> inp_embd;
 
     server_slot_stats stats;
+    bool telemetry_finalized = false;
 
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
+    uint64_t n_draft_hit_steps = 0;
+    uint64_t n_draft_full_steps = 0;
+    uint64_t n_spec_target_tokens = 0;
+    uint64_t n_spec_useful_tokens = 0;
+    uint64_t n_spec_target_passes = 0;
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -342,6 +384,8 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        response_probability.reset();
+        prompt_probability.reset();
         json_schema = json();
 
         task_prev = std::move(task);
@@ -349,7 +393,13 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+        telemetry_finalized = false;
         n_accepted_per_pos.clear();
+        n_draft_hit_steps = 0;
+        n_draft_full_steps = 0;
+        n_spec_target_tokens = 0;
+        n_spec_useful_tokens = 0;
+        n_spec_target_passes = 0;
 
         n_predict_max = -1;
 
@@ -389,6 +439,11 @@ struct server_slot {
     bool need_embd() const {
         GGML_ASSERT(task);
         return task->need_embd();
+    }
+
+    bool should_score_prompt() const {
+        GGML_ASSERT(task);
+        return task->params.prompt_perplexity && prompt_probability.unavailable_reason.empty();
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -684,6 +739,7 @@ struct server_slot {
         other.i_batch = i_batch;
 
         other.stats = stats;
+        other.prompt_probability = prompt_probability;
 
         other.prompt = prompt.clone();
         other.init_sampler();
@@ -818,8 +874,43 @@ public:
         }
     }
 
+    static void copy_ubatch_stats(
+            server_metrics::physical_ubatch_metrics & dst,
+            const llama_ubatch_stats & src) {
+        dst.attempted        = src.attempted;
+        dst.successful       = src.successful;
+        dst.tokens           = src.tokens;
+        dst.sequence_tokens  = src.sequence_tokens;
+        dst.sequences        = src.sequences;
+        dst.unique_sequences = src.unique_sequences;
+        dst.max_tokens       = src.max_tokens;
+        dst.token_histogram.sum = src.tokens;
+        dst.token_histogram.count = src.successful;
+        GGML_ASSERT(dst.token_histogram.buckets.size() == src.token_buckets.size());
+        std::copy(src.token_buckets.begin(), src.token_buckets.end(), dst.token_histogram.buckets.begin());
+    }
+
     server_metrics get_metrics() const {
-        return metrics;
+        server_metrics result = metrics;
+        if (ctx_tgt) {
+            copy_ubatch_stats(result.physical_ubatch_target, llama_get_ubatch_stats(ctx_tgt));
+        }
+        if (ctx_dft) {
+            copy_ubatch_stats(result.physical_ubatch_draft, llama_get_ubatch_stats(ctx_dft));
+        }
+        return result;
+    }
+
+    bool telemetry_content_enabled() const {
+        return telemetry_content;
+    }
+
+    size_t telemetry_event_capacity_bytes() const {
+        return telemetry_event_max_bytes;
+    }
+
+    const std::string & telemetry_instance_id() const {
+        return telemetry_server_instance_id;
     }
 
     void reset_metrics_bucket() {
@@ -867,6 +958,22 @@ private:
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
+
+    struct telemetry_event_entry {
+        json data;
+        size_t bytes;
+    };
+    std::deque<telemetry_event_entry> telemetry_events;
+    std::string telemetry_server_instance_id = "server-" + random_string();
+    uint64_t telemetry_next_sequence = 1;
+    uint64_t telemetry_dropped_events = 0;
+    uint64_t telemetry_last_dropped_sequence = 0;
+    size_t telemetry_event_bytes = 0;
+    size_t telemetry_event_max_bytes = 64 * 1024 * 1024;
+    std::vector<uint64_t> telemetry_slot_marks;
+    uint64_t telemetry_slot_epoch = 0;
+    bool telemetry_content = false;
+    static constexpr size_t TELEMETRY_EVENT_CAPACITY = 2048;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
     // note: kept out of server_metrics, which is copied as-is into the task result
@@ -1235,6 +1342,7 @@ private:
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
         }
+        telemetry_slot_marks.assign(slots.size(), 0);
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1381,6 +1489,17 @@ private:
 
         metrics.init();
 
+        const char * telemetry_content_env = getenv("LLAMA_TELEMETRY_CONTENT");
+        telemetry_content = telemetry_content_env && atoi(telemetry_content_env) != 0;
+        const char * telemetry_buffer_env = getenv("LLAMA_TELEMETRY_EVENT_BUFFER_MIB");
+        if (telemetry_buffer_env) {
+            const int mib = std::max(1, std::min(4096, atoi(telemetry_buffer_env)));
+            telemetry_event_max_bytes = (size_t) mib * 1024 * 1024;
+        }
+        if (telemetry_content) {
+            SRV_WRN("%s", "LLAMA_TELEMETRY_CONTENT is enabled; prompt and response text will be retained in the in-memory event buffer\n");
+        }
+
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
@@ -1497,7 +1616,7 @@ private:
         return nullptr;
     }
 
-    server_slot * get_available_slot(const server_task & task) {
+    server_slot * get_available_slot(server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1584,6 +1703,11 @@ private:
 
                 update_cache = true;
             }
+        }
+
+        if (ret && !ret->is_processing()) {
+            task.t_slot_start = ggml_time_us();
+            task.t_cache_start = task.t_slot_start;
         }
 
         if (ret) {
@@ -1765,9 +1889,18 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        slot.stats.trace_id = slot.task->trace_id;
+        slot.stats.t_arrival = slot.task->t_arrival;
+        slot.stats.t_enqueue = slot.task->t_enqueue;
+        slot.stats.t_slot_start = slot.task->t_slot_start;
+        slot.stats.t_cache_start = slot.task->t_cache_start;
+        slot.stats.t_arrival_unix_ms = slot.task->t_arrival_unix_ms;
+
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+
+        telemetry_on_start(slot);
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -1965,14 +2098,26 @@ private:
     }
 
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
-        send_error(task.id, error, type);
+        send_error(task.id, error, type, 0, 0, task.trace_id);
     }
 
-    void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
-        send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
+    void send_error(server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
+        const char * category = "server";
+        switch (type) {
+            case ERROR_TYPE_INVALID_REQUEST: category = "invalid_request"; break;
+            case ERROR_TYPE_AUTHENTICATION: category = "authentication"; break;
+            case ERROR_TYPE_NOT_FOUND: category = "not_found"; break;
+            case ERROR_TYPE_PERMISSION: category = "permission"; break;
+            case ERROR_TYPE_NOT_SUPPORTED: category = "not_supported"; break;
+            case ERROR_TYPE_UNAVAILABLE: category = "unavailable"; break;
+            case ERROR_TYPE_EXCEED_CONTEXT_SIZE: category = "context_size"; break;
+            case ERROR_TYPE_SERVER: break;
+        }
+        telemetry_finalize(slot, "error", error, category);
+        send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx, slot.task->trace_id);
     }
 
-    void send_error(const int id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0) {
+    void send_error(const int id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0, const std::string & trace_id = {}) {
         SRV_ERR("task id = %d, error: %s\n", id_task, error.c_str());
 
         if (type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
@@ -1981,6 +2126,7 @@ private:
 
         auto res = std::make_unique<server_task_result_error>();
         res->id              = id_task;
+        res->trace_id        = trace_id;
         res->err_type        = type;
         res->err_msg         = error;
         res->n_prompt_tokens = n_prompt_tokens;
@@ -1993,6 +2139,7 @@ private:
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
         res->id    = slot.task->id;
+        res->trace_id = slot.task->trace_id;
         res->index = slot.task->index;
 
         if (is_progress) {
@@ -2033,10 +2180,12 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        telemetry_finalize(slot, "success");
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
         res->id_slot = slot.id;
+        res->trace_id = slot.task->trace_id;
 
         res->index = slot.task->index;
 
@@ -2232,6 +2381,8 @@ private:
         size_t idx = 0;
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
         for (auto * slot : child_slots) {
+            parent_task.child_tasks[idx].t_slot_start = parent_task.t_slot_start;
+            parent_task.child_tasks[idx].t_cache_start = parent_task.t_cache_start;
             int id_child = parent_task.child_tasks[idx].id;
             if (!launch_slot_with_task(*slot, std::move(parent_task.child_tasks[idx]))) {
                 SRV_ERR("failed to launch slot with child task, id_task = %d\n", id_child);
@@ -2334,6 +2485,7 @@ private:
                     if (slot == nullptr) {
                         // if no slot is available, we defer this task for processing later
                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+                        task.t_cache_start = 0;
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -2341,6 +2493,7 @@ private:
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+                        task.t_cache_start = 0;
                         queue_tasks.defer(std::move(task));
                         break;
                     }
@@ -2351,6 +2504,7 @@ private:
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
+                            task.t_cache_start = 0;
                             queue_tasks.defer(std::move(task));
                             break;
                         }
@@ -2386,6 +2540,7 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            telemetry_finalize(slot, "cancelled");
                             slot.release();
                             break;
                         }
@@ -2443,10 +2598,27 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
-                    res->metrics             = metrics;
+                    // Include the authoritative core physical-ubatch counters. They live on
+                    // llama_context and are merged into the server counters on read.
+                    res->metrics             = get_metrics();
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_TELEMETRY_SNAPSHOT:
+            case SERVER_TASK_TYPE_TELEMETRY_EVENTS:
+            case SERVER_TASK_TYPE_TELEMETRY_KV:
+                {
+                    auto res = std::make_unique<server_task_result_telemetry>();
+                    res->id = task.id;
+                    if (task.type == SERVER_TASK_TYPE_TELEMETRY_SNAPSHOT) {
+                        res->data = telemetry_snapshot_json();
+                    } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_EVENTS) {
+                        res->data = telemetry_events_json(task.telemetry_cursor, task.telemetry_limit);
+                    } else {
+                        res->data = telemetry_kv_json();
                     }
                     queue_results.send(std::move(res));
                 } break;
@@ -3111,6 +3283,19 @@ private:
                             return;
                         }
 
+                        slot.prompt_probability.reset();
+                        if (slot.task->params.prompt_perplexity) {
+                            bool has_multimodal_token = false;
+                            for (size_t i = 0; i < input_tokens.size(); ++i) {
+                                has_multimodal_token |= input_tokens[i] == LLAMA_TOKEN_NULL;
+                            }
+                            if (has_multimodal_token) {
+                                slot.prompt_probability.unavailable_reason = "multimodal_prompt_scoring_not_supported";
+                            } else if (input_tokens.size() < 2) {
+                                slot.prompt_probability.unavailable_reason = "prompt_requires_at_least_two_text_tokens";
+                            }
+                        }
+
                         if (!slot.can_split()) {
                             if (slot.task->n_tokens() > n_ubatch) {
                                 send_error(slot,
@@ -3144,7 +3329,7 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            if (slot.task->params.cache_prompt && !slot.should_score_prompt()) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -3330,6 +3515,7 @@ private:
                         }
 
                         // [TAG_PROMPT_LOGITS]
+                        slot.stats.n_prompt_matched = n_past;
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
@@ -3338,6 +3524,7 @@ private:
 
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
+                        slot.stats.t_cache_last = ggml_time_us();
 
                         metrics.add_prompt_cached(n_past);
 
@@ -3417,6 +3604,9 @@ private:
                         // process the mtmd chunk
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
+                        if (slot.stats.t_prefill_start == 0) {
+                            slot.stats.t_prefill_start = ggml_time_us();
+                        }
                         metrics_pre_decode();
 
                         // encode on the worker thread, so we can still handle metrics tasks
@@ -3436,6 +3626,7 @@ private:
                         metrics_queue_prompt(n_tokens_out);
                         slot.stats.n_prompt_processed += n_tokens_out;
                         slot.stats.update_prompt_last();
+                        slot.stats.t_prefill_last = slot.stats.t_prompt_last;
 
                         // add the mtmd chunk to cache
                         {
@@ -3452,6 +3643,9 @@ private:
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                        if (slot.stats.t_prefill_start == 0) {
+                            slot.stats.t_prefill_start = ggml_time_us();
+                        }
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3472,9 +3666,17 @@ private:
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ slot.need_embd(),
+                            /* output    = */ slot.need_embd() || slot.should_score_prompt(),
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
+
+                        // Prompt perplexity is an explicitly expensive diagnostic. Keep at most one
+                        // scored row per sequence in a logical decode so it stays within the context's
+                        // normal n_outputs_max_per_seq allocation instead of reserving n_batch*vocab
+                        // logits for every server request, including requests which do not enable it.
+                        if (slot.should_score_prompt()) {
+                            break;
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -3794,8 +3996,11 @@ private:
             const int64_t t_now = ggml_time_us();
 
             slot.stats.n_gen += 1;
+            metrics.n_server_output_tokens++;
 
             if (slot.stats.n_gen == 1) {
+                slot.stats.t_first_token = t_now;
+                telemetry_on_first_token(slot);
                 slot.stats.update_prompt_last();
                 slot.t_print_last = t_now;
                 slot.n_gen_last = 0;
@@ -3810,6 +4015,16 @@ private:
 
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+
+                if (slot.response_probability.unavailable_reason.empty()) {
+                    double logprob = 0.0;
+                    std::string reason;
+                    if (selected_token_log_probability(ctx_tgt, tok_idx, id, logprob, reason)) {
+                        slot.response_probability.observe(logprob);
+                    } else {
+                        slot.response_probability.unavailable_reason = std::move(reason);
+                    }
+                }
             }
 
             if (!process_token(result, slot)) {
@@ -3837,14 +4052,44 @@ private:
             GGML_ASSERT(n_draft > 0);
 
             // verify and try to accept the draft
+            int64_t t_spec_sample = 0;
+            std::vector<float> spec_selected_probs;
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                const auto spec_rows = slot.spec_i_batch;
+                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_rows, slot.spec_draft);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+                t_spec_sample = ggml_time_us();
+
+                // Every visit here follows a successful target-model
+                // verification graph. Count replay passes as real forward
+                // passes even when their output is discarded.
+                metrics.spec_target_tokens_per_pass.observe(n_draft + 1);
+                metrics.n_spec_target_tokens += n_draft + 1;
+                metrics.n_spec_target_passes++;
+                slot.n_spec_target_tokens += n_draft + 1;
+                slot.n_spec_target_passes++;
+
+                // Acceptance depth is a logical verification-decision metric.
+                // A checkpoint replay completes the same decision and must not
+                // create a second proposed/accepted-depth observation.
+                if (!slot.spec_is_replay) {
+                    const size_t accepted_depth = accepted.size() - 1;
+                    metrics.spec_draft_depth.observe(n_draft);
+                    metrics.spec_accepted_depth.observe(accepted_depth);
+                    if (accepted_depth > 0) {
+                        slot.n_draft_hit_steps++;
+                        metrics.n_draft_hit_steps++;
+                    }
+                    if (accepted_depth == n_draft) {
+                        slot.n_draft_full_steps++;
+                        metrics.n_draft_full_steps++;
+                    }
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
@@ -3878,6 +4123,10 @@ private:
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
+                        // This expensive target pass committed no output. The
+                        // replay pass will receive its own target/useful entry.
+                        metrics.spec_useful_tokens_per_pass.observe(0);
+
                         return;
                     }
                 }
@@ -3889,6 +4138,22 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+
+                if (slot.task->params.sampling.n_probs > 0 && slot.response_probability.unavailable_reason.empty()) {
+                    spec_selected_probs.reserve(slot.spec_draft.size());
+                    for (size_t i = 0; i < slot.spec_draft.size(); ++i) {
+                        double logprob = 0.0;
+                        std::string reason;
+                        if (selected_token_log_probability(ctx_tgt, spec_rows[i], slot.spec_draft[i], logprob, reason)) {
+                            slot.response_probability.observe(logprob);
+                            spec_selected_probs.push_back((float) std::exp(logprob));
+                        } else {
+                            slot.response_probability.unavailable_reason = std::move(reason);
+                            spec_selected_probs.clear();
+                            break;
+                        }
+                    }
+                }
             }
 
             const auto ids = std::move(slot.spec_draft);
@@ -3899,7 +4164,14 @@ private:
             }
             slot.spec_is_replay = false;
 
-            slot.stats.update_gen_last();
+            if (slot.stats.n_gen == 0) {
+                slot.stats.t_first_token = t_spec_sample;
+                telemetry_on_first_token(slot);
+                slot.stats.set_prompt_last(t_spec_sample);
+                slot.t_print_last = t_spec_sample;
+                slot.n_gen_last = 0;
+            }
+            slot.stats.t_gen_last = std::max(slot.stats.t_prompt_last, t_spec_sample);
 
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
@@ -3922,18 +4194,24 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+            uint64_t useful_tokens_this_pass = 0;
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
                 result.tok          = ids[i];
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = 1.0f; // set later
+                result.prob         = i < spec_selected_probs.size() ? spec_selected_probs[i] : 1.0f;
 
                 // TODO: set result.probs
 
                 slot.stats.n_gen += 1;
+                metrics.n_server_output_tokens++;
+                slot.n_spec_useful_tokens++;
+                metrics.n_spec_useful_tokens++;
+                useful_tokens_this_pass++;
 
                 if (!process_token(result, slot)) {
+                    metrics.spec_useful_tokens_per_pass.observe(useful_tokens_this_pass);
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();
@@ -3941,6 +4219,8 @@ private:
                     return;
                 }
             }
+
+            metrics.spec_useful_tokens_per_pass.observe(useful_tokens_this_pass);
 
             slot.print_timings_tg();
 
@@ -3954,6 +4234,840 @@ private:
 
     server_response_reader get_response_reader() {
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
+    }
+
+    void telemetry_append(json event) {
+        event["schema_version"] = 1;
+        event["server_instance_id"] = telemetry_server_instance_id;
+        event["sequence"] = telemetry_next_sequence++;
+        const size_t bytes = event.dump().size();
+        if (bytes > telemetry_event_max_bytes) {
+            telemetry_dropped_events++;
+            telemetry_last_dropped_sequence = event.at("sequence").get<uint64_t>();
+            return;
+        }
+        telemetry_event_bytes += bytes;
+        telemetry_events.push_back({std::move(event), bytes});
+        while (telemetry_events.size() > TELEMETRY_EVENT_CAPACITY || telemetry_event_bytes > telemetry_event_max_bytes) {
+            telemetry_event_bytes -= telemetry_events.front().bytes;
+            telemetry_last_dropped_sequence = telemetry_events.front().data.at("sequence").get<uint64_t>();
+            telemetry_events.pop_front();
+            telemetry_dropped_events++;
+        }
+    }
+
+    bool selected_token_log_probability(
+            llama_context * ctx,
+            int idx,
+            llama_token selected,
+            double & logprob,
+            std::string & unavailable_reason) const {
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        if (selected < 0 || selected >= n_vocab) {
+            unavailable_reason = "selected_token_out_of_vocabulary";
+            return false;
+        }
+
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        if (logits == nullptr) {
+            unavailable_reason = "target_logits_unavailable";
+            return false;
+        }
+
+        // Backend sampling may expose only a sampled candidate subset. That is
+        // not the full raw-model distribution and must not be called raw PPL.
+        if (llama_get_sampled_candidates_count_ith(ctx, idx) > 0 ||
+                llama_get_sampled_logits_count_ith(ctx, idx) != n_vocab) {
+            unavailable_reason = "full_raw_target_logits_unavailable_with_backend_sampling";
+            return false;
+        }
+
+        double max_logit = -std::numeric_limits<double>::infinity();
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            if (std::isnan(logits[i])) {
+                unavailable_reason = "target_logits_contain_nan";
+                return false;
+            }
+            max_logit = std::max(max_logit, (double) logits[i]);
+        }
+        if (!std::isfinite(max_logit) || !std::isfinite(logits[selected])) {
+            unavailable_reason = "selected_or_max_target_logit_not_finite";
+            return false;
+        }
+
+        double sum_exp = 0.0;
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            sum_exp += std::exp((double) logits[i] - max_logit);
+        }
+        if (!(sum_exp > 0.0) || !std::isfinite(sum_exp)) {
+            unavailable_reason = "target_logsumexp_not_finite";
+            return false;
+        }
+
+        logprob = (double) logits[selected] - max_logit - std::log(sum_exp);
+        if (!std::isfinite(logprob)) {
+            unavailable_reason = "selected_token_log_probability_not_finite";
+            return false;
+        }
+        return true;
+    }
+
+    int64_t telemetry_unix_ms(const server_slot & slot, int64_t t_us) const {
+        if (slot.stats.t_arrival_unix_ms == 0 || slot.stats.t_arrival == 0 || t_us == 0) {
+            return 0;
+        }
+        return slot.stats.t_arrival_unix_ms + (t_us - slot.stats.t_arrival) / 1000;
+    }
+
+    json telemetry_server_configuration() const {
+        return {
+            {"parallel_slots", params_base.n_parallel},
+            {"logical_batch_size", params_base.n_batch},
+            {"physical_ubatch_size", params_base.n_ubatch},
+            {"context_size", params_base.n_ctx},
+            {"continuous_batching", params_base.cont_batching},
+            {"unified_kv", params_base.kv_unified},
+        };
+    }
+
+    void telemetry_on_start(const server_slot & slot) {
+        telemetry_append({
+            {"event", "request_started"},
+            {"trace_id", slot.task->trace_id},
+            {"w3c_trace_id", slot.task->correlation_trace_id.empty() ? json(nullptr) : json(slot.task->correlation_trace_id)},
+            {"w3c_traceparent", slot.task->traceparent.empty() ? json(nullptr) : json(slot.task->traceparent)},
+            {"task_id", slot.task->id},
+            {"slot_id", slot.id},
+            {"completion_id", slot.task->params.oaicompat_cmpl_id},
+            {"model", slot.task->params.oaicompat_model},
+            {"server_build", std::string(llama_build_info())},
+            {"timestamp_unix_ms", telemetry_unix_ms(slot, slot.stats.t_slot_start)},
+            {"arrival_unix_ms", slot.stats.t_arrival_unix_ms},
+            {"queue_ms", slot.stats.t_queue_ms()},
+            {"prompt_tokens", slot.task->n_tokens()},
+            {"server_configuration", telemetry_server_configuration()},
+        });
+    }
+
+    void telemetry_on_first_token(const server_slot & slot) {
+        telemetry_append({
+            {"event", "first_token"},
+            {"trace_id", slot.task->trace_id},
+            {"w3c_trace_id", slot.task->correlation_trace_id.empty() ? json(nullptr) : json(slot.task->correlation_trace_id)},
+            {"w3c_traceparent", slot.task->traceparent.empty() ? json(nullptr) : json(slot.task->traceparent)},
+            {"task_id", slot.task->id},
+            {"slot_id", slot.id},
+            {"timestamp_unix_ms", telemetry_unix_ms(slot, slot.stats.t_first_token)},
+            {"ttft_ms", slot.stats.t_ttft_ms()},
+            {"queue_ms", slot.stats.t_queue_ms()},
+            {"prompt_tokens", slot.task->n_tokens()},
+            {"matched_prefix_tokens", slot.stats.n_prompt_matched},
+            {"reused_prompt_tokens", slot.stats.n_prompt_cached},
+            {"evaluated_prompt_tokens", slot.stats.n_prompt_processed},
+            {"cache_status", slot.stats.cache_status()},
+            {"cache_reuse_ratio", slot.stats.cache_reuse_ratio()},
+            {"prefill_meaningful", std::strcmp(slot.stats.cache_status(), "full") != 0},
+            {"cache_lookup_ms", slot.stats.t_cache_ms()},
+            {"actual_prefill_ms", slot.stats.t_prefill_actual_ms()},
+            {"server_configuration", telemetry_server_configuration()},
+        });
+    }
+
+    void telemetry_finalize(server_slot & slot, const char * outcome, const std::string & error = {}, const char * error_category = nullptr) {
+        if (slot.telemetry_finalized) {
+            return;
+        }
+        slot.telemetry_finalized = true;
+        slot.stats.t_complete = ggml_time_us();
+
+        metrics.n_requests_total++;
+        if (std::strcmp(outcome, "success") == 0) {
+            metrics.n_requests_success++;
+        } else if (std::strcmp(outcome, "cancelled") == 0) {
+            metrics.n_requests_cancelled++;
+        } else {
+            metrics.n_requests_error++;
+        }
+
+        if (slot.stats.t_slot_start > 0 && slot.stats.t_enqueue > 0) {
+            metrics.request_queue_seconds.observe(slot.stats.t_queue_ms() / 1000.0);
+        }
+        if (slot.stats.t_first_token > 0) {
+            metrics.request_ttft_seconds.observe(slot.stats.t_ttft_ms() / 1000.0);
+        }
+        if (slot.stats.t_prefill_start > 0 && slot.stats.t_prefill_last > 0) {
+            metrics.request_prefill_seconds.observe(slot.stats.t_prefill_actual_ms() / 1000.0);
+        }
+        if (slot.stats.n_gen_steps() > 0) {
+            metrics.request_tpot_seconds.observe(slot.stats.t_gen_per_token_ms() / 1000.0);
+        }
+        metrics.request_e2e_seconds.observe(slot.stats.t_e2e_ms() / 1000.0);
+        metrics.request_prompt_tokens.observe(slot.task->n_tokens());
+        metrics.request_output_tokens.observe(slot.stats.n_gen);
+        metrics.request_cache_reuse_ratio.observe(slot.stats.cache_reuse_ratio());
+        const std::string cache_status = slot.stats.cache_status();
+        if (cache_status == "full") {
+            metrics.n_cache_full++;
+        } else if (cache_status == "partial") {
+            metrics.n_cache_partial++;
+        } else {
+            metrics.n_cache_miss++;
+        }
+
+        const char * finish_reason = "completed";
+        if (std::strcmp(outcome, "cancelled") == 0) {
+            finish_reason = "cancelled";
+        } else if (std::strcmp(outcome, "error") == 0) {
+            finish_reason = "error";
+        } else if (slot.stop == STOP_TYPE_EOS || slot.stop == STOP_TYPE_WORD) {
+            finish_reason = "stop";
+        } else if (slot.stop == STOP_TYPE_LIMIT) {
+            finish_reason = "length";
+        }
+
+        json sampling = slot.task->params.to_json(false);
+        sampling["requested_temperature"] = slot.task->telemetry_requested_temperature;
+        sampling["effective_temperature"] = slot.task->params.sampling.temp;
+        sampling["effective_seed"] = common_sampler_get_seed(slot.smpl.get());
+
+        json event = {
+            {"event", std::strcmp(outcome, "success") == 0 ? "request_completed" : "request_ended"},
+            {"trace_id", slot.task->trace_id},
+            {"w3c_trace_id", slot.task->correlation_trace_id.empty() ? json(nullptr) : json(slot.task->correlation_trace_id)},
+            {"w3c_traceparent", slot.task->traceparent.empty() ? json(nullptr) : json(slot.task->traceparent)},
+            {"task_id", slot.task->id},
+            {"slot_id", slot.id},
+            {"timestamp_unix_ms", telemetry_unix_ms(slot, slot.stats.t_complete)},
+            {"completion_id", slot.task->params.oaicompat_cmpl_id},
+            {"model", slot.task->params.oaicompat_model},
+            {"server_build", std::string(llama_build_info())},
+            {"outcome", outcome},
+            {"finish_reason", finish_reason},
+            {"partial_response", std::strcmp(outcome, "cancelled") == 0},
+            {"error", error.empty() ? json(nullptr) : json(error)},
+            {"error_category", error_category ? json(error_category) : json(nullptr)},
+            {"prompt_tokens", slot.task->n_tokens()},
+            {"matched_prefix_tokens", slot.stats.n_prompt_matched},
+            {"reused_prompt_tokens", slot.stats.n_prompt_cached},
+            {"evaluated_prompt_tokens", slot.stats.n_prompt_processed},
+            {"cache_status", slot.stats.cache_status()},
+            {"cache_reuse_ratio", slot.stats.cache_reuse_ratio()},
+            {"prefill_meaningful", cache_status != "full"},
+            {"output_tokens", slot.stats.n_gen},
+            {"decode_steps", slot.stats.n_gen_steps()},
+            {"timings", slot.stats.to_json()},
+            {"sampling", std::move(sampling)},
+            {"server_configuration", telemetry_server_configuration()},
+            {"speculative", {
+                {"draft_tokens", slot.stats.n_draft_tokens},
+                {"accepted_tokens", slot.stats.n_draft_accepted},
+                {"rejected_tokens", slot.stats.n_draft_tokens - slot.stats.n_draft_accepted},
+                {"verification_steps", slot.stats.n_draft_verif_steps},
+                {"logical_target_passes", slot.stats.n_draft_verif_steps},
+                {"actual_target_passes", slot.n_spec_target_passes},
+                {"hit_steps", slot.n_draft_hit_steps},
+                {"miss_steps", slot.stats.n_draft_verif_steps >= slot.n_draft_hit_steps ? slot.stats.n_draft_verif_steps - slot.n_draft_hit_steps : 0},
+                {"full_chain_steps", slot.n_draft_full_steps},
+                {"token_hit_rate", slot.stats.n_draft_tokens > 0 ? json((double) slot.stats.n_draft_accepted / slot.stats.n_draft_tokens) : json(nullptr)},
+                {"step_hit_rate", slot.stats.n_draft_verif_steps > 0 ? json((double) slot.n_draft_hit_steps / slot.stats.n_draft_verif_steps) : json(nullptr)},
+                {"full_chain_rate", slot.stats.n_draft_verif_steps > 0 ? json((double) slot.n_draft_full_steps / slot.stats.n_draft_verif_steps) : json(nullptr)},
+                {"target_tokens", slot.n_spec_target_tokens},
+                {"useful_output_tokens", slot.n_spec_useful_tokens},
+                {"target_tokens_per_pass", slot.n_spec_target_passes > 0 ? json((double) slot.n_spec_target_tokens / slot.n_spec_target_passes) : json(nullptr)},
+                {"useful_output_tokens_per_target_pass", slot.n_spec_target_passes > 0 ? json((double) slot.n_spec_useful_tokens / slot.n_spec_target_passes) : json(nullptr)},
+                {"configuration", {
+                    {"types", common_speculative_type_name_str(slot.task->params.speculative.types)},
+                    {"draft_n_max", slot.task->params.speculative.draft.n_max},
+                    {"draft_n_min", slot.task->params.speculative.draft.n_min},
+                    {"draft_p_split", slot.task->params.speculative.draft.p_split},
+                    {"draft_p_min", slot.task->params.speculative.draft.p_min},
+                    {"ngram_mod_n_match", slot.task->params.speculative.ngram_mod.n_match},
+                    {"ngram_mod_n_max", slot.task->params.speculative.ngram_mod.n_max},
+                    {"ngram_mod_n_min", slot.task->params.speculative.ngram_mod.n_min},
+                    {"ngram_simple_size_n", slot.task->params.speculative.ngram_simple.size_n},
+                    {"ngram_simple_size_m", slot.task->params.speculative.ngram_simple.size_m},
+                    {"ngram_simple_min_hits", slot.task->params.speculative.ngram_simple.min_hits},
+                }},
+            }},
+        };
+
+        auto probability_json = [](const telemetry_probability_accumulator & probability, const char * semantics) {
+            const double mean_nll = probability.nll_sum / probability.count;
+            const double perplexity = std::exp(mean_nll);
+            return json {
+                {"state", "available"},
+                {"available", true},
+                {"semantics", semantics},
+                {"scored_tokens", probability.count},
+                {"mean_nll", mean_nll},
+                {"mean_selected_token_log_probability", -mean_nll},
+                {"min_selected_token_log_probability", probability.min_logprob},
+                {"max_selected_token_log_probability", probability.max_logprob},
+                {"perplexity", std::isfinite(perplexity) ? json(perplexity) : json(nullptr)},
+                {"perplexity_state", std::isfinite(perplexity) ? "available" : "overflow"},
+            };
+        };
+
+        if (slot.task->params.sampling.n_probs == 0) {
+            event["response_probability"] = {
+                {"state", "disabled"},
+                {"available", false},
+                {"reason", "request_did_not_enable_logprobs"},
+            };
+        } else if (!slot.response_probability.unavailable_reason.empty()) {
+            event["response_probability"] = {
+                {"state", "unavailable"},
+                {"available", false},
+                {"reason", slot.response_probability.unavailable_reason},
+            };
+        } else if (slot.response_probability.count == 0) {
+            event["response_probability"] = {
+                {"state", "unavailable"},
+                {"available", false},
+                {"reason", "no_selected_token_probabilities_recorded"},
+            };
+        } else {
+            event["response_probability"] = probability_json(
+                slot.response_probability, "raw_target_model_pre_sampler_selected_token_probability");
+        }
+
+        if (!slot.task->params.prompt_perplexity) {
+            event["prompt_probability"] = {
+                {"state", "disabled"},
+                {"available", false},
+                {"reason", "request_did_not_enable_prompt_perplexity"},
+            };
+        } else if (!slot.prompt_probability.unavailable_reason.empty()) {
+            event["prompt_probability"] = {
+                {"state", "unavailable"},
+                {"available", false},
+                {"reason", slot.prompt_probability.unavailable_reason},
+            };
+        } else if (slot.prompt_probability.count == 0) {
+            event["prompt_probability"] = {
+                {"state", "unavailable"},
+                {"available", false},
+                {"reason", "no_prompt_token_probabilities_recorded"},
+            };
+        } else {
+            event["prompt_probability"] = probability_json(
+                slot.prompt_probability, "raw_target_model_next_token_probability_cold_text_prompt");
+            event["prompt_probability"]["conditioning_tokens"] = 1;
+            event["prompt_probability"]["cache_reuse_disabled"] = true;
+        }
+
+        if (telemetry_content) {
+            event["request"] = slot.task->telemetry_request;
+            event["response"] = slot.generated_text;
+        }
+        telemetry_append(std::move(event));
+    }
+
+    json telemetry_events_json(uint64_t cursor, size_t limit) const {
+        json events = json::array();
+        const uint64_t oldest = telemetry_events.empty() ? telemetry_next_sequence : telemetry_events.front().data.at("sequence").get<uint64_t>();
+        uint64_t next_cursor = cursor;
+        for (const auto & entry : telemetry_events) {
+            const auto & event = entry.data;
+            const uint64_t sequence = event.at("sequence").get<uint64_t>();
+            if (sequence <= cursor) {
+                continue;
+            }
+            events.push_back(event);
+            next_cursor = sequence;
+            if (events.size() >= limit) {
+                break;
+            }
+        }
+        return {
+            {"schema_version", 1},
+            {"server_instance_id", telemetry_server_instance_id},
+            {"events", std::move(events)},
+            {"cursor", next_cursor},
+            {"oldest_sequence", oldest},
+            {"next_sequence", telemetry_next_sequence},
+            {"gap", cursor < telemetry_last_dropped_sequence || (cursor == 0 && oldest > 1) || (cursor != 0 && cursor + 1 < oldest)},
+            {"dropped_events", telemetry_dropped_events},
+            {"last_dropped_sequence", telemetry_last_dropped_sequence},
+            {"retained_serialized_bytes", telemetry_event_bytes},
+            {"content_logging", telemetry_content},
+        };
+    }
+
+    static json telemetry_churn_json(const llama_memory_churn_data & churn) {
+        return {
+            {"entries_allocated", churn.entries_allocated},
+            {"entries_released", churn.entries_released},
+            {"entries_overwritten", churn.entries_overwritten},
+            {"memberships_added", churn.memberships_added},
+            {"memberships_removed", churn.memberships_removed},
+            {"sequence_remove_operations", churn.sequence_remove_operations},
+            {"sequence_copy_operations", churn.sequence_copy_operations},
+            {"shared_copy_entries", churn.shared_copy_entries},
+            {"copied_entries", churn.copied_entries},
+            {"reset_operations", churn.reset_operations},
+            {"context_shift_operations", churn.context_shift_operations},
+            {"shifted_entries", churn.shifted_entries},
+            {"prepare_failures", churn.prepare_failures},
+            {"optimize_attempts", churn.optimize_attempts},
+            {"defragmentation", {
+                {"state", "not_applicable"},
+                {"reason", "active KV defragmentation is not implemented by the current memory backends"},
+            }},
+        };
+    }
+
+    static json telemetry_memory_diagnostics_json(const llama_memory_diagnostics & diagnostics) {
+        if (diagnostics.state != "available") {
+            return {
+                {"state", diagnostics.state},
+                {"components", json::array()},
+            };
+        }
+
+        json components = json::array();
+        const llama_memory_component_diagnostics * primary = nullptr;
+        for (const auto & component : diagnostics.components) {
+            if (!primary && component.logical_primary) {
+                primary = &component;
+            }
+            components.push_back({
+                {"name", component.name},
+                {"kind", component.kind},
+                {"entry_semantics", component.entry_semantics},
+                {"state", component.state},
+                {"logical_primary", component.logical_primary},
+                {"capacity_entries", component.capacity_entries},
+                {"used_entries", component.used_entries},
+                {"free_entries", component.capacity_entries - component.used_entries},
+                {"utilization", component.capacity_entries > 0 ? json((double) component.used_entries / component.capacity_entries) : json(nullptr)},
+                {"resident_tokens", component.resident_tokens_supported ? json(component.resident_tokens) : json(nullptr)},
+                {"resident_tokens_state", component.resident_tokens_supported ? "available" : "not_applicable"},
+                {"sequences_represented", component.sequences_represented},
+                {"physical_sharing", {
+                    {"state", component.physical_sharing_supported ? "available" : "not_applicable"},
+                    {"shared_entries", component.shared_entries},
+                    {"shared_tokens", component.resident_tokens_supported ? json(component.shared_entries) : json(nullptr)},
+                    {"shared_memberships", component.shared_memberships},
+                    {"sequences_benefiting", component.sequences_sharing},
+                    {"shared_groups", component.shared_groups},
+                    {"average_fanout", component.shared_entries > 0 ? json((double) component.shared_memberships / component.shared_entries) : json(nullptr)},
+                    {"maximum_fanout", component.max_fanout},
+                }},
+                {"allocated_bytes", component.allocated_bytes},
+                {"occupied_bytes_estimate", component.occupied_bytes_estimate},
+                {"occupied_bytes_is_estimate", component.occupied_bytes_is_estimate},
+                {"churn", telemetry_churn_json(component.churn)},
+            });
+        }
+
+        json live = {{"state", primary ? "available" : "unsupported"}};
+        json sharing = {{"state", primary && primary->physical_sharing_supported ? "available" : "not_applicable"}};
+        if (primary) {
+            live.update({
+                {"memory_kind", primary->kind},
+                {"entry_semantics", primary->entry_semantics},
+                {"capacity_entries", primary->capacity_entries},
+                {"used_entries", primary->used_entries},
+                {"free_entries", primary->capacity_entries - primary->used_entries},
+                {"utilization", primary->capacity_entries > 0 ? json((double) primary->used_entries / primary->capacity_entries) : json(nullptr)},
+                {"resident_tokens", primary->resident_tokens_supported ? json(primary->resident_tokens) : json(nullptr)},
+                {"resident_tokens_state", primary->resident_tokens_supported ? "available" : "not_applicable"},
+                {"sequences_represented", primary->sequences_represented},
+                {"allocated_bytes", primary->allocated_bytes},
+                {"occupied_bytes_estimate", primary->occupied_bytes_estimate},
+                {"occupied_bytes_is_estimate", primary->occupied_bytes_is_estimate},
+            });
+            sharing.update({
+                {"entry_semantics", primary->entry_semantics},
+                {"shared_entries", primary->shared_entries},
+                {"shared_tokens", primary->resident_tokens_supported ? json(primary->shared_entries) : json(nullptr)},
+                {"shared_memberships", primary->shared_memberships},
+                {"sequences_benefiting", primary->sequences_sharing},
+                {"shared_prefix_groups", primary->shared_groups},
+                {"average_fanout", primary->shared_entries > 0 ? json((double) primary->shared_memberships / primary->shared_entries) : json(nullptr)},
+                {"maximum_fanout", primary->max_fanout},
+            });
+        }
+
+        return {
+            {"state", "available"},
+            {"live_occupancy", std::move(live)},
+            {"physical_prefix_sharing", std::move(sharing)},
+            {"components", std::move(components)},
+            {"churn", telemetry_churn_json(diagnostics.churn)},
+        };
+    }
+
+    json telemetry_snapshot_json() {
+        int active_slots = 0;
+        uint64_t resident_slot_tokens = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                active_slots++;
+            }
+            resident_slot_tokens += slot.prompt.n_tokens();
+        }
+        const json token_hit_rate = metrics.n_draft_tokens > 0 ? json((double) metrics.n_draft_accepted / metrics.n_draft_tokens) : json(nullptr);
+        const json step_hit_rate = metrics.n_draft_verif_steps > 0 ? json((double) metrics.n_draft_hit_steps / metrics.n_draft_verif_steps) : json(nullptr);
+        const llama_ubatch_stats ubatch_target = llama_get_ubatch_stats(ctx_tgt);
+        const llama_ubatch_stats ubatch_draft = ctx_dft ? llama_get_ubatch_stats(ctx_dft) : llama_ubatch_stats {};
+        const json memory_diagnostics = telemetry_memory_diagnostics_json(llama_get_memory_diagnostics(ctx_tgt));
+        const auto histogram_summary = [](const server_histogram & histogram) {
+            auto quantile_upper_bound = [&](double q) -> json {
+                if (histogram.count == 0) {
+                    return nullptr;
+                }
+                const uint64_t rank = std::max<uint64_t>(1, (uint64_t) std::ceil(q * histogram.count));
+                for (size_t i = 0; i < histogram.bounds.size(); ++i) {
+                    if (histogram.buckets[i] >= rank) {
+                        return histogram.bounds[i];
+                    }
+                }
+                return "+Inf";
+            };
+            json buckets = json::array();
+            for (size_t i = 0; i < histogram.bounds.size(); ++i) {
+                buckets.push_back({{"le", histogram.bounds[i]}, {"count", histogram.buckets[i]}});
+            }
+            buckets.push_back({{"le", "+Inf"}, {"count", histogram.count}});
+            return json {
+                {"count", histogram.count},
+                {"sum", histogram.sum},
+                {"mean", histogram.count > 0 ? json(histogram.sum / histogram.count) : json(nullptr)},
+                {"maximum", histogram.count > 0 ? json(histogram.maximum) : json(nullptr)},
+                {"p50_upper_bound", quantile_upper_bound(0.50)},
+                {"p95_upper_bound", quantile_upper_bound(0.95)},
+                {"buckets", std::move(buckets)},
+            };
+        };
+        const auto ubatch_to_json = [](const llama_ubatch_stats & stats, bool supported) {
+            if (!supported) {
+                return json {{"state", "not_applicable"}};
+            }
+            const auto bounds = llama_ubatch_histogram_bounds();
+            auto quantile_upper_bound = [&](double q) -> json {
+                if (stats.successful == 0) {
+                    return nullptr;
+                }
+                const uint64_t rank = std::max<uint64_t>(1, (uint64_t) std::ceil(q * stats.successful));
+                for (size_t i = 0; i < bounds.size(); ++i) {
+                    if (stats.token_buckets[i] >= rank) {
+                        return bounds[i];
+                    }
+                }
+                return "+Inf";
+            };
+            json buckets = json::array();
+            for (size_t i = 0; i < bounds.size(); ++i) {
+                buckets.push_back({{"le", bounds[i]}, {"count", stats.token_buckets[i]}});
+            }
+            buckets.push_back({{"le", "+Inf"}, {"count", stats.successful}});
+            return json {
+                {"state", stats.successful > 0 ? "available" : "no_data"},
+                {"attempted", stats.attempted},
+                {"successful", stats.successful},
+                {"failed", stats.attempted - stats.successful},
+                {"tokens", stats.tokens},
+                {"sequence_tokens", stats.sequence_tokens},
+                {"sequences", stats.sequences},
+                {"unique_sequences", stats.unique_sequences},
+                {"mean_tokens", stats.successful > 0 ? json((double) stats.tokens / stats.successful) : json(nullptr)},
+                {"max_tokens", stats.successful > 0 ? json(stats.max_tokens) : json(nullptr)},
+                {"p50_tokens_upper_bound", quantile_upper_bound(0.50)},
+                {"p95_tokens_upper_bound", quantile_upper_bound(0.95)},
+                {"token_buckets", std::move(buckets)},
+            };
+        };
+        return {
+            {"schema_version", 1},
+            {"server_instance_id", telemetry_server_instance_id},
+            {"timestamp_unix_ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()},
+            {"clock", {
+                {"monotonic_us", ggml_time_us()},
+                {"process_start_monotonic_us", metrics.t_start},
+                {"process_start_unix_s", metrics.t_start_unix},
+            }},
+            {"requests", {
+                {"total", metrics.n_requests_total},
+                {"success", metrics.n_requests_success},
+                {"cancelled", metrics.n_requests_cancelled},
+                {"error", metrics.n_requests_error},
+                {"active", active_slots},
+                {"queued", queue_tasks.queue_tasks_pending_size()},
+                {"deferred", queue_tasks.queue_tasks_deferred_size()},
+            }},
+            {"throughput", {
+                {"prefill_tps_window", metrics.prompt_bucket.n_per_second()},
+                {"decode_tps_window", metrics.predict_bucket.n_per_second()},
+                {"evaluated_prompt_tokens_total", metrics.prompt.count},
+                {"server_output_tokens_total", metrics.n_server_output_tokens},
+                {"prefill_state", metrics.prompt_bucket.time > 0 ? "available" : "no_data"},
+                {"decode_state", metrics.predict_bucket.time > 0 ? "available" : "no_data"},
+                {"server_output_tps", nullptr},
+                {"server_output_tps_state", "derive_from_counter_delta"},
+            }},
+            {"forward_pass", {
+                {"decode_calls", metrics.n_decode},
+                {"logical_tokens", metrics.n_logical_tokens},
+                {"successful_calls", metrics.n_logical_decode_success},
+                {"mean_logical_tokens_per_call", metrics.n_logical_decode_success > 0 ? (double) metrics.n_logical_tokens / metrics.n_logical_decode_success : 0.0},
+                {"logical_tokens_per_call_distribution", histogram_summary(metrics.logical_batch_tokens)},
+                {"participating_slots_per_call_distribution", histogram_summary(metrics.logical_batch_slots)},
+                {"physical_ubatch", {
+                    {"target", ubatch_to_json(ubatch_target, true)},
+                    {"draft", ubatch_to_json(ubatch_draft, ctx_dft != nullptr)},
+                }},
+            }},
+            {"cache", {
+                {"reused_prompt_tokens", metrics.n_prompt_cached},
+                {"misses", metrics.n_cache_miss},
+                {"partial_hits", metrics.n_cache_partial},
+                {"full_hits", metrics.n_cache_full},
+            }},
+            {"speculative", {
+                {"draft_tokens", metrics.n_draft_tokens},
+                {"accepted_tokens", metrics.n_draft_accepted},
+                {"rejected_tokens", metrics.n_draft_tokens - metrics.n_draft_accepted},
+                {"verification_steps", metrics.n_draft_verif_steps},
+                {"logical_target_passes", metrics.n_draft_verif_steps},
+                {"hit_steps", metrics.n_draft_hit_steps},
+                {"miss_steps", metrics.n_draft_verif_steps >= metrics.n_draft_hit_steps ? metrics.n_draft_verif_steps - metrics.n_draft_hit_steps : 0},
+                {"full_chain_steps", metrics.n_draft_full_steps},
+                {"target_passes", metrics.n_spec_target_passes},
+                {"target_tokens", metrics.n_spec_target_tokens},
+                {"useful_output_tokens", metrics.n_spec_useful_tokens},
+                {"target_tokens_per_pass", metrics.n_spec_target_passes > 0 ? json((double) metrics.n_spec_target_tokens / metrics.n_spec_target_passes) : json(nullptr)},
+                {"useful_output_tokens_per_target_pass", metrics.n_spec_target_passes > 0 ? json((double) metrics.n_spec_useful_tokens / metrics.n_spec_target_passes) : json(nullptr)},
+                {"token_hit_rate", token_hit_rate},
+                {"token_miss_rate", metrics.n_draft_tokens > 0 ? json(1.0 - token_hit_rate.get<double>()) : json(nullptr)},
+                {"step_hit_rate", step_hit_rate},
+                {"step_miss_rate", metrics.n_draft_verif_steps > 0 ? json(1.0 - step_hit_rate.get<double>()) : json(nullptr)},
+                {"full_chain_rate", metrics.n_draft_verif_steps > 0 ? json((double) metrics.n_draft_full_steps / metrics.n_draft_verif_steps) : json(nullptr)},
+                {"draft_depth_distribution", histogram_summary(metrics.spec_draft_depth)},
+                {"accepted_depth_distribution", histogram_summary(metrics.spec_accepted_depth)},
+                {"target_tokens_per_pass_distribution", histogram_summary(metrics.spec_target_tokens_per_pass)},
+                {"useful_output_tokens_per_target_pass_distribution", histogram_summary(metrics.spec_useful_tokens_per_pass)},
+                {"rate_state", metrics.n_draft_verif_steps > 0 ? "available" : "no_data"},
+            }},
+            {"kv", {
+                {"resident_slot_tokens_upper_bound", resident_slot_tokens},
+                {"represented_slots", std::count_if(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.prompt.n_tokens() > 0; })},
+                {"live_occupancy", memory_diagnostics.value("live_occupancy", json {{"state", "unsupported"}})},
+                {"physical_prefix_sharing", memory_diagnostics.value("physical_prefix_sharing", json {{"state", "unsupported"}})},
+                {"churn", memory_diagnostics.value("churn", json {{"state", "unsupported"}})},
+            }},
+        };
+    }
+
+    json telemetry_duplicate_prefix_json(const llama_memory_diagnostics & diagnostics) const {
+        struct candidate {
+            const server_slot * slot;
+            const llama_tokens * tokens;
+            std::string compatibility;
+        };
+
+        std::vector<candidate> candidates;
+        candidates.reserve(slots.size());
+        for (const auto & slot : slots) {
+            const auto & tokens = slot.prompt.tokens.get_tokens();
+            if (tokens.empty() || std::find(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL) != tokens.end()) {
+                continue;
+            }
+
+            // All server-global model/tokenizer/RoPE configuration is already
+            // identical. Add the per-slot compatibility state which can differ.
+            std::ostringstream compatibility;
+            compatibility << slot.n_ctx;
+            for (const auto & adapter : slot.lora) {
+                uint32_t scale_bits = 0;
+                static_assert(sizeof(scale_bits) == sizeof(adapter.scale));
+                std::memcpy(&scale_bits, &adapter.scale, sizeof(scale_bits));
+                compatibility << ':' << reinterpret_cast<uintptr_t>(adapter.ptr) << ':' << scale_bits;
+            }
+            candidates.push_back({&slot, &tokens, compatibility.str()});
+        }
+
+        std::sort(candidates.begin(), candidates.end(), [](const candidate & left, const candidate & right) {
+            if (left.compatibility != right.compatibility) {
+                return left.compatibility < right.compatibility;
+            }
+            return std::lexicographical_compare(
+                left.tokens->begin(), left.tokens->end(), right.tokens->begin(), right.tokens->end());
+        });
+
+        const auto common_prefix = [](const llama_tokens & left, const llama_tokens & right) {
+            const size_t limit = std::min(left.size(), right.size());
+            size_t length = 0;
+            while (length < limit && left[length] == right[length]) {
+                ++length;
+            }
+            return length;
+        };
+
+        const llama_memory_component_diagnostics * primary = nullptr;
+        for (const auto & component : diagnostics.components) {
+            if (component.logical_primary && component.entry_semantics == "token_kv_cell") {
+                primary = &component;
+                break;
+            }
+        }
+        const long double bytes_per_entry = primary && primary->capacity_entries > 0
+            ? (long double) primary->allocated_bytes / primary->capacity_entries
+            : 0.0L;
+
+        std::vector<size_t> adjacent_lcp(candidates.size(), 0);
+        for (size_t i = 0; i + 1 < candidates.size(); ++i) {
+            if (candidates[i].compatibility == candidates[i + 1].compatibility) {
+                adjacent_lcp[i] = common_prefix(*candidates[i].tokens, *candidates[i + 1].tokens);
+            }
+        }
+
+        json groups = json::array();
+        std::set<int> affected_slots;
+        uint64_t redundant_tokens = 0;
+        uint64_t longest_prefix = 0;
+        uint64_t group_ordinal = 0;
+
+        std::function<void(size_t, size_t, size_t)> analyze_range;
+        analyze_range = [&](size_t begin, size_t end, size_t parent_depth) {
+            if (end - begin < 2) {
+                return;
+            }
+            size_t depth = std::numeric_limits<size_t>::max();
+            for (size_t i = begin; i + 1 < end; ++i) {
+                depth = std::min(depth, adjacent_lcp[i]);
+            }
+
+            if (depth > parent_depth) {
+                std::vector<llama_seq_id> sequence_ids;
+                sequence_ids.reserve(end - begin);
+                for (size_t i = begin; i < end; ++i) {
+                    sequence_ids.push_back(candidates[i].slot->id);
+                }
+                const uint64_t physically_shared = llama_get_memory_shared_prefix_length(
+                    ctx_tgt, sequence_ids.data(), sequence_ids.size(), depth);
+                const size_t unshared_start = std::max(parent_depth, (size_t) std::min<uint64_t>(physically_shared, depth));
+                const uint64_t redundant_increment = (depth - unshared_start) * (end - begin - 1);
+                if (redundant_increment > 0) {
+                    for (size_t i = begin; i < end; ++i) {
+                        affected_slots.insert(candidates[i].slot->id);
+                    }
+                    redundant_tokens += redundant_increment;
+                    longest_prefix = std::max<uint64_t>(longest_prefix, depth);
+                    groups.push_back({
+                        {"ordinal", ++group_ordinal},
+                        {"fanout", end - begin},
+                        {"equivalent_prefix_tokens", depth},
+                        {"physically_shared_prefix_tokens", physically_shared},
+                        {"incremental_redundant_tokens", redundant_increment},
+                        {"estimated_redundant_bytes", (uint64_t) (redundant_increment * bytes_per_entry)},
+                    });
+                }
+                parent_depth = depth;
+            }
+
+            size_t child_begin = begin;
+            for (size_t i = begin; i + 1 < end; ++i) {
+                if (adjacent_lcp[i] <= parent_depth) {
+                    analyze_range(child_begin, i + 1, parent_depth);
+                    child_begin = i + 1;
+                }
+            }
+
+            analyze_range(child_begin, end, parent_depth);
+        };
+
+        size_t compatibility_begin = 0;
+        while (compatibility_begin < candidates.size()) {
+            size_t compatibility_end = compatibility_begin + 1;
+            while (compatibility_end < candidates.size() &&
+                   candidates[compatibility_end].compatibility == candidates[compatibility_begin].compatibility) {
+                ++compatibility_end;
+            }
+            analyze_range(compatibility_begin, compatibility_end, 0);
+            compatibility_begin = compatibility_end;
+        }
+
+        const uint64_t redundant_bytes = (uint64_t) (redundant_tokens * bytes_per_entry);
+        const json reclaim_ratio = primary && primary->occupied_bytes_estimate > 0
+            ? json((double) redundant_bytes / primary->occupied_bytes_estimate)
+            : json(nullptr);
+        return {
+            {"state", primary ? "available" : "not_applicable"},
+            {"semantics", "optimization_estimate_from_compatible_token_metadata_validated_against_physical_sequence_membership"},
+            {"compatible_sequences_examined", candidates.size()},
+            {"duplicate_prefix_groups", groups.size()},
+            {"affected_sequences", affected_slots.size()},
+            {"redundant_prefix_tokens", redundant_tokens},
+            {"estimated_redundant_kv_bytes", redundant_bytes},
+            {"longest_duplicate_prefix_tokens", longest_prefix},
+            {"estimated_potential_reclaim_ratio", reclaim_ratio},
+            {"groups", std::move(groups)},
+            {"multimodal_sequences_skipped", std::count_if(slots.begin(), slots.end(), [](const server_slot & slot) {
+                const auto & tokens = slot.prompt.tokens.get_tokens();
+                return !tokens.empty() && std::find(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL) != tokens.end();
+            })},
+        };
+    }
+
+    json telemetry_kv_json() const {
+        llama_memory_breakdown_data total;
+        json devices = json::array();
+        const auto breakdown = llama_get_memory_breakdown(ctx_tgt);
+        for (const auto & item : breakdown) {
+            total.model += item.second.model;
+            total.context += item.second.context;
+            total.compute += item.second.compute;
+            json allocation = {
+                {"buffer_type", ggml_backend_buft_name(item.first)},
+                {"model_bytes", item.second.model},
+                {"context_bytes", item.second.context},
+                {"compute_bytes", item.second.compute},
+            };
+            if (auto * device = ggml_backend_buft_get_device(item.first)) {
+                size_t free_bytes = 0;
+                size_t total_bytes = 0;
+                ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+                allocation["device"] = ggml_backend_dev_name(device);
+                allocation["device_free_bytes"] = free_bytes;
+                allocation["device_total_bytes"] = total_bytes;
+            } else {
+                allocation["device"] = "host";
+                allocation["device_free_bytes"] = nullptr;
+                allocation["device_total_bytes"] = nullptr;
+            }
+            devices.push_back(std::move(allocation));
+        }
+        uint64_t resident_slot_tokens = 0;
+        size_t represented_slots = 0;
+        for (const auto & slot : slots) {
+            resident_slot_tokens += slot.prompt.n_tokens();
+            represented_slots += slot.prompt.n_tokens() > 0 ? 1 : 0;
+        }
+        const llama_memory_diagnostics memory_diagnostics = llama_get_memory_diagnostics(ctx_tgt);
+        json diagnostics = telemetry_memory_diagnostics_json(memory_diagnostics);
+        json duplicate_prefixes = telemetry_duplicate_prefix_json(memory_diagnostics);
+        return {
+            {"schema_version", 1},
+            {"server_instance_id", telemetry_server_instance_id},
+            {"allocated", {
+                {"model_bytes", total.model},
+                {"context_bytes", total.context},
+                {"compute_bytes", total.compute},
+                {"total_bytes", total.total()},
+                {"by_buffer_type", std::move(devices)},
+            }},
+            {"slot_metadata", {
+                {"resident_tokens_upper_bound", resident_slot_tokens},
+                {"represented_slots", represented_slots},
+            }},
+            {"live_occupancy", diagnostics.value("live_occupancy", json {{"state", "unsupported"}})},
+            {"physical_prefix_sharing", diagnostics.value("physical_prefix_sharing", json {{"state", "unsupported"}})},
+            {"components", diagnostics.value("components", json::array())},
+            {"churn", diagnostics.value("churn", json {{"state", "unsupported"}})},
+            {"duplicate_prefix_opportunities", std::move(duplicate_prefixes)},
+        };
     }
 
     //
@@ -3988,6 +5102,22 @@ private:
     // has_output is computed by the caller, which also already synchronized the context if it is set
     void metrics_post_decode(int32_t off, int32_t n_tokens, bool has_output) {
         metrics.n_decode++;
+        metrics.n_logical_decode_success++;
+        metrics.n_logical_tokens += n_tokens;
+        metrics.logical_batch_tokens.observe(n_tokens);
+        if (++telemetry_slot_epoch == 0) {
+            std::fill(telemetry_slot_marks.begin(), telemetry_slot_marks.end(), 0);
+            telemetry_slot_epoch = 1;
+        }
+        size_t participating_slots = 0;
+        for (int i = off; i < off + n_tokens; ++i) {
+            const size_t id_slot = batch.tokens[i].id_slot;
+            if (telemetry_slot_marks[id_slot] != telemetry_slot_epoch) {
+                telemetry_slot_marks[id_slot] = telemetry_slot_epoch;
+                participating_slots++;
+            }
+        }
+        metrics.logical_batch_slots.observe(participating_slots);
         for (const auto & slot : slots) {
             if (slot.is_processing()) {
                 metrics.n_busy_slots++;
@@ -4013,6 +5143,23 @@ private:
             if (slot.stats.is_set()) {
                 slot.stats.n_prompt_processed++;
             }
+
+            if (t.output && slot.should_score_prompt() && slot.prompt_probability.unavailable_reason.empty()) {
+                // A prompt row at position p predicts the text token at p + 1.
+                // The diagnostic forces a cold, text-only, contiguous prompt, so
+                // token indices and positions are intentionally equivalent here.
+                const int64_t next_index = (int64_t) t.pos + 1;
+                if (next_index >= 0 && next_index < slot.task->n_tokens()) {
+                    const llama_token selected = slot.task->tokens[(size_t) next_index];
+                    double logprob = 0.0;
+                    std::string reason;
+                    if (selected_token_log_probability(ctx_tgt, i - off, selected, logprob, reason)) {
+                        slot.prompt_probability.observe(logprob);
+                    } else {
+                        slot.prompt_probability.unavailable_reason = std::move(reason);
+                    }
+                }
+            }
         }
 
         metrics_queue_prompt(n_prompt_tokens);
@@ -4030,6 +5177,7 @@ private:
             auto & slot = slots[t.id_slot];
             if (t.is_prompt && slot.stats.is_set()) {
                 slot.stats.set_prompt_last(t_now);
+                slot.stats.t_prefill_last = t_now;
             }
         }
     }
@@ -4172,6 +5320,31 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
+static bool parse_w3c_traceparent(const std::string & value, std::string & trace_id) {
+    if (value.size() != 55 || value[2] != '-' || value[35] != '-' || value[52] != '-') {
+        return false;
+    }
+    auto is_hex_range = [&](size_t offset, size_t length) {
+        return std::all_of(value.begin() + offset, value.begin() + offset + length, [](unsigned char c) {
+            return std::isxdigit(c) != 0;
+        });
+    };
+    if (!is_hex_range(0, 2) || !is_hex_range(3, 32) || !is_hex_range(36, 16) || !is_hex_range(53, 2)) {
+        return false;
+    }
+    std::string version = value.substr(0, 2);
+    std::string candidate = value.substr(3, 32);
+    std::string parent_id = value.substr(36, 16);
+    std::transform(version.begin(), version.end(), version.begin(), [](unsigned char c) { return std::tolower(c); });
+    std::transform(candidate.begin(), candidate.end(), candidate.begin(), [](unsigned char c) { return std::tolower(c); });
+    std::transform(parent_id.begin(), parent_id.end(), parent_id.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (version == "ff" || candidate == std::string(32, '0') || parent_id == std::string(16, '0')) {
+        return false;
+    }
+    trace_id = std::move(candidate);
+    return true;
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -4182,6 +5355,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
+    const std::string request_trace_id = "trace-" + random_string();
+    std::string correlation_trace_id;
+    std::string request_traceparent;
+    for (const auto & header : req.headers) {
+        std::string name = header.first;
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (name == "traceparent" && parse_w3c_traceparent(header.second, correlation_trace_id)) {
+            request_traceparent = header.second;
+            break;
+        }
+    }
     auto & rd = res->rd;
     auto & params = this->params;
 
@@ -4191,6 +5375,22 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
     try {
         std::vector<server_task> tasks;
+
+        json telemetry_request;
+        if (ctx_server.telemetry_content_enabled()) {
+            constexpr size_t MAX_TELEMETRY_REQUEST_BYTES = 4 * 1024 * 1024;
+            if (req.body.size() <= MAX_TELEMETRY_REQUEST_BYTES) {
+                telemetry_request["original_request"] = json::parse(req.body);
+                if (data.contains("prompt")) {
+                    telemetry_request["rendered_prompt"] = data.at("prompt");
+                }
+            } else {
+                telemetry_request = {
+                    {"content_omitted", true},
+                    {"reason", "request_exceeds_4_mib_event_limit"},
+                };
+            }
+        }
 
         const auto & prompt = data.at("prompt");
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
@@ -4228,6 +5428,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id = rd.get_new_id();
 
+            task.trace_id = inputs.size() == 1 ? request_trace_id : request_trace_id + "-i" + std::to_string(i);
+            task.traceparent = request_traceparent;
+            task.correlation_trace_id = correlation_trace_id;
+            task.t_arrival = req.t_arrival;
+            task.t_arrival_unix_ms = req.t_arrival_unix_ms;
+            task.telemetry_request = telemetry_request;
+            if (data.contains("temperature") && data.at("temperature").is_number()) {
+                task.telemetry_requested_temperature = data.at("temperature");
+            } else if (data.contains("temp") && data.at("temp").is_number()) {
+                task.telemetry_requested_temperature = data.at("temp");
+            }
+
             task.tokens = std::move(inputs[i]);
             task.params = server_schema::eval_llama_cmpl_schema(
                     ctx_server.vocab,
@@ -4257,6 +5469,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
 
         rd.post_tasks(std::move(tasks));
+        res->headers["X-Llama-Trace-Id"] = request_trace_id;
     } catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         return res;
@@ -4564,6 +5777,33 @@ json server_routes::get_model_info() const {
     return get_res_model_info(*meta);
 }
 
+std::unique_ptr<server_res_generator> server_routes::handle_telemetry(
+        const server_http_req & req,
+        server_task_type type,
+        uint64_t cursor,
+        size_t limit) {
+    auto res = create_response();
+    server_task task(type);
+    task.id = res->rd.get_new_id();
+    task.telemetry_cursor = cursor;
+    task.telemetry_limit = limit;
+    res->rd.post_task(std::move(task), true);
+
+    auto result = res->rd.next(req.should_stop);
+    if (!result) {
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+    auto * telemetry = dynamic_cast<server_task_result_telemetry *>(result.get());
+    GGML_ASSERT(telemetry != nullptr);
+    res->headers["Cache-Control"] = "no-store";
+    res->ok(telemetry->to_json());
+    return res;
+}
+
 void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
@@ -4581,6 +5821,106 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->get_telemetry_capabilities = [this](const server_http_req &) {
+        auto res = create_response(true);
+        res->headers["Cache-Control"] = "no-store";
+        res->ok({
+            {"schema_version", 1},
+            {"server_instance_id", ctx_server.telemetry_instance_id()},
+            {"server", {
+                {"build", std::string(llama_build_info())},
+                {"model", meta->model_name},
+            }},
+            {"clock", {
+                {"duration_clock", "monotonic_microseconds"},
+                {"event_clock", "unix_milliseconds_anchored_at_http_handler_dispatch_after_body_read"},
+                {"process_start_unix_s", ctx_server.get_metrics().t_start_unix},
+            }},
+            {"configuration", {
+                {"parallel_slots", params.n_parallel},
+                {"logical_batch_size", params.n_batch},
+                {"physical_ubatch_size", params.n_ubatch},
+                {"context_size", params.n_ctx},
+                {"continuous_batching", params.cont_batching},
+                {"unified_kv", params.kv_unified},
+            }},
+            {"capabilities", {
+                {"request_lifecycle", {{"state", "available"}, {"version", 1}}},
+                {"ttft", {{"state", "available"}, {"semantics", "first_model_token_minus_http_handler_dispatch_after_body_read"}}},
+                {"queue_latency", {{"state", "available"}, {"semantics", "slot_start_minus_first_enqueue"}}},
+                {"cache_reuse", {{"state", "available"}, {"full_hit_replays_one_token", true}}},
+                {"logical_batch", {{"state", "available"}}},
+                {"physical_ubatch_observed", {{"state", "available"}, {"semantics", "actual llama_ubatch graph submissions"}}},
+                {"speculative", {{"state", "available"}, {"enabled", common_speculative_n_max(&params.speculative) > 0}}},
+                {"response_perplexity", {
+                    {"state", "conditional"},
+                    {"requires", "n_probs > 0 and full raw target logits"},
+                    {"supports_speculative_output", true},
+                    {"semantics", "committed emitted tokens only; rejected and replayed speculative tokens are excluded"},
+                }},
+                {"prompt_perplexity", {
+                    {"state", "conditional"},
+                    {"enable_with", "prompt_perplexity=true"},
+                    {"semantics", "exact raw-target next-token probability for a cold contiguous text prompt"},
+                    {"overhead", "forces one scored prompt token per sequence and performs O(prompt_tokens * vocabulary) CPU work"},
+                    {"multimodal", "unsupported"},
+                }},
+                {"kv_allocation", {{"state", "available"}, {"semantics", "typed memory components plus model/context/compute allocation by buffer type"}}},
+                {"kv_live_occupancy", {{"state", "available"}, {"semantics", "authoritative memory metadata; occupied bytes are a labeled dense-allocation estimate"}}},
+                {"physical_prefix_sharing", {{"state", "available"}, {"semantics", "authoritative multi-sequence membership in physical memory entries"}}},
+                {"duplicate_prefix_opportunities", {{"state", "available"}, {"semantics", "bounded metadata-only optimization estimate; multimodal histories are skipped"}}},
+                {"content_events", {{"state", ctx_server.telemetry_content_enabled() ? "enabled" : "disabled"}, {"enable_with", "LLAMA_TELEMETRY_CONTENT=1"}}},
+            }},
+            {"content_policy", {
+                {"default", "metadata_only"},
+                {"in_memory_event_capacity", 2048},
+                {"serialized_event_capacity_bytes", ctx_server.telemetry_event_capacity_bytes()},
+                {"event_buffer_env", "LLAMA_TELEMETRY_EVENT_BUFFER_MIB"},
+                {"request_capture_limit_bytes", 4 * 1024 * 1024},
+                {"prometheus_content", false},
+            }},
+        });
+        return res;
+    };
+
+    this->get_telemetry_snapshot = [this](const server_http_req & req) {
+        return handle_telemetry(req, SERVER_TASK_TYPE_TELEMETRY_SNAPSHOT);
+    };
+
+    this->get_telemetry_events = [this](const server_http_req & req) {
+        uint64_t cursor = 0;
+        size_t limit = 100;
+        try {
+            auto parse_unsigned = [](const std::string & value) {
+                if (value.empty() || value.front() == '-') {
+                    throw std::invalid_argument("expected unsigned integer");
+                }
+                size_t end = 0;
+                const uint64_t parsed = std::stoull(value, &end);
+                if (end != value.size()) {
+                    throw std::invalid_argument("unexpected trailing characters");
+                }
+                return parsed;
+            };
+            if (!req.get_param("cursor").empty()) {
+                cursor = parse_unsigned(req.get_param("cursor"));
+            }
+            if (!req.get_param("limit").empty()) {
+                limit = parse_unsigned(req.get_param("limit"));
+            }
+        } catch (const std::exception &) {
+            auto res = create_response(true);
+            res->error(format_error_response("cursor and limit must be non-negative integers", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        limit = std::max<size_t>(1, std::min<size_t>(limit, 512));
+        return handle_telemetry(req, SERVER_TASK_TYPE_TELEMETRY_EVENTS, cursor, limit);
+    };
+
+    this->get_telemetry_kv = [this](const server_http_req & req) {
+        return handle_telemetry(req, SERVER_TASK_TYPE_TELEMETRY_KV);
+    };
+
     this->get_metrics = [this](const server_http_req & req) {
         auto res = create_response(true);
         if (!params.endpoint_metrics) {
@@ -4591,7 +5931,7 @@ void server_routes::init_routes() {
         // render response using cached_metrics
         auto use_cached_metrics = [&]() {
             std::unique_lock<std::mutex> lock(mutex_cache);
-            res->headers["Process-Start-Time-Unix"] = std::to_string(cached_metrics.t_start);
+            res->headers["Process-Start-Time-Unix"] = std::to_string(cached_metrics.t_start_unix);
             server_task_result_metrics tmp;
             tmp.metrics = cached_metrics;
             res->content_type = "text/plain; version=0.0.4";
@@ -4634,7 +5974,7 @@ void server_routes::init_routes() {
             auto res_task = dynamic_cast<server_task_result_metrics*>(result.get());
             GGML_ASSERT(res_task != nullptr);
 
-            res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->metrics.t_start);
+            res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->metrics.t_start_unix);
             res->content_type = "text/plain; version=0.0.4";
             res->status = 200;
             res->data = res_task->to_metrics();

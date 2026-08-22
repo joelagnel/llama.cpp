@@ -344,7 +344,10 @@ json format_response_rerank(
 
 // shared between server_slot and server_task_result_*
 struct server_slot_stats {
+    std::string trace_id;
+
     uint64_t n_prompt_cached    = 0;
+    uint64_t n_prompt_matched   = 0;
     uint64_t n_prompt_processed = 0;
     uint64_t n_gen              = 0;
 
@@ -359,6 +362,17 @@ struct server_slot_stats {
     int64_t t_start       = 0;
     int64_t t_prompt_last = 0;
     int64_t t_gen_last    = 0;
+
+    int64_t t_arrival       = 0;
+    int64_t t_enqueue       = 0;
+    int64_t t_slot_start    = 0;
+    int64_t t_cache_start   = 0;
+    int64_t t_cache_last    = 0;
+    int64_t t_prefill_start = 0;
+    int64_t t_prefill_last  = 0;
+    int64_t t_first_token   = 0;
+    int64_t t_complete      = 0;
+    int64_t t_arrival_unix_ms = 0;
 
     // can only move one direction: start -> prompt -> gen
     void update_prompt_start() {
@@ -421,6 +435,43 @@ struct server_slot_stats {
         return t_ms > 0.0 ? 1e3 / t_ms * n_gen_steps() : 0.0;
     }
 
+    double t_queue_ms() const {
+        return t_slot_start > 0 && t_enqueue > 0 ? (t_slot_start - t_enqueue) / 1000.0 : 0.0;
+    }
+    double t_cache_ms() const {
+        return t_cache_last > 0 && t_cache_start > 0 ? (t_cache_last - t_cache_start) / 1000.0 : 0.0;
+    }
+    double t_prefill_actual_ms() const {
+        return t_prefill_last > 0 && t_prefill_start > 0 ? (t_prefill_last - t_prefill_start) / 1000.0 : 0.0;
+    }
+    double t_prefill_actual_per_token_ms() const {
+        return n_prompt_processed > 0 ? t_prefill_actual_ms() / n_prompt_processed : 0.0;
+    }
+    double n_prefill_actual_tps() const {
+        const double t_ms = t_prefill_actual_ms();
+        return t_ms > 0.0 ? 1e3 / t_ms * n_prompt_processed : 0.0;
+    }
+    double t_ttft_ms() const {
+        return t_first_token > 0 && t_arrival > 0 ? (t_first_token - t_arrival) / 1000.0 : 0.0;
+    }
+    double t_e2e_ms() const {
+        return t_complete > 0 && t_arrival > 0 ? (t_complete - t_arrival) / 1000.0 : 0.0;
+    }
+    double cache_reuse_ratio() const {
+        const uint64_t total = n_prompt_cached + n_prompt_processed;
+        return total > 0 ? (double) n_prompt_cached / total : 0.0;
+    }
+    const char * cache_status() const {
+        const uint64_t total = n_prompt_cached + n_prompt_processed;
+        if (total == 0 || n_prompt_cached == 0) {
+            return "miss";
+        }
+        if (n_prompt_matched >= total) {
+            return "full";
+        }
+        return "partial";
+    }
+
     // false if the slot never started, i.e. the task result carries no stats
     bool is_set() const {
         return t_start > 0;
@@ -429,10 +480,38 @@ struct server_slot_stats {
     json to_json() const;
 };
 
+struct server_histogram {
+    std::vector<double> bounds;
+    std::vector<uint64_t> buckets;
+    double sum = 0.0;
+    double maximum = 0.0;
+    uint64_t count = 0;
+
+    void init(std::initializer_list<double> values) {
+        bounds.assign(values);
+        buckets.assign(bounds.size(), 0);
+        sum = 0.0;
+        maximum = 0.0;
+        count = 0;
+    }
+
+    void observe(double value) {
+        sum += value;
+        maximum = count == 0 ? value : std::max(maximum, value);
+        count++;
+        for (size_t i = 0; i < bounds.size(); ++i) {
+            if (value <= bounds[i]) {
+                buckets[i]++;
+            }
+        }
+    }
+};
+
 // shared between server_context_impl and server_task_result_*
 // unlike server_slot_stats, server_metrics is server-global and cumulative, not tied to a slot
 struct server_metrics {
     int64_t t_start = 0;
+    int64_t t_start_unix = 0;
 
     struct bucket {
         uint64_t count = 0; // number of tokens
@@ -466,15 +545,78 @@ struct server_metrics {
     uint64_t n_tokens_max = 0;
 
     uint64_t n_decode     = 0;
+    uint64_t n_logical_decode_success = 0;
     uint64_t n_busy_slots = 0;
+    uint64_t n_logical_tokens = 0;
+    uint64_t n_server_output_tokens = 0;
+
+    uint64_t n_requests_total     = 0;
+    uint64_t n_requests_success   = 0;
+    uint64_t n_requests_cancelled = 0;
+    uint64_t n_requests_error     = 0;
+    uint64_t n_cache_miss         = 0;
+    uint64_t n_cache_partial      = 0;
+    uint64_t n_cache_full         = 0;
 
     uint64_t n_draft_tokens      = 0; // Total draft tokens generated
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
+    uint64_t n_draft_hit_steps   = 0;
+    uint64_t n_draft_full_steps  = 0;
+    uint64_t n_spec_target_tokens = 0;
+    uint64_t n_spec_useful_tokens = 0;
+    uint64_t n_spec_target_passes = 0;
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
+
+    struct physical_ubatch_metrics {
+        uint64_t attempted = 0;
+        uint64_t successful = 0;
+        uint64_t tokens = 0;
+        uint64_t sequence_tokens = 0;
+        uint64_t sequences = 0;
+        uint64_t unique_sequences = 0;
+        uint64_t max_tokens = 0;
+        server_histogram token_histogram;
+
+        void init() {
+            token_histogram.init({1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192});
+        }
+    } physical_ubatch_target, physical_ubatch_draft;
+
+    server_histogram request_ttft_seconds;
+    server_histogram request_queue_seconds;
+    server_histogram request_prefill_seconds;
+    server_histogram request_tpot_seconds;
+    server_histogram request_e2e_seconds;
+    server_histogram request_prompt_tokens;
+    server_histogram request_output_tokens;
+    server_histogram request_cache_reuse_ratio;
+    server_histogram logical_batch_tokens;
+    server_histogram logical_batch_slots;
+    server_histogram spec_draft_depth;
+    server_histogram spec_accepted_depth;
+    server_histogram spec_target_tokens_per_pass;
+    server_histogram spec_useful_tokens_per_pass;
 
     void init() {
         t_start = ggml_time_us();
+        t_start_unix = std::time(nullptr);
+        request_ttft_seconds   .init({0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1, 2, 5, 10, 20, 30, 60});
+        request_queue_seconds  .init({0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1, 2, 5, 10, 30, 60});
+        request_prefill_seconds.init({0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1, 2, 5, 10, 30, 60});
+        request_tpot_seconds   .init({0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250, 0.500, 1, 2, 5});
+        request_e2e_seconds    .init({0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1, 2, 5, 10, 20, 30, 60, 120, 300});
+        request_prompt_tokens  .init({1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768});
+        request_output_tokens  .init({1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192});
+        request_cache_reuse_ratio.init({0, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99, 1.0});
+        logical_batch_tokens   .init({1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192});
+        logical_batch_slots    .init({1, 2, 4, 8, 16, 32, 64});
+        spec_draft_depth       .init({0, 1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32});
+        spec_accepted_depth    .init({0, 1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32});
+        spec_target_tokens_per_pass.init({1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32});
+        spec_useful_tokens_per_pass.init({0, 1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32});
+        physical_ubatch_target.init();
+        physical_ubatch_draft.init();
     }
 
     void reset_bucket() {

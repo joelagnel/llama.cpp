@@ -31,6 +31,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("cache_prompt", params.cache_prompt))
         ->set_desc("Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests"));
 
+    add((new field_bool("prompt_perplexity", params.prompt_perplexity))
+        ->set_desc("Opt in to exact text-prompt perplexity scoring from raw model logits. This disables prompt-cache reuse for the request, requests logits at every prompt position, and adds O(prompt tokens times vocabulary) CPU work"));
+
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));
 
