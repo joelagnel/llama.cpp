@@ -27,6 +27,9 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_TELEMETRY_SNAPSHOT,
+    SERVER_TASK_TYPE_TELEMETRY_EVENTS,
+    SERVER_TASK_TYPE_TELEMETRY_KV,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -51,6 +54,7 @@ struct task_params {
     bool stream          = false;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+    bool prompt_perplexity = false; // opt-in cold prompt scoring diagnostic
     bool return_tokens   = false;
     bool return_progress = false;
 
@@ -143,6 +147,17 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    std::string trace_id;
+    std::string traceparent;
+    std::string correlation_trace_id;
+    json telemetry_request;
+    json telemetry_requested_temperature;
+    int64_t t_arrival = 0;
+    int64_t t_enqueue = 0;
+    int64_t t_slot_start = 0;
+    int64_t t_cache_start = 0;
+    int64_t t_arrival_unix_ms = 0;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling
@@ -171,6 +186,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
+
+    uint64_t telemetry_cursor = 0;
+    size_t telemetry_limit = 100;
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
@@ -234,6 +252,14 @@ struct server_task {
         copy.type      = type;
         copy.tokens    = tokens.clone();
         copy.id_slot   = -1; // child tasks cannot specify slot
+        copy.trace_id  = trace_id + "-c" + std::to_string(child_tasks.size() + 1);
+        copy.traceparent = traceparent;
+        copy.correlation_trace_id = correlation_trace_id;
+        copy.telemetry_request = telemetry_request;
+        copy.telemetry_requested_temperature = telemetry_requested_temperature;
+        copy.t_arrival = t_arrival;
+        copy.t_enqueue = t_enqueue;
+        copy.t_arrival_unix_ms = t_arrival_unix_ms;
 
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723
@@ -271,6 +297,7 @@ struct result_prompt_progress {
 struct server_task_result {
     int id           = -1;
     int id_slot      = -1;
+    std::string trace_id;
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // to be used for batched tasks
@@ -505,6 +532,14 @@ struct server_task_result_metrics : server_task_result {
         double value; // prometheus values are always float64
     };
     std::string to_metrics();
+};
+
+struct server_task_result_telemetry : server_task_result {
+    json data;
+
+    virtual json to_json() override {
+        return data;
+    }
 };
 
 // used by /slots API

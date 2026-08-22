@@ -71,6 +71,7 @@ json task_params::to_json(bool only_metrics) const {
             {"n_discard",                 n_discard},
             {"ignore_eos",                sampling.ignore_eos},
             {"stream",                    stream},
+            {"prompt_perplexity",         prompt_perplexity},
             {"n_probs",                   sampling.n_probs},
             {"min_keep",                  sampling.min_keep},
             {"chat_format",               common_chat_format_name(chat_parser_params.format)},
@@ -125,6 +126,7 @@ json task_params::to_json(bool only_metrics) const {
         {"n_discard",                 n_discard},
         {"ignore_eos",                sampling.ignore_eos},
         {"stream",                    stream},
+        {"prompt_perplexity",         prompt_perplexity},
         {"logit_bias",                format_logit_bias(sampling.logit_bias)},
         {"n_probs",                   sampling.n_probs},
         {"min_keep",                  sampling.min_keep},
@@ -257,6 +259,22 @@ static inline std::string stop_type_to_str(stop_type type) {
     }
 }
 
+static json add_trace_id(json data, const std::string & trace_id) {
+    if (trace_id.empty()) {
+        return data;
+    }
+    if (data.is_array()) {
+        for (auto & item : data) {
+            if (item.is_object()) {
+                item["trace_id"] = trace_id;
+            }
+        }
+    } else if (data.is_object()) {
+        data["trace_id"] = trace_id;
+    }
+    return data;
+}
+
 //
 // completion_token_output
 //
@@ -319,22 +337,24 @@ std::vector<unsigned char> completion_token_output::str_to_bytes(const std::stri
 //
 json server_task_result_cmpl_final::to_json() {
     GGML_ASSERT(is_updated && "update() must be called before to_json()");
+    json result;
     switch (res_type) {
         case TASK_RESPONSE_TYPE_NONE:
-            return to_json_non_oaicompat();
+            result = to_json_non_oaicompat(); break;
         case TASK_RESPONSE_TYPE_OAI_CMPL:
-            return to_json_oaicompat();
+            result = to_json_oaicompat(); break;
         case TASK_RESPONSE_TYPE_OAI_CHAT:
-            return stream ? to_json_oaicompat_chat_stream() : to_json_oaicompat_chat();
+            result = stream ? to_json_oaicompat_chat_stream() : to_json_oaicompat_chat(); break;
         case TASK_RESPONSE_TYPE_OAI_RESP:
-            return stream ? to_json_oaicompat_resp_stream() : to_json_oaicompat_resp();
+            result = stream ? to_json_oaicompat_resp_stream() : to_json_oaicompat_resp(); break;
         case TASK_RESPONSE_TYPE_OAI_ASR:
-            return to_json_oaicompat_asr();
+            result = to_json_oaicompat_asr(); break;
         case TASK_RESPONSE_TYPE_ANTHROPIC:
-            return stream ? to_json_anthropic_stream() : to_json_anthropic();
+            result = stream ? to_json_anthropic_stream() : to_json_anthropic(); break;
         default:
             GGML_ASSERT(false && "Invalid task_response_type");
     }
+    return add_trace_id(std::move(result), trace_id);
 }
 
 json server_task_result_cmpl_final::to_json_non_oaicompat() {
@@ -1028,22 +1048,24 @@ json server_task_result_cmpl_partial::to_json() {
     if (is_begin) {
         return nullptr; // simply signal to HTTP handler to send the headers and status code
     }
+    json result;
     switch (res_type) {
         case TASK_RESPONSE_TYPE_NONE:
-            return to_json_non_oaicompat();
+            result = to_json_non_oaicompat(); break;
         case TASK_RESPONSE_TYPE_OAI_CMPL:
-            return to_json_oaicompat();
+            result = to_json_oaicompat(); break;
         case TASK_RESPONSE_TYPE_OAI_CHAT:
-            return to_json_oaicompat_chat();
+            result = to_json_oaicompat_chat(); break;
         case TASK_RESPONSE_TYPE_OAI_RESP:
-            return to_json_oaicompat_resp();
+            result = to_json_oaicompat_resp(); break;
         case TASK_RESPONSE_TYPE_OAI_ASR:
-            return to_json_oaicompat_asr();
+            result = to_json_oaicompat_asr(); break;
         case TASK_RESPONSE_TYPE_ANTHROPIC:
-            return to_json_anthropic();
+            result = to_json_anthropic(); break;
         default:
             GGML_ASSERT(false && "Invalid task_response_type");
     }
+    return add_trace_id(std::move(result), trace_id);
 }
 
 json server_task_result_cmpl_partial::to_json_non_oaicompat() {
@@ -1500,6 +1522,9 @@ json server_task_result_rerank::to_json() {
 //
 json server_task_result_error::to_json() {
     json res = format_error_response(err_msg, err_type);
+    if (!trace_id.empty()) {
+        res["trace_id"] = trace_id;
+    }
     if (err_type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
         res["n_prompt_tokens"] = n_prompt_tokens;
         res["n_ctx"]           = n_ctx;
@@ -1539,6 +1564,10 @@ std::string server_task_result_metrics::to_metrics() {
             "Number of generation tokens processed",
             (double) metrics.predict.count
         }, {
+            "server_output_tokens_total",
+            "Number of model-generated tokens observed, updated during generation",
+            (double) metrics.n_server_output_tokens
+        }, {
             "tokens_predicted_seconds_total",
             "Total time spent generating tokens",
             metrics.predict.time / 1.e6
@@ -1546,6 +1575,66 @@ std::string server_task_result_metrics::to_metrics() {
             "n_decode_total",
             "Total number of llama_decode() calls, excluding speculative decoding and multimodal decoding",
             (double) metrics.n_decode
+        }, {
+            "logical_decode_success_total",
+            "Total successful logical llama_decode calls observed by telemetry",
+            (double) metrics.n_logical_decode_success
+        }, {
+            "logical_tokens_total",
+            "Total logical tokens submitted in successful llama_decode() calls",
+            (double) metrics.n_logical_tokens
+        }, {
+            "physical_ubatch_target_attempts_total",
+            "Physical target-context llama_ubatch graph submission attempts",
+            (double) metrics.physical_ubatch_target.attempted
+        }, {
+            "physical_ubatch_target_success_total",
+            "Successful physical target-context llama_ubatch graph submissions",
+            (double) metrics.physical_ubatch_target.successful
+        }, {
+            "physical_ubatch_target_tokens_total",
+            "Tokens evaluated in successful physical target-context llama_ubatches",
+            (double) metrics.physical_ubatch_target.tokens
+        }, {
+            "physical_ubatch_draft_attempts_total",
+            "Physical draft-context llama_ubatch graph submission attempts",
+            (double) metrics.physical_ubatch_draft.attempted
+        }, {
+            "physical_ubatch_draft_success_total",
+            "Successful physical draft-context llama_ubatch graph submissions",
+            (double) metrics.physical_ubatch_draft.successful
+        }, {
+            "physical_ubatch_draft_tokens_total",
+            "Tokens evaluated in successful physical draft-context llama_ubatches",
+            (double) metrics.physical_ubatch_draft.tokens
+        }, {
+            "requests_total",
+            "Total finalized inference requests",
+            (double) metrics.n_requests_total
+        }, {
+            "requests_success_total",
+            "Total successfully completed inference requests",
+            (double) metrics.n_requests_success
+        }, {
+            "requests_cancelled_total",
+            "Total cancelled inference requests",
+            (double) metrics.n_requests_cancelled
+        }, {
+            "requests_error_total",
+            "Total failed inference requests",
+            (double) metrics.n_requests_error
+        }, {
+            "prompt_cache_miss_total",
+            "Total finalized requests with no reusable prompt state",
+            (double) metrics.n_cache_miss
+        }, {
+            "prompt_cache_partial_hit_total",
+            "Total finalized requests with partially reusable prompt state",
+            (double) metrics.n_cache_partial
+        }, {
+            "prompt_cache_full_hit_total",
+            "Total finalized requests whose full prompt matched cached state before the required logits replay",
+            (double) metrics.n_cache_full
         }, {
             "n_tokens_max",
             "Largest observed sequence length (prompt + generation)",
@@ -1562,6 +1651,30 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "spec_decode_hit_steps_total",
+            "Speculative: Verification steps accepting at least one draft token",
+            (double) metrics.n_draft_hit_steps
+        }, {
+            "spec_decode_miss_steps_total",
+            "Speculative: Verification steps accepting zero draft tokens",
+            (double) (metrics.n_spec_target_passes - metrics.n_draft_hit_steps)
+        }, {
+            "spec_decode_full_chain_steps_total",
+            "Speculative: Verification steps accepting the complete proposed chain",
+            (double) metrics.n_draft_full_steps
+        }, {
+            "spec_decode_target_tokens_total",
+            "Speculative: Target-model tokens evaluated in logical verification passes",
+            (double) metrics.n_spec_target_tokens
+        }, {
+            "spec_decode_useful_output_tokens_total",
+            "Speculative: Useful generation advances from logical target verification passes",
+            (double) metrics.n_spec_useful_tokens
+        }, {
+            "spec_decode_target_passes_total",
+            "Speculative: Logical target-model verification passes excluding replay",
+            (double) metrics.n_spec_target_passes
         },
     };
 
@@ -1601,6 +1714,34 @@ std::string server_task_result_metrics::to_metrics() {
 
     add_items("counter", counters);
     add_items("gauge",   gauges);
+
+    auto add_histogram = [&prometheus](const char * name, const char * description, const server_histogram & histogram) {
+        prometheus << "# HELP llamacpp:" << name << " " << description << "\n"
+                   << "# TYPE llamacpp:" << name << " histogram\n";
+        for (size_t i = 0; i < histogram.bounds.size(); ++i) {
+            prometheus << "llamacpp:" << name << "_bucket{le=\"" << histogram.bounds[i] << "\"} " << histogram.buckets[i] << "\n";
+        }
+        prometheus << "llamacpp:" << name << "_bucket{le=\"+Inf\"} " << histogram.count << "\n"
+                   << "llamacpp:" << name << "_sum " << histogram.sum << "\n"
+                   << "llamacpp:" << name << "_count " << histogram.count << "\n";
+    };
+
+    add_histogram("request_ttft_seconds", "Time from HTTP handler dispatch after body read to the first actual model token", metrics.request_ttft_seconds);
+    add_histogram("request_queue_seconds", "Time from first enqueue to slot processing start", metrics.request_queue_seconds);
+    add_histogram("request_prefill_seconds", "Time spent evaluating prompt tokens after cache lookup", metrics.request_prefill_seconds);
+    add_histogram("request_tpot_seconds", "Per-request average steady-state time per output token", metrics.request_tpot_seconds);
+    add_histogram("request_e2e_seconds", "Time from HTTP handler dispatch after body read to request completion", metrics.request_e2e_seconds);
+    add_histogram("request_prompt_tokens", "Prompt token count per finalized request", metrics.request_prompt_tokens);
+    add_histogram("request_output_tokens", "Output token count per finalized request", metrics.request_output_tokens);
+    add_histogram("request_cache_reuse_ratio", "Fraction of prompt tokens reused without evaluation per finalized request", metrics.request_cache_reuse_ratio);
+    add_histogram("logical_batch_tokens", "Logical tokens submitted per llama_decode call", metrics.logical_batch_tokens);
+    add_histogram("logical_batch_slots", "Participating slots per llama_decode call", metrics.logical_batch_slots);
+    add_histogram("physical_ubatch_target_tokens", "Tokens per successful physical target-context llama_ubatch", metrics.physical_ubatch_target.token_histogram);
+    add_histogram("physical_ubatch_draft_tokens", "Tokens per successful physical draft-context llama_ubatch", metrics.physical_ubatch_draft.token_histogram);
+    add_histogram("spec_decode_draft_depth", "Draft tokens proposed per logical verification decision", metrics.spec_draft_depth);
+    add_histogram("spec_decode_accepted_depth", "Draft tokens accepted per logical verification decision", metrics.spec_accepted_depth);
+    add_histogram("spec_decode_target_tokens_per_pass", "Target-model tokens evaluated per logical speculative verification pass", metrics.spec_target_tokens_per_pass);
+    add_histogram("spec_decode_useful_tokens_per_pass", "Useful output-token advances per logical speculative target pass", metrics.spec_useful_tokens_per_pass);
 
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {

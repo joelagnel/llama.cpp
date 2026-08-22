@@ -22,12 +22,35 @@
 //
 
 static bool task_resets_idle_timer(server_task_type type) {
-    return type != SERVER_TASK_TYPE_METRICS;
+    return type != SERVER_TASK_TYPE_METRICS &&
+        type != SERVER_TASK_TYPE_TELEMETRY_SNAPSHOT &&
+        type != SERVER_TASK_TYPE_TELEMETRY_EVENTS &&
+        type != SERVER_TASK_TYPE_TELEMETRY_KV;
+}
+
+static void initialize_task_telemetry(server_task & task) {
+    if (task.type != SERVER_TASK_TYPE_COMPLETION && task.type != SERVER_TASK_TYPE_INFILL) {
+        return;
+    }
+    if (task.trace_id.empty()) {
+        task.trace_id = "trace-" + random_string();
+    }
+    if (task.t_arrival == 0) {
+        task.t_arrival = ggml_time_us();
+    }
+    if (task.t_arrival_unix_ms == 0) {
+        task.t_arrival_unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+    if (task.t_enqueue == 0) {
+        task.t_enqueue = ggml_time_us();
+    }
 }
 
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
+    initialize_task_telemetry(task);
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
@@ -53,6 +76,19 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     for (auto & task : tasks) {
         if (task.id == -1) {
             task.id = id++;
+        }
+        initialize_task_telemetry(task);
+        for (auto & child : task.child_tasks) {
+            if (child.t_arrival == 0) {
+                child.t_arrival = task.t_arrival;
+            }
+            if (child.t_arrival_unix_ms == 0) {
+                child.t_arrival_unix_ms = task.t_arrival_unix_ms;
+            }
+            if (child.t_enqueue == 0) {
+                child.t_enqueue = task.t_enqueue;
+            }
+            initialize_task_telemetry(child);
         }
         // if this is cancel task make sure to clean up pending tasks
         if (task.type == SERVER_TASK_TYPE_CANCEL) {

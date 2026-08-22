@@ -542,6 +542,11 @@ static std::string build_query_string(const httplib::Request & req) {
 // using unique_ptr for request to allow safe capturing in lambdas
 using server_http_req_ptr = std::unique_ptr<server_http_req>;
 
+static int64_t unix_time_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res) {
     if (response->is_stream()) {
         res.status = response->status;
@@ -585,6 +590,8 @@ static void process_handler_response(server_http_req_ptr && request, server_http
 void server_http_context::get(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
     pimpl->srv->Get(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
+        const int64_t t_arrival = ggml_time_us();
+        const int64_t t_arrival_unix_ms = unix_time_ms();
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -592,6 +599,8 @@ void server_http_context::get(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
+            t_arrival,
+            t_arrival_unix_ms,
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
@@ -602,6 +611,8 @@ void server_http_context::get(const std::string & path, const server_http_contex
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
     pimpl->srv->Post(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
+        const int64_t t_arrival = ggml_time_us();
+        const int64_t t_arrival_unix_ms = unix_time_ms();
         std::string body = req.body;
         std::map<std::string, uploaded_file> files;
 
@@ -639,6 +650,8 @@ void server_http_context::post(const std::string & path, const server_http_conte
             build_query_string(req),
             body,
             std::move(files),
+            t_arrival,
+            t_arrival_unix_ms,
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
@@ -649,6 +662,8 @@ void server_http_context::post(const std::string & path, const server_http_conte
 void server_http_context::del(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
     pimpl->srv->Delete(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
+        const int64_t t_arrival = ggml_time_us();
+        const int64_t t_arrival_unix_ms = unix_time_ms();
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
             get_params(req),
             get_headers(req),
@@ -656,6 +671,8 @@ void server_http_context::del(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
+            t_arrival,
+            t_arrival_unix_ms,
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
@@ -811,6 +828,8 @@ void server_http_context::register_gcp_compat() const {
                         req.query_string,
                         payload.dump(),
                         {},
+                        req.t_arrival,
+                        req.t_arrival_unix_ms,
                         req.should_stop,
                     };
 
