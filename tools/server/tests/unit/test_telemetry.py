@@ -1030,7 +1030,13 @@ def test_completion_e2e_ends_at_response_handoff(stream):
 
     if stream:
         url = f"http://{server.server_host}:{server.server_port}/completion"
-        with requests.post(url, json=data, stream=True, timeout=5.0) as response:
+        with requests.post(
+            url,
+            json=data,
+            headers={"Authorization": f"Bearer {server.api_key}"},
+            stream=True,
+            timeout=5.0,
+        ) as response:
             assert response.status_code == 200
             trace_id = response.headers["X-Llama-Trace-Id"]
             final = None
@@ -1433,6 +1439,7 @@ def test_success_error_and_cancel_each_emit_one_release_complete_event():
             "ignore_eos": True,
             "stream": True,
         },
+        headers={"Authorization": f"Bearer {server.api_key}"},
         stream=True,
         timeout=5.0,
     ) as streaming_response:
