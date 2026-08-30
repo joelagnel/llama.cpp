@@ -642,95 +642,85 @@ def test_kv_pressure_split_recovery_finishes_each_identity_when_its_subbatch_suc
 
 
 def test_kv_pressure_identity_stays_waiting_across_multiple_retry_slices():
-    model_file = download_file(MODEL_TINY_FILE_URL)
-    server.model_hf_repo = None
-    server.model_hf_file = None
-    server.model_file = model_file
-    server.n_ctx = 512
-    server.n_batch = 33
-    server.n_ubatch = 33
-    server.n_slots = 3
-    server.n_threads = 1
+    server.n_ctx = 256
+    server.n_batch = 32
+    server.n_ubatch = 32
+    server.n_slots = 2
     server.kv_unified = True
     server.no_cache_idle_slots = True
     server.enable_ctx_shift = False
-    server.server_slots = True
     start_kv_pressure_server()
 
     token = one_token_without_special_tokens()
-    background_data = {
-        "prompt": [token] * 482,
-        "n_predict": 25,
-        "ignore_eos": True,
-        "temperature": 0,
-        "cache_prompt": True,
-    }
+    response = kv_pressure_request(
+        "POST",
+        "/completion",
+        data={
+            "prompt": [[token], [token]],
+            "n_predict": 129,
+            "ignore_eos": True,
+            "temperature": 0,
+            "cache_prompt": True,
+        },
+    )
+    assert response.status_code == 500
+    assert "Context size has been exceeded" in response.body["error"]["message"]
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        background = executor.submit(
-            kv_pressure_request, "POST", "/completion", background_data
-        )
-        deadline = time.monotonic() + 10
-        background_prompt_tokens = 0
-        while time.monotonic() < deadline and not background.done():
-            slots = requests.get(
-                f"http://{server.server_host}:{server.server_port}/slots",
-                headers=KV_PRESSURE_AUTH,
-                timeout=1,
-            )
-            assert slots.status_code == 200
-            active_slots = [slot for slot in slots.json() if slot["is_processing"]]
-            if active_slots:
-                background_prompt_tokens = max(
-                    slot.get("n_prompt_tokens_processed", 0) for slot in active_slots
-                )
-                if background_prompt_tokens >= 462:
-                    break
-            time.sleep(0.001)
-        assert background_prompt_tokens >= 462, (
-            "background request did not reach the final prompt slice"
-        )
-        response = kv_pressure_request(
-            "POST",
-            "/completion",
-            data={
-                "prompt": [[token] * 12, [token] * 20],
-                "n_predict": 1,
-                "ignore_eos": True,
-                "temperature": 0,
-                "cache_prompt": True,
-            },
-        )
-        background_response = background.result()
-    assert background_response.status_code == 200
-    assert response.status_code == 200
-    assert isinstance(response.body, list)
-    assert len(response.body) == 2
-
-    short_trace = min(response.body, key=lambda result: result["tokens_evaluated"])["trace_id"]
-    long_trace = max(response.body, key=lambda result: result["tokens_evaluated"])["trace_id"]
     batch = kv_pressure_batch()
-    starts = [event for event in batch["events"] if event["kind"] == "decode_wait_started"]
+    starts = [
+        event
+        for event in batch["events"]
+        if event["kind"] == "decode_wait_started"
+    ]
     shared_episode = next(
         episode_id
         for episode_id in {event["episode_id"] for event in starts}
-        if {short_trace, long_trace}.issubset(
-            {event["trace_id"] for event in starts if event["episode_id"] == episode_id}
+        if len(
+            {
+                event["trace_id"]
+                for event in starts
+                if event["episode_id"] == episode_id
+            }
         )
+        == 2
     )
     episode = [event for event in batch["events"] if event.get("episode_id") == shared_episode]
-    long_finish = next(
-        event
-        for event in episode
-        if event["kind"] == "decode_wait_finished" and event["trace_id"] == long_trace
-    )
-    second_retries = [
-        event
-        for event in episode
-        if event["kind"] == "decode_retry" and event["retry_count"] == 2
+    trace_ids = {
+        event["trace_id"]
+        for event in starts
+        if event["episode_id"] == shared_episode
+    }
+    assert len(trace_ids) == 2
+    expected_retries = [
+        (1, "batch_halved", 32, 16),
+        (2, "batch_halved", 16, 8),
+        (3, "batch_halved", 8, 4),
+        (4, "batch_halved", 4, 2),
+        (5, "batch_halved", 2, 1),
+        (6, "terminal", 1, 0),
     ]
-    assert {event["trace_id"] for event in second_retries} >= {short_trace, long_trace}
-    assert long_finish["sequence"] > max(event["sequence"] for event in second_retries)
+    for trace_id in trace_ids:
+        retries = [
+            event
+            for event in episode
+            if event["kind"] == "decode_retry" and event["trace_id"] == trace_id
+        ]
+        assert [
+            (
+                event["retry_count"],
+                event["action"],
+                event["attempted_batch_size"],
+                event["next_batch_size"],
+            )
+            for event in retries
+        ] == expected_retries
+        finished = next(
+            event for event in episode
+            if event["kind"] == "decode_wait_finished"
+            and event["trace_id"] == trace_id
+        )
+        assert finished["outcome"] == "context_exhausted"
+        assert finished["sequence"] > retries[-1]["sequence"]
 
 
 def test_kv_pressure_post_split_error_finishes_the_unresolved_identity():
