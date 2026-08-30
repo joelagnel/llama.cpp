@@ -64,7 +64,8 @@ struct task_params {
     bool output_token_candidate_include_accepted = false; // include accepted MTP positions in target top-K detail
     int32_t output_token_candidate_top_k = 5;
     int32_t output_token_candidate_byte_cap = 32 * 1024;
-    bool moe_routing_telemetry = false; // opt-in bounded routed-expert diagnostics
+    bool moe_routing_telemetry = false; // effective request-time routed-expert diagnostics state
+    bool moe_routing_telemetry_permitted = false; // false permanently opts this request out; true permits a live global gate
     bool return_tokens   = false;
     bool return_progress = false;
 

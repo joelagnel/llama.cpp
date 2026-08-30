@@ -285,6 +285,48 @@ struct telemetry_moe_token_activation_record {
     bool replay_pass = false;
 };
 
+// The native readback is invalidated by the next decode or routing toggle. Keep
+// an owning copy while the decode still owns the native context.
+struct telemetry_moe_routing_expert_capture {
+    int32_t expert_index = -1;
+    float effective_weight = std::numeric_limits<float>::quiet_NaN();
+    llama_moe_routing_value_status expert_index_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    llama_moe_routing_value_status effective_weight_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+};
+
+struct telemetry_moe_routing_row_capture {
+    int32_t layer_index = -1;
+    uint32_t graph_type = 0;
+    uint32_t physical_ubatch_index = 0;
+    int32_t row_index = -1;
+    int32_t ubatch_token_index = -1;
+    int32_t token_index = -1;
+    llama_token token = LLAMA_TOKEN_NULL;
+    llama_pos position = -1;
+    std::vector<telemetry_moe_routing_expert_capture> selected_experts;
+    llama_moe_routing_value_status row_identity_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    llama_moe_routing_value_status selected_experts_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    float selected_score = std::numeric_limits<float>::quiet_NaN();
+    float rejected_score = std::numeric_limits<float>::quiet_NaN();
+    llama_moe_routing_value_status selected_score_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    llama_moe_routing_value_status rejected_score_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+};
+
+struct telemetry_moe_shared_expert_capture {
+    int32_t layer_index = -1;
+    uint32_t graph_type = 0;
+    bool present = false;
+    uint32_t configured_count = 0;
+    uint32_t ffn_size = 0;
+};
+
+struct telemetry_moe_routing_readback_capture {
+    uint32_t version = 0;
+    uint64_t capture_generation = 0;
+    std::vector<telemetry_moe_routing_row_capture> rows;
+    std::vector<telemetry_moe_shared_expert_capture> shared_experts;
+};
+
 struct server_batch {
     llama_batch batch;
     bool batch_rendered = false;
@@ -4516,13 +4558,13 @@ private:
             collect_moe_routing |= control.moe_routing
                 && llama_model_n_expert(model_tgt) > 0
                 && slot.task
-                && slot.task->params.moe_routing_telemetry;
+                && slot.task->params.moe_routing_telemetry_permitted;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        std::vector<llama_moe_routing_entry> moe_routing_entries;
+        telemetry_moe_routing_readback_capture moe_routing_readback;
         queue_tasks.yield_to_queue([&]() {
             llama_set_moe_routing(ctx_tgt, collect_moe_routing);
             ret = llama_decode(ctx_tgt, batch_view);
@@ -4530,17 +4572,13 @@ private:
                 llama_synchronize(ctx_tgt);
             }
             if (ret == 0 && collect_moe_routing) {
-                size_t count = 0;
-                const llama_moe_routing_entry * entries = llama_get_moe_routing(ctx_tgt, &count);
-                if (entries != nullptr && count > 0) {
-                    moe_routing_entries.assign(entries, entries + count);
-                }
+                telemetry_copy_moe_routing_readback(moe_routing_readback);
             }
         });
         const int64_t decode_completed_us = ggml_time_us();
 
         if (ret == 0 && collect_moe_routing) {
-            telemetry_record_moe_routing(moe_routing_entries, off, batch_view.n_tokens);
+            telemetry_record_moe_routing(moe_routing_readback, off, batch_view.n_tokens);
         }
 
         if (ret == 0 && gpu_telemetry.is_collecting()) {
@@ -5766,16 +5804,92 @@ private:
         };
     }
 
+    bool telemetry_copy_moe_routing_readback(telemetry_moe_routing_readback_capture & destination) {
+        destination = {};
+        const llama_moe_routing_readback * source = llama_get_moe_routing_readback(ctx_tgt);
+        if (source == nullptr || source->version != LLAMA_MOE_ROUTING_READBACK_VERSION ||
+                source->struct_size < sizeof(llama_moe_routing_readback)) {
+            return false;
+        }
+
+        destination.version = source->version;
+        destination.capture_generation = source->capture_generation;
+        if (source->row_count > 0 && source->rows == nullptr) {
+            return false;
+        }
+        destination.rows.reserve(source->row_count);
+        for (size_t index = 0; index < source->row_count; ++index) {
+            const llama_moe_routing_row & row = source->rows[index];
+            telemetry_moe_routing_row_capture copied;
+            copied.layer_index = row.layer_index;
+            copied.graph_type = row.graph_type;
+            copied.physical_ubatch_index = row.physical_ubatch_index;
+            copied.row_index = row.row_index;
+            copied.ubatch_token_index = row.ubatch_token_index;
+            copied.token_index = row.token_index;
+            copied.token = row.token;
+            copied.position = row.position;
+            copied.row_identity_status = row.row_identity_status;
+            copied.selected_experts_status = row.selected_experts_status;
+            copied.selected_score = row.selected_score;
+            copied.rejected_score = row.rejected_score;
+            copied.selected_score_status = row.selected_score_status;
+            copied.rejected_score_status = row.rejected_score_status;
+            if (row.selected_expert_count > 0 && row.selected_experts == nullptr) {
+                copied.selected_experts_status = LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
+            } else {
+                copied.selected_experts.reserve(row.selected_expert_count);
+                for (size_t expert_index = 0; expert_index < row.selected_expert_count; ++expert_index) {
+                    const llama_moe_routing_expert & expert = row.selected_experts[expert_index];
+                    copied.selected_experts.push_back({
+                        expert.expert_index,
+                        expert.effective_weight,
+                        expert.expert_index_status,
+                        expert.effective_weight_status,
+                    });
+                }
+            }
+            destination.rows.push_back(std::move(copied));
+        }
+
+        if (source->shared_expert_count > 0 && source->shared_experts == nullptr) {
+            return false;
+        }
+        destination.shared_experts.reserve(source->shared_expert_count);
+        for (size_t index = 0; index < source->shared_expert_count; ++index) {
+            const llama_moe_shared_expert_metadata & metadata = source->shared_experts[index];
+            destination.shared_experts.push_back({
+                metadata.layer_index,
+                metadata.graph_type,
+                metadata.present,
+                metadata.configured_count,
+                metadata.ffn_size,
+            });
+        }
+        return true;
+    }
+
     bool telemetry_moe_request_enabled(const server_slot & slot) const {
         return llama_model_n_expert(model_tgt) > 0
             && slot.task
-            && slot.task->params.moe_routing_telemetry;
+            && slot.task->params.moe_routing_telemetry_permitted;
     }
 
     void telemetry_record_moe_routing(
-            const std::vector<llama_moe_routing_entry> & entries,
+            const telemetry_moe_routing_readback_capture & readback,
             int32_t batch_offset,
             int32_t batch_token_count) {
+        std::vector<llama_moe_routing_entry> entries;
+        for (const telemetry_moe_routing_row_capture & row : readback.rows) {
+            for (const telemetry_moe_routing_expert_capture & expert : row.selected_experts) {
+                entries.push_back({
+                    row.layer_index,
+                    row.token_index,
+                    expert.expert_index,
+                    expert.effective_weight,
+                });
+            }
+        }
         if (entries.empty()) {
             return;
         }
@@ -8310,6 +8424,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
             return globally_enabled && data.at(name).get<bool>();
         };
+        const auto request_feature_permitted = [&](const char * name) {
+            if (!data.contains(name)) {
+                return true;
+            }
+            if (!data.at(name).is_boolean()) {
+                throw std::invalid_argument(std::string(name) + " must be a boolean");
+            }
+            return data.at(name).get<bool>();
+        };
         const bool request_content = request_feature_enabled(
             "request_content", telemetry_control.request_content);
 
@@ -8392,8 +8515,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 "output_token_telemetry", telemetry_control.output_token_detail);
             task.params.output_token_candidate_telemetry = request_feature_enabled(
                 "output_token_candidate_telemetry", telemetry_control.token_candidates);
-            task.params.moe_routing_telemetry = request_feature_enabled(
-                "moe_routing_telemetry", telemetry_control.moe_routing);
+            task.params.moe_routing_telemetry_permitted = request_feature_permitted(
+                "moe_routing_telemetry");
+            task.params.moe_routing_telemetry = telemetry_control.moe_routing
+                && task.params.moe_routing_telemetry_permitted;
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
