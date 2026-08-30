@@ -77,7 +77,7 @@ Content logging is disabled by default. Metadata-only events never contain promp
 
 The ring retains at most 2,048 whole events and 64 MiB of serialized event data by default. Set `LLAMA_TELEMETRY_EVENT_BUFFER_MIB` to a value from 1 through 4096 to change the byte limit. Original requests above 4 MiB are explicitly marked omitted. Oversized events are dropped whole rather than silently truncating content.
 
-An events response contains `cursor`, `oldest_sequence`, `next_sequence`, `gap`, `gap_ranges`, `dropped_events`, `last_dropped_sequence`, and `retained_serialized_bytes`. Send the last consumed `cursor` on the next request. `next_sequence` is an allocation watermark, not the continuation cursor. If `gap` is true, retained history is incomplete for the supplied cursor. Each `gap_ranges` item names only the exact missing global event-sequence interval; it does not invent token, layer, or model-position coordinates for lost data.
+An events response contains `cursor`, `oldest_sequence`, `next_sequence`, `gap`, `gap_ranges`, `dropped_events`, `last_dropped_sequence`, and `retained_serialized_bytes`. Send the last consumed `cursor` on the next request. `next_sequence` is an allocation watermark, not the continuation cursor. If `gap` is true, retained history is incomplete for the supplied cursor. Each `gap_ranges` item names only the exact missing global event-sequence interval; it does not invent token, layer, or model-position coordinates for lost data. A cursor ahead of the server high-water mark is reset to that mark with `gap: true`; `gap_ranges` stays empty because no unallocated future sequence is reported as lost.
 
 ## Response probability
 

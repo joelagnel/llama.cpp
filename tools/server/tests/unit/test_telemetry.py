@@ -151,6 +151,83 @@ def test_event_ring_reuses_serialized_payload_bytes_for_retention_and_response()
     }]
     assert b'"events":[' + b",".join(serialized_events) + b"]" in response.content
 
+    zero_width = server.make_request(
+        "GET",
+        f"/telemetry/v1/events?cursor={body['oldest_sequence'] - 1}&limit=100",
+        headers=auth,
+    )
+    assert zero_width.status_code == 200
+    assert zero_width.body["gap"] is False
+    assert zero_width.body["gap_ranges"] == []
+
+
+def test_event_ring_future_cursor_resets_to_high_water_mark():
+    server.start()
+
+    future = server.make_request("GET", "/telemetry/v1/events?cursor=18446744073709551615")
+    assert future.status_code == 200
+    assert future.body["events"] == []
+    assert future.body["gap"] is True
+    assert future.body["gap_ranges"] == []
+    assert future.body["cursor"] == future.body["next_sequence"] - 1
+
+    response = server.make_request(
+        "POST",
+        "/completion",
+        data={"prompt": "Recover after a future event cursor", "n_predict": 1, "ignore_eos": True},
+    )
+    assert response.status_code == 200
+
+    resumed = server.make_request(
+        "GET", f"/telemetry/v1/events?cursor={future.body['cursor']}&limit=100"
+    )
+    assert resumed.status_code == 200
+    assert resumed.body["events"]
+    assert all(event["sequence"] > future.body["cursor"] for event in resumed.body["events"])
+
+
+def test_event_ring_reports_singleton_trailing_gap_for_dropped_completion():
+    api_key = "dropped-final-event-test-key"
+    auth = {"Authorization": f"Bearer {api_key}"}
+    server.server_props = True
+    server.api_key = api_key
+    server.extra_env = {"LLAMA_TELEMETRY_EVENT_BUFFER_MIB": "1"}
+    server.start()
+
+    control = server.make_request(
+        "POST",
+        "/props",
+        data={"telemetry_control": {"request_content": True}},
+        headers=auth,
+    )
+    assert control.status_code == 200
+
+    completion = server.make_request(
+        "POST",
+        "/completion",
+        data={
+            "prompt": "A small prompt with an oversized retained request payload",
+            "n_predict": 1,
+            "ignore_eos": True,
+            "unused_payload": "x" * (1024 * 1024),
+        },
+        headers=auth,
+    )
+    assert completion.status_code == 200
+
+    response = server.make_request("GET", "/telemetry/v1/events?cursor=0&limit=100", headers=auth)
+    assert response.status_code == 200
+    body = response.body
+    final_sequence = body["next_sequence"] - 1
+    assert body["dropped_events"] == 1
+    assert body["last_dropped_sequence"] == final_sequence
+    assert body["events"][-1]["sequence"] == final_sequence - 1
+    assert body["gap"] is True
+    assert body["gap_ranges"] == [{
+        "first_sequence": final_sequence,
+        "last_sequence": final_sequence,
+    }]
+
 
 def kv_pressure_batch(cursor=0, limit=4096, trace_id=None, headers=None):
     path = f"/telemetry/v1/kv-pressure?cursor={cursor}&limit={limit}"
@@ -1768,12 +1845,15 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         )
         assert response.status_code == 200
         trace_id = response.body["trace_id"]
-        events_response = server.make_request(
-            "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
+        events_http = requests.get(
+            f"http://{server.server_host}:{server.server_port}/telemetry/v1/events?cursor=0&limit=512",
+            headers=auth,
+            timeout=60,
         )
-        assert events_response.status_code == 200
+        assert events_http.status_code == 200
+        events_response = events_http.json()
         chunks = [
-            event for event in events_response.body["events"]
+            event for event in events_response["events"]
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == trace_id
         ]
         assert chunks
@@ -1798,8 +1878,13 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
             )
             for chunk in chunks
         )
+        serialized_events = [
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            for event in events_response["events"]
+        ]
+        assert b'"events":[' + b",".join(serialized_events) + b"]" in events_http.content
         assert all(chunk["sequence"] > 0 for chunk in chunks)
-        assert all(chunk["server_instance_id"] == events_response.body["server_instance_id"] for chunk in chunks)
+        assert all(chunk["server_instance_id"] == events_response["server_instance_id"] for chunk in chunks)
         assert all(chunk["physical_peer_coverage"] in ["complete", "partial"] for chunk in chunks)
         assert all("shared_experts" in chunk for chunk in chunks)
         assert len({decision["physical_ubatch_index"] for decision in decisions}) >= 2

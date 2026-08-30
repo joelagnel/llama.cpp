@@ -7854,23 +7854,36 @@ private:
     }
 
     std::string telemetry_events_json(uint64_t cursor, size_t limit) const {
+        const uint64_t latest = telemetry_next_sequence - 1;
+        const bool future_cursor = cursor > latest;
+        const uint64_t effective_cursor = future_cursor ? latest : cursor;
         std::string events = "[";
         const uint64_t oldest = telemetry_events.empty() ? telemetry_next_sequence : telemetry_events.front().sequence;
         json gap_ranges = json::array();
-        if (cursor < oldest && oldest > 0) {
-            const uint64_t first_missing_sequence = cursor + 1;
-            if (first_missing_sequence < oldest) {
+        uint64_t previous_sequence = effective_cursor;
+        for (const auto & entry : telemetry_events) {
+            if (entry.sequence <= effective_cursor) {
+                continue;
+            }
+            if (previous_sequence + 1 < entry.sequence) {
                 gap_ranges.push_back({
-                    {"first_sequence", first_missing_sequence},
-                    {"last_sequence", oldest - 1},
+                    {"first_sequence", previous_sequence + 1},
+                    {"last_sequence", entry.sequence - 1},
                 });
             }
+            previous_sequence = entry.sequence;
+        }
+        if (previous_sequence < latest) {
+            gap_ranges.push_back({
+                {"first_sequence", previous_sequence + 1},
+                {"last_sequence", latest},
+            });
         }
         size_t event_count = 0;
-        uint64_t next_cursor = cursor;
+        uint64_t next_cursor = effective_cursor;
         for (const auto & entry : telemetry_events) {
             const uint64_t sequence = entry.sequence;
-            if (sequence <= cursor) {
+            if (sequence <= effective_cursor) {
                 continue;
             }
             if (event_count++ > 0) {
@@ -7890,7 +7903,7 @@ private:
             {"cursor", next_cursor},
             {"oldest_sequence", oldest},
             {"next_sequence", telemetry_next_sequence},
-            {"gap", !gap_ranges.empty()},
+            {"gap", future_cursor || !gap_ranges.empty()},
             {"gap_ranges", std::move(gap_ranges)},
             {"dropped_events", telemetry_dropped_events},
             {"last_dropped_sequence", telemetry_last_dropped_sequence},
