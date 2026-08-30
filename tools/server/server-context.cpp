@@ -526,6 +526,7 @@ struct server_slot {
     uint64_t telemetry_moe_token_decisions_cap_dropped = 0;
     server_moe_routing_capture_counts telemetry_moe_token_detail_counts;
     uint64_t telemetry_moe_chunk_sequence = 0;
+    uint64_t telemetry_moe_chunk_decision_sequence = 0;
     uint64_t telemetry_moe_chunk_rows = 0;
     uint64_t telemetry_moe_chunk_invalid_rows = 0;
     uint64_t telemetry_moe_chunk_unavailable_rows = 0;
@@ -673,6 +674,7 @@ struct server_slot {
         telemetry_moe_token_decisions_cap_dropped = 0;
         telemetry_moe_token_detail_counts = {};
         telemetry_moe_chunk_sequence = 0;
+        telemetry_moe_chunk_decision_sequence = 0;
         telemetry_moe_chunk_rows = 0;
         telemetry_moe_chunk_invalid_rows = 0;
         telemetry_moe_chunk_unavailable_rows = 0;
@@ -6140,7 +6142,7 @@ private:
                     slot.telemetry_moe_chunk_source_unavailable;
                 json event = {
                     {"event", "moe_routing_chunk"},
-                    {"moe_routing_schema_version", 1},
+                    {"moe_routing_schema_version", 2},
                     {"trace_id", trace_id},
                     {"trace_chunk_sequence", ++slot.telemetry_moe_chunk_sequence},
                     {"final", false},
@@ -6215,6 +6217,7 @@ private:
                 decision_valid = decision_valid && kth_selected_valid && highest_rejected_valid;
                 const bool mtp_verify = !token.is_prompt && slot.can_speculate() && !slot.spec_draft.empty();
                 json decision = {
+                    {"trace_decision_sequence", ++slot.telemetry_moe_chunk_decision_sequence},
                     {"physical_step_id", readback.capture_generation},
                     {"physical_ubatch_index", row.physical_ubatch_index},
                     {"physical_ubatch_token_index", row.ubatch_token_index >= 0 ? json(row.ubatch_token_index) : json(nullptr)},
@@ -6263,7 +6266,7 @@ private:
             slot.telemetry_moe_chunk_unavailable_rows > 0;
         json event = {
             {"event", "moe_routing_chunk"},
-            {"moe_routing_schema_version", 1},
+            {"moe_routing_schema_version", 2},
             {"trace_id", slot.task->trace_id},
             {"trace_chunk_sequence", ++slot.telemetry_moe_chunk_sequence},
             {"final", true},
@@ -9404,7 +9407,7 @@ void server_routes::init_routes() {
                         {"enable_with", "POST /props telemetry_control.moe_routing=true; request moe_routing_telemetry=false permanently opts a request out"},
                         {"endpoint", "/telemetry/v1/events"},
                         {"chunk_event", "moe_routing_chunk"},
-                        {"chunk_schema_version", 1},
+                        {"chunk_schema_version", 2},
                         {"chunk_max_serialized_bytes", 1024 * 1024},
                         {"full_request_capture", true},
                         {"transport_gap_ranges", "response gap_ranges report only missing global event-sequence intervals"},
