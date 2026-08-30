@@ -252,6 +252,11 @@ struct telemetry_control_state {
     uint64_t generation = 0;
 };
 
+struct telemetry_control_application {
+    telemetry_control_state effective;
+    const char * effective_from = "next_request";
+};
+
 enum telemetry_moe_token_phase {
     TELEMETRY_MOE_TOKEN_PHASE_PREFILL_OUTPUT,
     TELEMETRY_MOE_TOKEN_PHASE_NORMAL_DECODE,
@@ -1138,11 +1143,18 @@ public:
         return telemetry_control;
     }
 
-    telemetry_control_state telemetry_control_apply(telemetry_control_state next) {
+    telemetry_control_application telemetry_control_apply(telemetry_control_state next) {
         std::lock_guard<std::mutex> lock(mutex_telemetry_control);
+        const bool microbatch_changed =
+                telemetry_control.moe_routing != next.moe_routing ||
+                telemetry_control.kv_pressure_detail != next.kv_pressure_detail ||
+                telemetry_control.native_gpu_gpm != next.native_gpu_gpm;
         next.generation = telemetry_control.generation + 1;
         telemetry_control = next;
-        return telemetry_control;
+        return {
+            telemetry_control,
+            microbatch_changed ? "next_microbatch" : "next_request",
+        };
     }
 
     static json telemetry_control_effective_json(const telemetry_control_state & control) {
@@ -1157,59 +1169,91 @@ public:
         };
     }
 
-    static json telemetry_control_effective_from_json() {
+    json telemetry_control_applicability_json() const {
+        const json gpu = gpu_telemetry.capability_json();
+        const bool gpu_applicable = gpu.value("state", "unavailable") == "available";
         return {
-            {"moe_routing", "next_microbatch"},
-            {"output_token_detail", "next_request"},
-            {"token_candidates", "next_request"},
-            {"prompt_perplexity", "next_request"},
-            {"request_content", "next_request"},
-            {"kv_pressure_detail", "next_microbatch"},
-            {"native_gpu_gpm", "next_microbatch"},
+            {"moe_routing", llama_model_n_expert(model_tgt) > 0
+                ? json { {"applicable", true} }
+                : json { {"applicable", false}, {"reason", "The loaded target model has no routed MoE experts."} }},
+            {"output_token_detail", {{"applicable", true}}},
+            {"token_candidates", {{"applicable", true}}},
+            {"prompt_perplexity", {{"applicable", true}}},
+            {"request_content", {{"applicable", true}}},
+            {"kv_pressure_detail", {{"applicable", true}}},
+            {"native_gpu_gpm", gpu_applicable
+                ? json { {"applicable", true} }
+                : json {
+                    {"applicable", false},
+                    {"reason", gpu.value("reason", "Native NVML GPM is not available for the active backend.")},
+                }},
         };
     }
 
-    json telemetry_control_applicability_json() const {
-        const json gpu = gpu_telemetry.capability_json();
+    static json telemetry_control_state_json(const telemetry_control_state & control) {
         return {
-            {"moe_routing", llama_model_n_expert(model_tgt) > 0
-                ? json { {"state", "available"} }
-                : json { {"state", "not_applicable"}, {"reason", "The loaded target model has no routed MoE experts."} }},
-            {"output_token_detail", {{"state", "available"}}},
-            {"token_candidates", {{"state", "available"}}},
-            {"prompt_perplexity", {{"state", "available"}}},
-            {"request_content", {{"state", "available"}}},
-            {"kv_pressure_detail", {{"state", "available"}}},
-            {"native_gpu_gpm", {
-                {"state", gpu.value("state", "conditional")},
-                {"reason", gpu.value("reason", "Native NVML GPM availability is evaluated when collection starts.")},
-            }},
+            {"effective", telemetry_control_effective_json(control)},
+            {"generation", control.generation},
         };
     }
 
     json telemetry_control_snapshot_json() const {
-        const telemetry_control_state control = telemetry_control_current();
-        return {
-            {"effective", telemetry_control_effective_json(control)},
-            {"generation", control.generation},
-            {"effective_from", telemetry_control_effective_from_json()},
-        };
+        return telemetry_control_state_json(telemetry_control_current());
     }
 
     json telemetry_control_capability_json() const {
         return {
-            {"state", "available"},
-            {"endpoint", "POST /props"},
-            {"full_replacement", true},
-            {"requires", {
-                {"props", "--props"},
-                {"api_key", "a configured non-empty API key"},
-                {"listener", "loopback"},
+            {"supported", true},
+            {"route", "/props"},
+            {"method", "POST"},
+            {"requires_props", true},
+            {"requires_authentication", true},
+            {"requires_loopback", true},
+            {"replacement_semantics", "full"},
+            {"features", {
+                {"moe_routing", {
+                    {"supported", true},
+                    {"effective_from", "next_microbatch"},
+                    {"dependencies", json::array({"moe_model"})},
+                    {"privacy_sensitive", false},
+                }},
+                {"output_token_detail", {
+                    {"supported", true},
+                    {"effective_from", "next_request"},
+                    {"dependencies", json::array()},
+                    {"privacy_sensitive", true},
+                }},
+                {"token_candidates", {
+                    {"supported", true},
+                    {"effective_from", "next_request"},
+                    {"dependencies", json::array({"output_token_detail"})},
+                    {"privacy_sensitive", true},
+                }},
+                {"prompt_perplexity", {
+                    {"supported", true},
+                    {"effective_from", "next_request"},
+                    {"dependencies", json::array()},
+                    {"privacy_sensitive", false},
+                }},
+                {"request_content", {
+                    {"supported", true},
+                    {"effective_from", "next_request"},
+                    {"dependencies", json::array()},
+                    {"privacy_sensitive", true},
+                }},
+                {"kv_pressure_detail", {
+                    {"supported", true},
+                    {"effective_from", "next_microbatch"},
+                    {"dependencies", json::array()},
+                    {"privacy_sensitive", false},
+                }},
+                {"native_gpu_gpm", {
+                    {"supported", true},
+                    {"effective_from", "next_microbatch"},
+                    {"dependencies", json::array()},
+                    {"privacy_sensitive", false},
+                }},
             }},
-            {"request_opt_out", "explicit false disables a request feature"},
-            {"request_cannot_enable_global_off", true},
-            {"environment_cannot_enable_global", true},
-            {"effective_from", telemetry_control_effective_from_json()},
         };
     }
 
@@ -8483,7 +8527,6 @@ void server_routes::init_routes() {
                 {"unified_kv", params.kv_unified},
             }},
             {"capabilities", {
-                {"telemetry_control", ctx_server.telemetry_control_capability_json()},
                 {"request_lifecycle", {{"state", "available"}, {"version", 1}}},
                 {"ttft", {{"state", "available"}, {"semantics", "first_model_token_minus_http_handler_dispatch_after_body_read"}}},
                 {"queue_latency", {{"state", "available"}, {"semantics", "slot_start_minus_first_enqueue"}}},
@@ -8571,6 +8614,7 @@ void server_routes::init_routes() {
                 }},
                 {"content_events", {{"state", "conditional"}, {"enable_with", "POST /props telemetry_control.request_content=true plus request request_content=true"}}},
             }},
+            {"telemetry_control", ctx_server.telemetry_control_capability_json()},
             {"content_policy", {
                 {"default", "metadata_only"},
                 {"in_memory_event_capacity", 2048},
@@ -8938,9 +8982,9 @@ void server_routes::init_routes() {
         next.request_content = value("request_content");
         next.kv_pressure_detail = value("kv_pressure_detail");
         next.native_gpu_gpm = value("native_gpu_gpm");
-        ctx_server.telemetry_control_apply(next);
-
-        json telemetry_control = ctx_server.telemetry_control_snapshot_json();
+        const telemetry_control_application application = ctx_server.telemetry_control_apply(next);
+        json telemetry_control = ctx_server.telemetry_control_state_json(application.effective);
+        telemetry_control["effective_from"] = application.effective_from;
         telemetry_control["applicability"] = ctx_server.telemetry_control_applicability_json();
         res->ok({
             {"success", true},

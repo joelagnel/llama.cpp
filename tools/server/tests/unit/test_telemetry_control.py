@@ -33,16 +33,21 @@ def test_props_telemetry_control_replaces_state_and_resets_on_restart():
 
     capabilities = server.make_request("GET", "/telemetry/v1/capabilities", headers=AUTH)
     assert capabilities.status_code == 200
-    control_capability = capabilities.body["capabilities"]["telemetry_control"]
-    assert control_capability["endpoint"] == "POST /props"
-    assert control_capability["full_replacement"] is True
-    assert control_capability["environment_cannot_enable_global"] is True
+    control_capability = capabilities.body["telemetry_control"]
+    assert control_capability["supported"] is True
+    assert control_capability["route"] == "/props"
+    assert control_capability["method"] == "POST"
+    assert control_capability["requires_props"] is True
+    assert control_capability["requires_authentication"] is True
+    assert control_capability["requires_loopback"] is True
+    assert control_capability["replacement_semantics"] == "full"
+    assert control_capability["features"]["moe_routing"]["effective_from"] == "next_microbatch"
+    assert control_capability["features"]["token_candidates"]["dependencies"] == ["output_token_detail"]
 
     initial = _snapshot(server)
     assert initial["generation"] == 0
     assert all(value is False for value in initial["effective"].values())
-    assert initial["effective_from"]["moe_routing"] == "next_microbatch"
-    assert initial["effective_from"]["output_token_detail"] == "next_request"
+    assert "effective_from" not in initial
 
     enabled = server.make_request(
         "POST",
@@ -56,11 +61,23 @@ def test_props_telemetry_control_replaces_state_and_resets_on_restart():
     assert control["effective"]["output_token_detail"] is True
     assert control["effective"]["request_content"] is True
     assert control["effective"]["token_candidates"] is False
-    assert control["applicability"]["moe_routing"]["state"] == "not_applicable"
+    assert control["effective_from"] == "next_request"
+    assert control["applicability"]["moe_routing"]["applicable"] is False
+
+    microbatch = server.make_request(
+        "POST",
+        "/props",
+        data={"telemetry_control": {"moe_routing": True}},
+        headers=AUTH,
+    )
+    assert microbatch.status_code == 200
+    assert microbatch.body["telemetry_control"]["generation"] == 2
+    assert microbatch.body["telemetry_control"]["effective_from"] == "next_microbatch"
 
     disabled = server.make_request("POST", "/props", data={"telemetry_control": {}}, headers=AUTH)
     assert disabled.status_code == 200
-    assert disabled.body["telemetry_control"]["generation"] == 2
+    assert disabled.body["telemetry_control"]["generation"] == 3
+    assert disabled.body["telemetry_control"]["effective_from"] == "next_microbatch"
     assert all(value is False for value in disabled.body["telemetry_control"]["effective"].values())
 
     server.stop()
