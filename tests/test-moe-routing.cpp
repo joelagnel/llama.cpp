@@ -142,12 +142,12 @@ static bool test_moe_model(llama_model * model, const common_params & params) {
 
 int main(int argc, char ** argv) {
     common_params params;
-    params.n_gpu_layers = 0;
 
     common_init();
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
+    params.n_gpu_layers = 0;
 
     ggml_backend_load_all();
     common_init_result_ptr llama_init = common_init_from_params(params);
