@@ -13,6 +13,8 @@
 #include "log.h"
 
 #include <atomic>
+#include <algorithm>
+#include <cctype>
 #include <clocale>
 #include <exception>
 #include <signal.h>
@@ -83,6 +85,42 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
         }
         return res;
     };
+}
+
+static bool telemetry_control_loopback_listener(const std::string & hostname) {
+    std::string value = hostname;
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    return value == "127.0.0.1" || value == "::1" || value == "localhost";
+}
+
+static server_http_res_ptr telemetry_control_router_guard(
+        const common_params & params,
+        const server_http_req & req,
+        const server_http_context::handler_t & proxy) {
+    if (!params.endpoint_props) {
+        auto res = std::make_unique<server_http_res>();
+        res->status = 501;
+        res->data = safe_json_to_str({{"error", format_error_response(
+            "This server does not support changing global properties. Start it with `--props`", ERROR_TYPE_NOT_SUPPORTED)}});
+        return res;
+    }
+    if (params.api_keys.empty()) {
+        auto res = std::make_unique<server_http_res>();
+        res->status = 403;
+        res->data = safe_json_to_str({{"error", format_error_response(
+            "Telemetry control requires a configured API key.", ERROR_TYPE_PERMISSION)}});
+        return res;
+    }
+    if (!telemetry_control_loopback_listener(params.hostname)) {
+        auto res = std::make_unique<server_http_res>();
+        res->status = 403;
+        res->data = safe_json_to_str({{"error", format_error_response(
+            "Telemetry control requires a loopback listener.", ERROR_TYPE_PERMISSION)}});
+        return res;
+    }
+    return proxy(req);
 }
 
 int llama_server(int argc, char ** argv) {
@@ -216,7 +254,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.get_telemetry_kv            = models_routes->proxy_get;
         routes.get_telemetry_kv_pressure   = models_routes->proxy_get;
         routes.get_telemetry_gpu           = models_routes->proxy_get;
-        routes.post_props                  = models_routes->proxy_post;
+        routes.post_props                  = [&params, proxy = models_routes->proxy_post](const server_http_req & req) {
+            return telemetry_control_router_guard(params, req, proxy);
+        };
         routes.post_completions            = models_routes->proxy_post;
         routes.post_completions_oai        = models_routes->proxy_post;
         routes.post_chat_completions       = models_routes->proxy_post;

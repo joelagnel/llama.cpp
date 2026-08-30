@@ -1026,6 +1026,24 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+        if (base_params.endpoint_props && !base_params.api_keys.empty()) {
+            std::string api_keys;
+            for (const std::string & key : base_params.api_keys) {
+                if (key.empty()) {
+                    continue;
+                }
+                if (!api_keys.empty()) {
+                    api_keys += ',';
+                }
+                api_keys += key;
+            }
+            if (!api_keys.empty()) {
+                // Child servers are loopback-only, but retain the same guard and
+                // auth middleware for model-targeted POST /props requests.
+                child_env.push_back("LLAMA_ARG_ENDPOINT_PROPS=1");
+                child_env.push_back("LLAMA_API_KEY=" + api_keys);
+            }
+        }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;

@@ -161,6 +161,7 @@ struct server_task {
     std::string correlation_trace_id;
     json telemetry_request;
     json telemetry_requested_temperature;
+    bool telemetry_content = false;
     int64_t t_arrival = 0;
     int64_t t_enqueue = 0;
     int64_t t_slot_start = 0;
@@ -267,6 +268,7 @@ struct server_task {
         copy.correlation_trace_id = correlation_trace_id;
         copy.telemetry_request = telemetry_request;
         copy.telemetry_requested_temperature = telemetry_requested_temperature;
+        copy.telemetry_content = telemetry_content;
         copy.t_arrival = t_arrival;
         copy.t_enqueue = t_enqueue;
         copy.t_arrival_unix_ms = t_arrival_unix_ms;

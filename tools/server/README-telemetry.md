@@ -25,6 +25,26 @@ Use `-SpecType` with `-SpecModelPath` for a draft backend, or `-MtpModelPath` to
 
 The model router proxies these routes to a selected model in the same way as the existing monitoring routes. Normal server API-key policy applies. Responses include `schema_version` and `server_instance_id`; consumers must reset their cursor when the instance changes.
 
+## Runtime telemetry control
+
+`POST /props` is the single control endpoint. It is available only when the server was started with `--props`, has a configured non-empty API key, and listens on `127.0.0.1`, `::1`, or `localhost`. The normal API-key middleware still authenticates the call. The same restrictions apply to the router's public listener before it proxies a model-targeted request.
+
+```json
+{
+  "model": "optional-router-model-id",
+  "telemetry_control": {
+    "output_token_detail": true,
+    "request_content": true
+  }
+}
+```
+
+`telemetry_control` is a full replacement, not a patch. Its only accepted fields are `moe_routing`, `output_token_detail`, `token_candidates`, `prompt_perplexity`, `request_content`, `kv_pressure_detail`, and `native_gpu_gpm`; every omitted field is false, so `{}` explicitly disables every control. The reply returns the complete effective set, per-control applicability, a monotonically increasing generation, and the boundary at which each control takes effect. `moe_routing`, `kv_pressure_detail`, and `native_gpu_gpm` take effect at the next microbatch. The remaining request-scoped controls take effect for the next request. Last apply wins, and state survives until an explicit replacement or process restart.
+
+`GET /telemetry/v1/capabilities` advertises this static contract. `GET /telemetry/v1/snapshot` includes the current effective set and generation. Environment variables may still set telemetry bounds and buffer sizes, but they cannot enable a telemetry control.
+
+Request booleans remain opt-out switches: an explicit false disables that feature for the request, while true cannot enable a globally disabled control. Requests snapshot `prompt_perplexity`, `output_token_telemetry`, `output_token_candidate_telemetry`, and `request_content` when they are accepted; microbatch controls use the current set at each microbatch.
+
 ## Request identity and clocks
 
 Every completion or infill sequence has an opaque unique `trace_id`. Parallel completion children use distinct IDs. The server returns the root request ID in `X-Llama-Trace-Id` and includes the sequence ID in JSON results and events.
@@ -53,7 +73,7 @@ Final events also retain the complete parsed sampler configuration, including re
 
 ## Event retention and privacy
 
-Content logging is disabled by default. Metadata-only events never contain prompts or responses. Set `LLAMA_TELEMETRY_CONTENT=1` before starting the process to retain the original structured request, rendered prompt, and response in the in-memory event ring.
+Content logging is disabled by default. Metadata-only events never contain prompts or responses. Enable `request_content` through `POST /props`, then leave the request-level `request_content` option unset (or set it true) to retain the original structured request, rendered prompt, and response in the in-memory event ring.
 
 The ring retains at most 2,048 whole events and 64 MiB of serialized event data by default. Set `LLAMA_TELEMETRY_EVENT_BUFFER_MIB` to a value from 1 through 4096 to change the byte limit. Original requests above 4 MiB are explicitly marked omitted. Oversized events are dropped whole rather than silently truncating content.
 
@@ -71,17 +91,17 @@ Prompt perplexity is an independent, explicit diagnostic requested with `prompt_
 
 ## Bounded output-token diagnostics
 
-Per-token detail is disabled by default. Start llama-server with `LLAMA_TELEMETRY_OUTPUT_TOKENS=1`, then set `output_token_telemetry: true` only on requests that need microscopic evidence. For a trusted local OpenClaw-style client that cannot send private request options, start the server with `LLAMA_TELEMETRY_CONTENT=1`, `LLAMA_TELEMETRY_OUTPUT_TOKENS=1`, and `LLAMA_TELEMETRY_TOKEN_CANDIDATES=1`. When all three are enabled together, every completion, chat, Responses, and infill request defaults to `output_token_telemetry: true`, `output_token_candidate_telemetry: true`, and `n_probs >= 1`. Partial gate combinations retain request-by-request behavior. `LLAMA_TELEMETRY_OUTPUT_TOKEN_LIMIT` sets a hard 32--8192 committed-token cap (default 512). The richer speculative records have independent caps: `LLAMA_TELEMETRY_MTP_PASS_LIMIT` and `LLAMA_TELEMETRY_MTP_PROPOSAL_LIMIT` each accept 32 through 4096 with a default of 512, while `LLAMA_TELEMETRY_TOKEN_CANDIDATE_DECISION_LIMIT` accepts 8 through 4096 with a default of 512. Raising the committed-output cap therefore does not retain thousands of MTP proposal or candidate distributions. The disabled path does not allocate the per-request record buffer, take another token-detail clock sample, serialize token rows, or compute probability.
+Per-token detail is disabled by default. Enable `output_token_detail` through `POST /props`; accepted requests snapshot that setting, and may explicitly opt out with `output_token_telemetry: false`. `token_candidates` is independently controlled and requires both global controls for a request that sets `output_token_candidate_telemetry: true`. Set `request_content` globally only when token IDs and pieces, prompts, and response text may be retained. `LLAMA_TELEMETRY_OUTPUT_TOKEN_LIMIT` sets a hard 32--8192 committed-token cap (default 512). The richer speculative records have independent caps: `LLAMA_TELEMETRY_MTP_PASS_LIMIT` and `LLAMA_TELEMETRY_MTP_PROPOSAL_LIMIT` each accept 32 through 4096 with a default of 512, while `LLAMA_TELEMETRY_TOKEN_CANDIDATE_DECISION_LIMIT` accepts 8 through 4096 with a default of 512. Raising the committed-output cap therefore does not retain thousands of MTP proposal or candidate distributions. The disabled path does not allocate the per-request record buffer, take another token-detail clock sample, serialize token rows, or compute probability.
 
 Output-token record schema v3 retains the zero-based output ordinal, the existing request-relative model-ready offset, the absolute process-monotonic model-ready timestamp used to align concurrent sequences, authoritative Base64 tokenizer-piece bytes under the content policy, and the target-model context position derived directly from the evaluated logits-row position plus one. It also classifies each committed token as ordinary target decode, accepted MTP proposal, target replacement after the first mismatch, or target bonus after a full accepted chain. MTP-origin tokens retain their zero-based logical step, actual target pass, proposal position, accepted depth, proposed depth, and whether the committing pass was a checkpoint replay. Multiple tokens committed by one verification pass intentionally share one model-ready timestamp.
 
-Raw selected-token log probability remains independently conditional on `n_probs > 0`, and token ID remains independently conditional on `LLAMA_TELEMETRY_CONTENT=1`. Every record carries separate state and reason fields for model position, probability, token identity, origin, and MTP linkage; ordinary decode reports MTP linkage as `not_applicable`. Older v1 records do not acquire inferred positions or linkage in consumers--those fields remain `not_captured`.
+Raw selected-token log probability remains independently conditional on `n_probs > 0`, and token ID remains independently conditional on `request_content`. Every record carries separate state and reason fields for model position, probability, token identity, origin, and MTP linkage; ordinary decode reports MTP linkage as `not_applicable`. Older v1 records do not acquire inferred positions or linkage in consumers--those fields remain `not_captured`.
 
 This committed-token block does not replace the request-level speculative counters or the `/telemetry/v1/gpu` operation ledger. A target verification pass that is discarded before committing output has no token row, but remains real work in actual-pass totals and native GPU operation evidence. Schema v3 also retains a bounded MTP proposal ledger. Target top-K candidate distributions remain in the separate bounded `/telemetry/v1/token-candidates` block and are never placed in the normal event payload.
 
 ## Bounded MoE routing diagnostics
 
-Static MoE configuration is always reported when the loaded model exposes it. Dynamic request routing is disabled by default. Set `LLAMA_TELEMETRY_MOE_ROUTING=1` before server start and set `moe_routing_telemetry: true` only on the diagnostic request. `LLAMA_TELEMETRY_MOE_ACTIVATION_LIMIT` controls the retained activation cap from 1,024 through 1,048,576 (default 65,536).
+Static MoE configuration is always reported when the loaded model exposes it. Dynamic request routing is disabled by default. Enable `moe_routing` through `POST /props`, then set `moe_routing_telemetry: true` only on the diagnostic request. `LLAMA_TELEMETRY_MOE_ACTIVATION_LIMIT` controls the retained activation cap from 1,024 through 1,048,576 (default 65,536).
 
 The disabled request path does not add graph outputs, host copies, histogram allocation, or exact-token records. The enabled path marks llama.cpp's already-computed selected-expert IDs and final effective expert coefficients as optional graph outputs, performs asynchronous backend-to-host copies, maps routed token positions to server slots, and builds a bounded request histogram. Rows are keyed by `layer_index` plus `expert_index`; the same expert number in two layers is never merged. Each row carries its retained activation count, whole-block share, and within-layer share. The event also keeps routed layer/token/decision counts, total/captured/dropped activations, population, cap, configuration state/reason, and request-detail state/reason.
 

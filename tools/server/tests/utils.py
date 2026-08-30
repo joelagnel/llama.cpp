@@ -85,6 +85,7 @@ class ServerProcess:
     server_embeddings: bool | None = False
     server_reranking: bool | None = False
     server_metrics: bool | None = False
+    server_props: bool | None = False
     kv_unified: bool | None = False
     swa_full: bool | None = False
     server_slots: bool | None = False
@@ -126,6 +127,8 @@ class ServerProcess:
     mcp_servers_config: str | None = None
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
+    request_host: str | None = None
+    extra_env: dict[str, str] | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -146,6 +149,8 @@ class ServerProcess:
         }
         if "LLAMA_CACHE" not in os.environ:
             env["LLAMA_CACHE"] = "tmp"
+        if self.extra_env:
+            env.update(self.extra_env)
         if self.external_server:
             print(f"[external_server]: Assuming external server running on {self.server_host}:{self.server_port}")
             return
@@ -203,6 +208,8 @@ class ServerProcess:
             server_args.append("--reranking")
         if self.server_metrics:
             server_args.append("--metrics")
+        if self.server_props:
+            server_args.append("--props")
         if self.kv_unified:
             server_args.append("--kv-unified")
         if self.swa_full:
@@ -381,7 +388,8 @@ class ServerProcess:
         headers: dict | None = None,
         timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     ) -> ServerResponse:
-        url = f"http://{self.server_host}:{self.server_port}{path}"
+        request_host = self.request_host or self.server_host
+        url = f"http://{request_host}:{self.server_port}{path}"
         parse_body = False
         if method == "GET":
             response = requests.get(url, headers=headers, timeout=timeout)
@@ -416,7 +424,8 @@ class ServerProcess:
         data: dict | None = None,
         headers: dict | None = None,
     ) -> Iterator[dict]:
-        url = f"http://{self.server_host}:{self.server_port}{path}"
+        request_host = self.request_host or self.server_host
+        url = f"http://{request_host}:{self.server_port}{path}"
         if method == "POST":
             response = requests.post(url, headers=headers, json=data, stream=True)
         else:
