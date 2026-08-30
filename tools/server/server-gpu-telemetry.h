@@ -1,13 +1,11 @@
 #pragma once
 
-#include <nlohmann/json_fwd.hpp>
+#include "json.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
-
-using json = nlohmann::ordered_json;
 
 enum server_gpu_operation_kind {
     SERVER_GPU_OPERATION_REQUEST,
@@ -53,8 +51,8 @@ public:
             int64_t proposal_position,
             server_gpu_timing_semantics timing_semantics);
 
-    json capability_json() const;
-    json snapshot_json(
+    common_json capability_json() const;
+    common_json snapshot_json(
             const std::string & server_instance_id,
             uint64_t interval_cursor,
             size_t interval_limit,

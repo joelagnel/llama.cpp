@@ -5938,7 +5938,7 @@ private:
 
         json block = build_block(decisions, 0);
         while (!decisions.empty() && telemetry_json_size(block) > request_cap) {
-            decisions.erase(decisions.end() - 1);
+            decisions.erase(decisions.size() - 1);
             block = build_block(decisions, 0);
         }
         for (size_t iteration = 0; iteration < 16; ++iteration) {
@@ -7049,11 +7049,11 @@ private:
 
         auto matches_explicit_trace = [&](const json & event) {
             if (event.contains("trace_id") && event.at("trace_id").is_string() &&
-                    event.at("trace_id").get_ref<const std::string &>() == trace_id) {
+                    event.at("trace_id").get<std::string>() == trace_id) {
                 return true;
             }
             if (event.contains("victim_trace_id") && event.at("victim_trace_id").is_string() &&
-                    event.at("victim_trace_id").get_ref<const std::string &>() == trace_id) {
+                    event.at("victim_trace_id").get<std::string>() == trace_id) {
                 return true;
             }
             return false;
@@ -7220,33 +7220,30 @@ private:
             {"reason", primary && primary->physical_sharing_supported ? "authoritative physical sequence membership" : "the primary memory component does not expose physical prefix sharing"},
         };
         if (primary) {
-            live.update({
-                {"memory_kind", primary->kind},
-                {"entry_semantics", primary->entry_semantics},
-                {"capacity_entries", primary->capacity_entries},
-                {"used_entries", primary->used_entries},
-                {"free_entries", primary->capacity_entries - primary->used_entries},
-                {"utilization", primary->capacity_entries > 0 ? json((double) primary->used_entries / primary->capacity_entries) : json(nullptr)},
-                {"resident_tokens", primary->resident_tokens_supported ? json(primary->resident_tokens) : json(nullptr)},
-                {"resident_tokens_state", primary->resident_tokens_supported ? "available" : "not_applicable"},
-                {"resident_tokens_reason", primary->resident_tokens_supported
-                    ? "the primary memory component exposes authoritative resident-token membership"
-                    : "the primary memory component does not expose token-addressable residency"},
-                {"sequences_represented", primary->sequences_represented},
-                {"allocated_bytes", primary->allocated_bytes},
-                {"occupied_bytes_estimate", primary->occupied_bytes_estimate},
-                {"occupied_bytes_is_estimate", primary->occupied_bytes_is_estimate},
-            });
-            sharing.update({
-                {"entry_semantics", primary->entry_semantics},
-                {"shared_entries", primary->shared_entries},
-                {"shared_tokens", primary->resident_tokens_supported ? json(primary->shared_entries) : json(nullptr)},
-                {"shared_memberships", primary->shared_memberships},
-                {"sequences_benefiting", primary->sequences_sharing},
-                {"shared_prefix_groups", primary->shared_groups},
-                {"average_fanout", primary->shared_entries > 0 ? json((double) primary->shared_memberships / primary->shared_entries) : json(nullptr)},
-                {"maximum_fanout", primary->max_fanout},
-            });
+            live.set({"memory_kind", primary->kind});
+            live.set({"entry_semantics", primary->entry_semantics});
+            live.set({"capacity_entries", primary->capacity_entries});
+            live.set({"used_entries", primary->used_entries});
+            live.set({"free_entries", primary->capacity_entries - primary->used_entries});
+            live.set({"utilization", primary->capacity_entries > 0 ? json((double) primary->used_entries / primary->capacity_entries) : json(nullptr)});
+            live.set({"resident_tokens", primary->resident_tokens_supported ? json(primary->resident_tokens) : json(nullptr)});
+            live.set({"resident_tokens_state", primary->resident_tokens_supported ? "available" : "not_applicable"});
+            live.set({"resident_tokens_reason", primary->resident_tokens_supported
+                ? "the primary memory component exposes authoritative resident-token membership"
+                : "the primary memory component does not expose token-addressable residency"});
+            live.set({"sequences_represented", primary->sequences_represented});
+            live.set({"allocated_bytes", primary->allocated_bytes});
+            live.set({"occupied_bytes_estimate", primary->occupied_bytes_estimate});
+            live.set({"occupied_bytes_is_estimate", primary->occupied_bytes_is_estimate});
+
+            sharing.set({"entry_semantics", primary->entry_semantics});
+            sharing.set({"shared_entries", primary->shared_entries});
+            sharing.set({"shared_tokens", primary->resident_tokens_supported ? json(primary->shared_entries) : json(nullptr)});
+            sharing.set({"shared_memberships", primary->shared_memberships});
+            sharing.set({"sequences_benefiting", primary->sequences_sharing});
+            sharing.set({"shared_prefix_groups", primary->shared_groups});
+            sharing.set({"average_fanout", primary->shared_entries > 0 ? json((double) primary->shared_memberships / primary->shared_entries) : json(nullptr)});
+            sharing.set({"maximum_fanout", primary->max_fanout});
         }
 
         return {

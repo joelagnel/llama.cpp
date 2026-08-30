@@ -1,7 +1,5 @@
 #include "server-gpu-telemetry.h"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -15,6 +13,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+using json = common_json;
 
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
@@ -501,7 +501,7 @@ void server_gpu_telemetry::record_operation(
     }
 }
 
-json server_gpu_telemetry::capability_json() const {
+common_json server_gpu_telemetry::capability_json() const {
     std::lock_guard<std::mutex> lock(pimpl->mutex);
     return {
         {"state", pimpl->state},
@@ -520,7 +520,7 @@ json server_gpu_telemetry::capability_json() const {
     };
 }
 
-json server_gpu_telemetry::snapshot_json(
+common_json server_gpu_telemetry::snapshot_json(
         const std::string & server_instance_id,
         uint64_t interval_cursor,
         size_t interval_limit,
