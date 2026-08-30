@@ -1294,9 +1294,12 @@ public:
     }
 
     json telemetry_kv_pressure_capability_json() const {
+        const llama_memory_primary_occupancy & occupancy = telemetry_kv_boundary.memory.primary_occupancy;
+        const bool primary_occupancy_available = telemetry_kv_boundary.available && occupancy.available &&
+            occupancy.capacity_entries > 0 && occupancy.used_entries <= occupancy.capacity_entries;
         return {
-            {"state", telemetry_kv_primary_occupancy_available ? "available" : "partial"},
-            {"reason", telemetry_kv_primary_occupancy_available
+            {"state", primary_occupancy_available ? "available" : "partial"},
+            {"reason", primary_occupancy_available
                 ? "Bounded causal KV-pressure events and lightweight primary occupancy are available."
                 : "Causal KV-pressure events are available, but primary occupancy is unavailable."},
             {"owner", "llama.cpp/llama-server"},
@@ -1450,7 +1453,6 @@ private:
     std::string telemetry_kv_primary_component;
     std::string telemetry_kv_primary_memory_kind;
     std::string telemetry_kv_primary_entry_semantics;
-    bool telemetry_kv_primary_occupancy_available = false;
     telemetry_kv_boundary_snapshot telemetry_kv_boundary;
     telemetry_kv_wait_episode telemetry_kv_wait;
     std::vector<uint64_t> telemetry_slot_marks;
@@ -1511,7 +1513,19 @@ private:
 
     void telemetry_apply_micro_controls() {
         const telemetry_control_state control = telemetry_control_current();
-        telemetry_kv_pressure_active = control.kv_pressure_detail;
+        if (control.kv_pressure_detail != telemetry_kv_pressure_active) {
+            telemetry_kv_pressure_active = control.kv_pressure_detail;
+            telemetry_kv_wait.clear();
+            if (telemetry_kv_pressure_active) {
+                telemetry_kv_pressure_initialize();
+                telemetry_kv_pressure_sample(0, true);
+                for (const auto & slot : slots) {
+                    if (slot.is_processing() && slot.task) {
+                        telemetry_kv_request_started(slot);
+                    }
+                }
+            }
+        }
         if (control.native_gpu_gpm == telemetry_gpu_gpm_active) {
             return;
         }
@@ -2043,9 +2057,6 @@ private:
                 std::min((int) TELEMETRY_KV_REQUEST_WINDOW_MAX_CAPACITY, atoi(telemetry_kv_request_window_env)));
         }
         telemetry_kv_snapshot_capture(false);
-        telemetry_kv_pressure_initialize();
-        telemetry_kv_pressure_sample(ggml_time_us(), true);
-
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
@@ -2285,6 +2296,10 @@ private:
     telemetry_kv_eviction_result clear_idle_slot(server_slot & slot) {
         telemetry_kv_eviction_result result;
         result.cleared = true;
+        if (!telemetry_kv_pressure_active) {
+            slot.prompt_clear();
+            return result;
+        }
         result.victim_slot_id = slot.id;
         result.victim_prompt_tokens = slot.prompt.n_tokens();
         if (slot.task_prev) {
@@ -3678,24 +3693,29 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                const llama_memory_diagnostics diagnostics_before = llama_get_memory_diagnostics(ctx_tgt);
-                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
-                slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
-                const llama_memory_diagnostics diagnostics_after = llama_get_memory_diagnostics(ctx_tgt);
-                const uint64_t shifted_entries = diagnostics_after.churn.shifted_entries >= diagnostics_before.churn.shifted_entries
-                    ? diagnostics_after.churn.shifted_entries - diagnostics_before.churn.shifted_entries
-                    : 0;
-                telemetry_kv_pressure_append({
-                    {"kind", "context_shift"},
-                    {"trace_id", slot.task->trace_id},
-                    {"task_id", slot.task->id},
-                    {"slot_id", slot.id},
-                    {"role", "target"},
-                    {"discarded_tokens", n_discard},
-                    {"position_delta", -n_discard},
-                    {"shifted_entries", shifted_entries},
-                });
-                telemetry_kv_pressure_sample(ggml_time_us(), true);
+                if (telemetry_kv_pressure_active) {
+                    const llama_memory_diagnostics diagnostics_before = llama_get_memory_diagnostics(ctx_tgt);
+                    slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
+                    slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                    const llama_memory_diagnostics diagnostics_after = llama_get_memory_diagnostics(ctx_tgt);
+                    const uint64_t shifted_entries = diagnostics_after.churn.shifted_entries >= diagnostics_before.churn.shifted_entries
+                        ? diagnostics_after.churn.shifted_entries - diagnostics_before.churn.shifted_entries
+                        : 0;
+                    telemetry_kv_pressure_append({
+                        {"kind", "context_shift"},
+                        {"trace_id", slot.task->trace_id},
+                        {"task_id", slot.task->id},
+                        {"slot_id", slot.id},
+                        {"role", "target"},
+                        {"discarded_tokens", n_discard},
+                        {"position_delta", -n_discard},
+                        {"shifted_entries", shifted_entries},
+                    });
+                    telemetry_kv_pressure_sample(ggml_time_us(), true);
+                } else {
+                    slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
+                    slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                }
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -4524,7 +4544,7 @@ private:
             }
         }
 
-        if (ret == 1) {
+        if (ret == 1 && telemetry_kv_pressure_active) {
             telemetry_kv_wait_begin(off, batch_view.n_tokens, n_batch);
             telemetry_kv_pressure_sample(decode_completed_us, true);
         }
@@ -4551,7 +4571,7 @@ private:
                 // TODO: handle ret == 2 (abort) when we start aborting
 
                 if (!err.empty()) {
-                    if (telemetry_kv_wait.active()) {
+                    if (telemetry_kv_pressure_active && telemetry_kv_wait.active()) {
                         if (ret == 1) {
                             telemetry_kv_wait_retry("terminal", n_batch, 0, decode_completed_us);
                             telemetry_kv_wait_finish("context_exhausted", decode_completed_us);
@@ -4581,22 +4601,26 @@ private:
                 const int32_t attempted_batch_size = n_batch;
                 const telemetry_kv_eviction_result eviction = try_clear_idle_slots();
                 if (eviction.cleared) {
-                    telemetry_kv_wait_retry(
-                        "emergency_idle_slot_eviction",
-                        attempted_batch_size,
-                        attempted_batch_size,
-                        decode_completed_us);
-                    telemetry_kv_record_eviction(
-                        eviction,
-                        "decode_pressure_recovery",
-                        "idle cached state cleared after llama_decode returned KV-slot unavailable",
-                        true);
+                    if (telemetry_kv_pressure_active) {
+                        telemetry_kv_wait_retry(
+                            "emergency_idle_slot_eviction",
+                            attempted_batch_size,
+                            attempted_batch_size,
+                            decode_completed_us);
+                        telemetry_kv_record_eviction(
+                            eviction,
+                            "decode_pressure_recovery",
+                            "idle cached state cleared after llama_decode returned KV-slot unavailable",
+                            true);
+                    }
                 } else {
                     n_batch /= 2;
-                    telemetry_kv_wait_retry("batch_halved", attempted_batch_size, n_batch, decode_completed_us);
+                    if (telemetry_kv_pressure_active) {
+                        telemetry_kv_wait_retry("batch_halved", attempted_batch_size, n_batch, decode_completed_us);
+                    }
                 }
             } else {
-                if (telemetry_kv_wait.active()) {
+                if (telemetry_kv_pressure_active && telemetry_kv_wait.active()) {
                     telemetry_kv_wait_finish("failed", decode_completed_us);
                 }
                 n_batch /= 2;
@@ -4606,8 +4630,10 @@ private:
 
             return false; // retry with the updated n_batch
         } else {
-            telemetry_kv_wait_finish_resumed(off, batch_view.n_tokens, decode_completed_us);
-            telemetry_kv_pressure_sample(decode_completed_us, false);
+            if (telemetry_kv_pressure_active) {
+                telemetry_kv_wait_finish_resumed(off, batch_view.n_tokens, decode_completed_us);
+                telemetry_kv_pressure_sample(decode_completed_us, false);
+            }
 
             // success, apply batch metrics
             metrics_post_decode(off, batch_view.n_tokens, has_output);
@@ -5201,9 +5227,9 @@ private:
 
     void telemetry_kv_pressure_initialize() {
         const llama_memory_diagnostics diagnostics = llama_get_memory_diagnostics(ctx_tgt);
-        const llama_memory_primary_occupancy occupancy = llama_get_memory_primary_occupancy(ctx_tgt);
-        telemetry_kv_primary_occupancy_available = occupancy.available && occupancy.capacity_entries > 0 &&
-            occupancy.used_entries <= occupancy.capacity_entries;
+        telemetry_kv_primary_component.clear();
+        telemetry_kv_primary_memory_kind.clear();
+        telemetry_kv_primary_entry_semantics.clear();
         for (const auto & component : diagnostics.components) {
             if (!component.logical_primary) {
                 continue;
@@ -5526,7 +5552,7 @@ private:
             const char * cause,
             const char * reason,
             bool attach_wait) {
-        if (!eviction.cleared) {
+        if (!telemetry_kv_pressure_active || !eviction.cleared) {
             return;
         }
         json event = {
@@ -6902,7 +6928,9 @@ private:
     }
 
     void telemetry_on_start(server_slot & slot) {
-        telemetry_kv_request_started(slot);
+        if (telemetry_kv_pressure_active) {
+            telemetry_kv_request_started(slot);
+        }
         if (telemetry_output_token_request_enabled(slot)) {
             slot.telemetry_output_tokens.reserve(telemetry_output_token_limit);
             slot.telemetry_mtp_passes.reserve(telemetry_mtp_pass_limit);
@@ -6971,8 +6999,10 @@ private:
         const char * wait_outcome = std::strcmp(outcome, "cancelled") == 0
             ? "cancelled"
             : std::strcmp(outcome, "error") == 0 ? "failed" : "resumed";
-        telemetry_kv_wait_finish_request(slot, wait_outcome, slot.stats.t_complete);
-        telemetry_kv_request_finished(slot);
+        if (telemetry_kv_pressure_active) {
+            telemetry_kv_wait_finish_request(slot, wait_outcome, slot.stats.t_complete);
+            telemetry_kv_request_finished(slot);
+        }
         gpu_telemetry.record_operation(
             SERVER_GPU_OPERATION_REQUEST,
             slot.task->trace_id,
@@ -7295,9 +7325,9 @@ private:
             }
         }
 
-        const llama_memory_primary_occupancy occupancy = llama_get_memory_primary_occupancy(ctx_tgt);
-        const bool occupancy_available = occupancy.available && occupancy.capacity_entries > 0 &&
-            occupancy.used_entries <= occupancy.capacity_entries;
+        const llama_memory_primary_occupancy & occupancy = telemetry_kv_boundary.memory.primary_occupancy;
+        const bool occupancy_available = telemetry_kv_boundary.available && occupancy.available &&
+            occupancy.capacity_entries > 0 && occupancy.used_entries <= occupancy.capacity_entries;
         const char * state = "available";
         const char * reason = "bounded native KV-pressure event stream";
         if (future_cursor) {

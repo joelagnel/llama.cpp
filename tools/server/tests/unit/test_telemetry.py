@@ -16,7 +16,8 @@ server = ServerPreset.tinyllama2()
 
 MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org/tiny-llamas/resolve/main/stories15M-q4_0.gguf"
 MODEL_TINY_FILE_URL = "https://huggingface.co/ggml-org/test-model-stories260K/resolve/main/stories260K-f32.gguf"
-TELEMETRY_CONTROL_API_KEY = "telemetry-control-test-key"
+KV_PRESSURE_API_KEY = "kv-pressure-test-key"
+KV_PRESSURE_AUTH = {"Authorization": f"Bearer {KV_PRESSURE_API_KEY}"}
 
 KV_PRESSURE_EVENT_KINDS = {
     "utilization_sample",
@@ -64,14 +65,42 @@ def kv_pressure_batch(cursor=0, limit=4096, trace_id=None, headers=None):
     path = f"/telemetry/v1/kv-pressure?cursor={cursor}&limit={limit}"
     if trace_id is not None:
         path += f"&trace_id={quote(trace_id, safe='')}"
-    response = server.make_request("GET", path, headers=headers)
+    response = server.make_request(
+        "GET", path, headers=KV_PRESSURE_AUTH if headers is None else headers
+    )
     assert response.status_code == 200
     assert response.body["schema_version"] == 1
     return response.body
 
 
+def kv_pressure_request(method, path, data=None, **kwargs):
+    return server.make_request(method, path, data=data, headers=KV_PRESSURE_AUTH, **kwargs)
+
+
+def start_kv_pressure_server():
+    server.server_props = True
+    server.api_key = KV_PRESSURE_API_KEY
+    server.start()
+
+    disabled = kv_pressure_batch()
+    assert disabled["events"] == []
+    assert disabled["oldest_sequence"] == disabled["next_sequence"] == 1
+    assert disabled["dropped_events"] == 0
+    assert disabled["last_dropped_sequence"] == 0
+    assert disabled["retained_serialized_bytes"] == 0
+
+    enabled = kv_pressure_request(
+        "POST",
+        "/props",
+        {"telemetry_control": {"kv_pressure_detail": True}},
+    )
+    assert enabled.status_code == 200
+    assert enabled.body["telemetry_control"]["effective"]["kv_pressure_detail"] is True
+    assert enabled.body["telemetry_control"]["effective_from"] == "next_microbatch"
+
+
 def one_token_without_special_tokens():
-    response = server.make_request(
+    response = kv_pressure_request(
         "POST",
         "/tokenize",
         data={"content": " hello", "add_special": False},
@@ -82,9 +111,9 @@ def one_token_without_special_tokens():
 
 
 def test_kv_pressure_capability_and_route_exist():
-    server.start()
+    start_kv_pressure_server()
 
-    capabilities = server.make_request("GET", "/telemetry/v1/capabilities")
+    capabilities = kv_pressure_request("GET", "/telemetry/v1/capabilities")
     assert capabilities.status_code == 200
     capability = capabilities.body["capabilities"]["kv_pressure"]
     assert capability["state"] == "available"
@@ -98,7 +127,7 @@ def test_kv_pressure_capability_and_route_exist():
     assert set(capability["event_kinds"]) == KV_PRESSURE_EVENT_KINDS
     assert capability["decode_wait_semantics"] == "llama_decode_returned_1_no_kv_slot_available"
 
-    pressure = server.make_request("GET", "/telemetry/v1/kv-pressure?cursor=0&limit=1")
+    pressure = kv_pressure_request("GET", "/telemetry/v1/kv-pressure?cursor=0&limit=1")
     assert pressure.status_code == 200
     assert pressure.body["schema_version"] == 1
     assert pressure.body["state"] == "available"
@@ -114,7 +143,7 @@ def test_kv_pressure_capability_and_route_exist():
     assert pressure.body["gap"] is False
     assert pressure.body["dropped_events"] == 0
     assert pressure.body["last_dropped_sequence"] == 0
-    assert 0 < pressure.body["retained_serialized_bytes"] <= capability["serialized_event_capacity_bytes"]
+    assert pressure.body["retained_serialized_bytes"] <= capability["serialized_event_capacity_bytes"]
 
 
 def test_kv_pressure_capabilities_are_safe_during_decode():
@@ -124,12 +153,12 @@ def test_kv_pressure_capabilities_are_safe_during_decode():
     server.n_threads = 1
     server.n_slots = 1
     server.enable_ctx_shift = True
-    server.start()
+    start_kv_pressure_server()
 
     token = one_token_without_special_tokens()
     with ThreadPoolExecutor(max_workers=1) as executor:
         completion = executor.submit(
-            server.make_request,
+            kv_pressure_request,
             "POST",
             "/completion",
             {
@@ -142,7 +171,7 @@ def test_kv_pressure_capabilities_are_safe_during_decode():
         )
         capability_reads = 0
         while not completion.done():
-            response = server.make_request("GET", "/telemetry/v1/capabilities")
+            response = kv_pressure_request("GET", "/telemetry/v1/capabilities")
             assert response.status_code == 200
             assert response.body["capabilities"]["kv_pressure"]["state"] == "available"
             capability_reads += 1
@@ -166,16 +195,22 @@ def test_kv_pressure_capabilities_are_safe_during_decode():
     ],
 )
 def test_kv_pressure_route_rejects_invalid_cursor_limit_and_trace(query):
-    server.start()
+    start_kv_pressure_server()
 
-    response = server.make_request("GET", f"/telemetry/v1/kv-pressure?{query}")
+    response = kv_pressure_request("GET", f"/telemetry/v1/kv-pressure?{query}")
 
     assert response.status_code == 400
 
 
 def test_kv_pressure_route_pages_with_monotonic_bounded_metadata():
-    server.start()
+    start_kv_pressure_server()
 
+    response = kv_pressure_request(
+        "POST",
+        "/completion",
+        data={"prompt": "A bounded KV-pressure page", "n_predict": 2, "ignore_eos": True},
+    )
+    assert response.status_code == 200
     first = kv_pressure_batch(limit=1)
     assert len(first["events"]) == 1
     first_event = first["events"][0]
@@ -186,10 +221,10 @@ def test_kv_pressure_route_pages_with_monotonic_bounded_metadata():
     assert first_event["timestamp_unix_ms"] > 0
     assert first_event["monotonic_us"] > 0
 
-    response = server.make_request(
+    response = kv_pressure_request(
         "POST",
         "/completion",
-        data={"prompt": "A bounded KV-pressure page", "n_predict": 2, "ignore_eos": True},
+        data={"prompt": "A second bounded KV-pressure page", "n_predict": 2, "ignore_eos": True},
     )
     assert response.status_code == 200
     second = kv_pressure_batch(cursor=first["cursor"], limit=2)
@@ -207,7 +242,7 @@ def test_kv_pressure_route_pages_with_monotonic_bounded_metadata():
 
 
 def test_kv_pressure_future_cursor_resets_to_high_water_mark():
-    server.start()
+    start_kv_pressure_server()
 
     future = kv_pressure_batch(cursor=2**64 - 1)
     assert future["state"] == "partial"
@@ -215,7 +250,7 @@ def test_kv_pressure_future_cursor_resets_to_high_water_mark():
     assert future["gap"] is True
     assert future["cursor"] == future["next_sequence"] - 1
 
-    response = server.make_request(
+    response = kv_pressure_request(
         "POST",
         "/completion",
         data={"prompt": "Recover after a future cursor", "n_predict": 2, "ignore_eos": True},
@@ -227,37 +262,25 @@ def test_kv_pressure_future_cursor_resets_to_high_water_mark():
 
 
 def test_kv_pressure_reports_exact_global_primary_occupancy_after_decode():
-    auth = {"Authorization": f"Bearer {TELEMETRY_CONTROL_API_KEY}"}
-    server.server_props = True
-    server.api_key = TELEMETRY_CONTROL_API_KEY
-    server.start()
+    start_kv_pressure_server()
 
-    control = server.make_request(
-        "POST",
-        "/props",
-        data={"telemetry_control": {"kv_pressure_detail": True}},
-        headers=auth,
-    )
-    assert control.status_code == 200
-
-    response = server.make_request(
+    response = kv_pressure_request(
         "POST",
         "/completion",
         data={"prompt": "Measure occupied KV entries", "n_predict": 4, "ignore_eos": True},
-        headers=auth,
     )
     assert response.status_code == 200
-    batch = kv_pressure_batch(headers=auth)
+    batch = kv_pressure_batch()
     samples = [event for event in batch["events"] if event["kind"] == "utilization_sample"]
     assert samples
     sample = samples[-1]
-    shallow_kv = server.make_request("GET", "/telemetry/v1/kv", headers=auth)
+    shallow_kv = kv_pressure_request("GET", "/telemetry/v1/kv")
     assert shallow_kv.status_code == 200
     assert shallow_kv.body["components"] == []
     assert shallow_kv.body["physical_prefix_sharing"]["state"] == "not_collected"
     assert shallow_kv.body["duplicate_prefix_opportunities"]["state"] == "not_collected"
 
-    kv = server.make_request("GET", "/telemetry/v1/kv?detail=deep", headers=auth)
+    kv = kv_pressure_request("GET", "/telemetry/v1/kv?detail=deep")
     assert kv.status_code == 200
     primary = next(component for component in kv.body["components"] if component["logical_primary"])
 
@@ -286,9 +309,9 @@ def test_kv_pressure_reports_exact_global_primary_occupancy_after_decode():
 
 
 def test_kv_pressure_trace_filter_has_exact_identity_and_request_bounds():
-    server.start()
+    start_kv_pressure_server()
 
-    response = server.make_request(
+    response = kv_pressure_request(
         "POST",
         "/completion",
         data={"prompt": "Trace-bound KV telemetry", "n_predict": 4, "ignore_eos": True},
@@ -321,9 +344,9 @@ def test_kv_pressure_context_shift_preserves_trace_and_distinct_churn_counts():
     server.n_ctx = 512
     server.n_slots = 2
     server.enable_ctx_shift = True
-    server.start()
+    start_kv_pressure_server()
 
-    response = server.make_request(
+    response = kv_pressure_request(
         "POST",
         "/completion",
         data={
@@ -355,9 +378,9 @@ def test_kv_pressure_retained_trace_events_are_partial_when_window_expires(monke
     server.n_ctx = 512
     server.n_slots = 2
     server.enable_ctx_shift = True
-    server.start()
+    start_kv_pressure_server()
 
-    first = server.make_request(
+    first = kv_pressure_request(
         "POST",
         "/completion",
         data={
@@ -367,7 +390,7 @@ def test_kv_pressure_retained_trace_events_are_partial_when_window_expires(monke
         },
     )
     assert first.status_code == 200
-    second = server.make_request(
+    second = kv_pressure_request(
         "POST",
         "/completion",
         data={"prompt": "Expire the prior request window", "n_predict": 2, "ignore_eos": True},
@@ -398,10 +421,10 @@ def test_kv_pressure_decode_wait_is_a_ret1_ordered_terminal_episode():
     server.n_slots = 2
     server.kv_unified = True
     server.no_cache_idle_slots = True
-    server.start()
+    start_kv_pressure_server()
 
     token = one_token_without_special_tokens()
-    response = server.make_request(
+    response = kv_pressure_request(
         "POST",
         "/completion",
         data={
@@ -472,10 +495,10 @@ def test_kv_pressure_split_recovery_finishes_each_identity_when_its_subbatch_suc
     server.kv_unified = True
     server.no_cache_idle_slots = True
     server.enable_ctx_shift = False
-    server.start()
+    start_kv_pressure_server()
 
     token = one_token_without_special_tokens()
-    response = server.make_request(
+    response = kv_pressure_request(
         "POST",
         "/completion",
         data={
@@ -545,7 +568,7 @@ def test_kv_pressure_identity_stays_waiting_across_multiple_retry_slices():
     server.no_cache_idle_slots = True
     server.enable_ctx_shift = False
     server.server_slots = True
-    server.start()
+    start_kv_pressure_server()
 
     token = one_token_without_special_tokens()
     background_data = {
@@ -558,13 +581,15 @@ def test_kv_pressure_identity_stays_waiting_across_multiple_retry_slices():
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         background = executor.submit(
-            server.make_request, "POST", "/completion", background_data
+            kv_pressure_request, "POST", "/completion", background_data
         )
         deadline = time.monotonic() + 10
         background_prompt_tokens = 0
         while time.monotonic() < deadline and not background.done():
             slots = requests.get(
-                f"http://{server.server_host}:{server.server_port}/slots", timeout=1
+                f"http://{server.server_host}:{server.server_port}/slots",
+                headers=KV_PRESSURE_AUTH,
+                timeout=1,
             )
             assert slots.status_code == 200
             active_slots = [slot for slot in slots.json() if slot["is_processing"]]
@@ -578,7 +603,7 @@ def test_kv_pressure_identity_stays_waiting_across_multiple_retry_slices():
         assert background_prompt_tokens >= 462, (
             "background request did not reach the final prompt slice"
         )
-        response = server.make_request(
+        response = kv_pressure_request(
             "POST",
             "/completion",
             data={
@@ -637,10 +662,10 @@ def test_kv_pressure_post_split_error_finishes_the_unresolved_identity():
     server.kv_unified = True
     server.no_cache_idle_slots = True
     server.enable_ctx_shift = False
-    server.start()
+    start_kv_pressure_server()
 
     token = one_token_without_special_tokens()
-    response = server.make_request(
+    response = kv_pressure_request(
         "POST",
         "/completion",
         data={
@@ -681,10 +706,10 @@ def test_kv_pressure_emergency_eviction_separates_trigger_and_victim_identity():
     server.n_slots = 2
     server.kv_unified = True
     server.no_cache_idle_slots = True
-    server.start()
+    start_kv_pressure_server()
 
     token = one_token_without_special_tokens()
-    victim = server.make_request(
+    victim = kv_pressure_request(
         "POST",
         "/completion",
         data={
@@ -698,7 +723,7 @@ def test_kv_pressure_emergency_eviction_separates_trigger_and_victim_identity():
     )
     assert victim.status_code == 200
     before_target = kv_pressure_batch()
-    target = server.make_request(
+    target = kv_pressure_request(
         "POST",
         "/completion",
         data={
@@ -785,10 +810,10 @@ def test_kv_pressure_proactive_idle_cache_policy_is_not_pressure_recovery(tmp_pa
     server.cache_ram = 100
     server.debug = True
     server.log_path = str(tmp_path / "server.log")
-    server.start()
+    start_kv_pressure_server()
 
     token = one_token_without_special_tokens()
-    victim = server.make_request(
+    victim = kv_pressure_request(
         "POST",
         "/completion",
         data={
@@ -802,7 +827,7 @@ def test_kv_pressure_proactive_idle_cache_policy_is_not_pressure_recovery(tmp_pa
     )
     assert victim.status_code == 200
     before_launch = kv_pressure_batch()
-    target = server.make_request(
+    target = kv_pressure_request(
         "POST",
         "/completion",
         data={

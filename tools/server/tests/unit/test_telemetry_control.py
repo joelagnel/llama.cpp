@@ -18,6 +18,14 @@ def _snapshot(server):
     return response.body["telemetry_control"]
 
 
+def _kv_pressure(server):
+    response = server.make_request(
+        "GET", "/telemetry/v1/kv-pressure?cursor=0&limit=4096", headers=AUTH
+    )
+    assert response.status_code == 200
+    return response.body
+
+
 def _completed_event(server, trace_id):
     response = server.make_request("GET", "/telemetry/v1/events?cursor=0&limit=100", headers=AUTH)
     assert response.status_code == 200
@@ -181,6 +189,70 @@ def test_output_token_telemetry_preserves_requested_probability_mode():
     requested_event = _completed_event(server, requested.body["trace_id"])
     assert requested_event["response_probability"]["state"] == "available"
     assert requested_event["output_token_telemetry"]["probability_state"] == "available"
+
+
+def test_kv_pressure_control_keeps_the_disabled_path_empty_and_records_when_enabled():
+    server = _controlled_server()
+    server.start()
+
+    disabled_response = server.make_request(
+        "POST",
+        "/completion",
+        data={"prompt": "KV pressure stays disabled", "n_predict": 2, "temperature": 0},
+        headers=AUTH,
+    )
+    assert disabled_response.status_code == 200
+    disabled = _kv_pressure(server)
+    assert disabled["events"] == []
+    assert disabled["oldest_sequence"] == disabled["next_sequence"] == 1
+    assert disabled["dropped_events"] == 0
+    assert disabled["last_dropped_sequence"] == 0
+    assert disabled["retained_serialized_bytes"] == 0
+
+    enabled_response = server.make_request(
+        "POST",
+        "/props",
+        data={"telemetry_control": {"kv_pressure_detail": True}},
+        headers=AUTH,
+    )
+    assert enabled_response.status_code == 200
+    assert enabled_response.body["telemetry_control"]["effective"]["kv_pressure_detail"] is True
+    assert enabled_response.body["telemetry_control"]["effective_from"] == "next_microbatch"
+
+    enabled_completion = server.make_request(
+        "POST",
+        "/completion",
+        data={"prompt": "KV pressure is enabled", "n_predict": 2, "temperature": 0},
+        headers=AUTH,
+    )
+    assert enabled_completion.status_code == 200
+    enabled = _kv_pressure(server)
+    assert enabled["events"]
+    assert any(event["kind"] == "utilization_sample" for event in enabled["events"])
+    assert enabled["next_sequence"] > 1
+    assert enabled["retained_serialized_bytes"] > 0
+
+    disabled_again_response = server.make_request(
+        "POST",
+        "/props",
+        data={"telemetry_control": {}},
+        headers=AUTH,
+    )
+    assert disabled_again_response.status_code == 200
+    assert disabled_again_response.body["telemetry_control"]["effective"]["kv_pressure_detail"] is False
+
+    before_disable = _kv_pressure(server)
+    after_disable_completion = server.make_request(
+        "POST",
+        "/completion",
+        data={"prompt": "KV pressure is disabled again", "n_predict": 2, "temperature": 0},
+        headers=AUTH,
+    )
+    assert after_disable_completion.status_code == 200
+    after_disable = _kv_pressure(server)
+    assert after_disable["next_sequence"] == before_disable["next_sequence"]
+    assert after_disable["dropped_events"] == before_disable["dropped_events"]
+    assert after_disable["retained_serialized_bytes"] == before_disable["retained_serialized_bytes"]
 
 
 def test_props_requires_auth_props_api_key_and_loopback_listener():
