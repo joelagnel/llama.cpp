@@ -919,7 +919,7 @@ def terminal_event(trace_id, expected_event, expected_outcome):
     return matches[0]
 
 
-def assert_complete_lifecycle_clock(event, require_generation=True):
+def assert_complete_lifecycle_clock(event, require_generation=True, require_handoff=True):
     clock = event["lifecycle_clock"]
     assert clock["schema_version"] == 1
     assert clock["clock_domain"] == "server_process_monotonic_microseconds"
@@ -934,6 +934,7 @@ def assert_complete_lifecycle_clock(event, require_generation=True):
         "first_token_monotonic_us",
         "last_generation_work_monotonic_us",
         "finalization_start_monotonic_us",
+        "response_handoff_monotonic_us",
         "slot_release_monotonic_us",
     ]
     assert set(names).issubset(clock)
@@ -946,8 +947,24 @@ def assert_complete_lifecycle_clock(event, require_generation=True):
     assert clock["enqueue_monotonic_us"] is not None
     assert clock["slot_start_monotonic_us"] is not None
     assert clock["finalization_start_monotonic_us"] is not None
+    if require_handoff:
+        assert clock["response_handoff_monotonic_us"] is not None
+        assert clock["response_handoff_monotonic_us"] >= clock["finalization_start_monotonic_us"]
+        assert event["timings"]["e2e_ms"] == pytest.approx(
+            (clock["response_handoff_monotonic_us"] - clock["arrival_monotonic_us"]) / 1000.0
+        )
+        assert event["timestamp_unix_ms"] == (
+            event["timings"]["arrival_unix_ms"]
+            + (clock["response_handoff_monotonic_us"] - clock["arrival_monotonic_us"]) // 1000
+        )
+    else:
+        assert clock["response_handoff_monotonic_us"] is None
+        assert event["timings"]["e2e_ms"] == 0
     assert clock["slot_release_monotonic_us"] is not None
-    assert clock["slot_release_monotonic_us"] >= clock["finalization_start_monotonic_us"]
+    if require_handoff:
+        assert clock["slot_release_monotonic_us"] >= clock["response_handoff_monotonic_us"]
+    else:
+        assert clock["slot_release_monotonic_us"] >= clock["finalization_start_monotonic_us"]
     assert event["slot_release_unix_ms"] >= event["timestamp_unix_ms"]
     assert event["slot_release_unix_ms"] == (
         event["timings"]["arrival_unix_ms"]
@@ -965,6 +982,39 @@ def assert_rich_diagnostics_finish_by_last_generation_work(event):
     finalization_start = event["lifecycle_clock"]["finalization_start_monotonic_us"]
     assert last_generation_work > latest_model_ready
     assert finalization_start >= last_generation_work
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_completion_e2e_ends_at_response_handoff(stream):
+    server.start()
+    data = {
+        "prompt": "response handoff timing",
+        "n_predict": 2,
+        "ignore_eos": True,
+        "stream": stream,
+    }
+
+    if stream:
+        url = f"http://{server.server_host}:{server.server_port}/completion"
+        with requests.post(url, json=data, stream=True, timeout=5.0) as response:
+            assert response.status_code == 200
+            trace_id = response.headers["X-Llama-Trace-Id"]
+            final = None
+            for line in response.iter_lines():
+                if line.startswith(b"data: "):
+                    chunk = json.loads(line[6:])
+                    if chunk.get("stop") is True:
+                        final = chunk
+            assert final is not None
+    else:
+        response = server.make_request("POST", "/completion", data=data)
+        assert response.status_code == 200
+        trace_id = response.body["trace_id"]
+        final = response.body
+
+    event = completed_event(trace_id)
+    assert_complete_lifecycle_clock(event)
+    assert final["timings"]["e2e_ms"] == pytest.approx(event["timings"]["e2e_ms"])
 
 
 def test_telemetry_lifecycle_cache_and_cursor():
@@ -1368,7 +1418,7 @@ def test_success_error_and_cancel_each_emit_one_release_complete_event():
         time.sleep(0.05)
 
     assert cancelled is not None
-    assert_complete_lifecycle_clock(cancelled, require_generation=False)
+    assert_complete_lifecycle_clock(cancelled, require_generation=False, require_handoff=False)
     terminal_event(cancelled["trace_id"], "request_ended", "cancelled")
 
 

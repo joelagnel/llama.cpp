@@ -2743,10 +2743,11 @@ private:
             case ERROR_TYPE_SERVER: break;
         }
         telemetry_finalize(slot, "error", error, category);
-        send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx, slot.task->trace_id);
+        const int64_t t_handoff = send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx, slot.task->trace_id);
+        telemetry_on_response_handoff(slot, t_handoff);
     }
 
-    void send_error(const int id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0, const std::string & trace_id = {}) {
+    int64_t send_error(const int id_task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER, const int32_t n_prompt_tokens = 0, const int32_t n_ctx = 0, const std::string & trace_id = {}) {
         SRV_ERR("task id = %d, error: %s\n", id_task, error.c_str());
 
         if (type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
@@ -2761,7 +2762,7 @@ private:
         res->n_prompt_tokens = n_prompt_tokens;
         res->n_ctx           = n_ctx;
 
-        queue_results.send(std::move(res));
+        return queue_results.send(std::move(res), true);
     }
 
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
@@ -2866,7 +2867,6 @@ private:
         res->generation_params = slot.task->params; // copy the parameters
 
         telemetry_finalize(slot, "success");
-        res->stats.t_complete = slot.stats.t_complete;
 
         // in stream mode, content and tokens are already in last partial chunk
         if (!slot.task->params.stream) {
@@ -2874,7 +2874,8 @@ private:
             res->tokens  = std::move(slot.generated_tokens);
         }
 
-        queue_results.send(std::move(res));
+        const int64_t t_handoff = queue_results.send(std::move(res), true);
+        telemetry_on_response_handoff(slot, t_handoff);
     }
 
     void send_embedding(server_slot & slot, const llama_batch & batch) {
@@ -2920,7 +2921,8 @@ private:
         SLT_DBG(slot, "%s", "sending embeddings\n");
 
         telemetry_finalize(slot, "success");
-        queue_results.send(std::move(res));
+        const int64_t t_handoff = queue_results.send(std::move(res), true);
+        telemetry_on_response_handoff(slot, t_handoff);
     }
 
     void send_rerank(server_slot & slot, const llama_batch & batch) {
@@ -2952,7 +2954,8 @@ private:
         SLT_DBG(slot, "sending rerank result, res.score = %f\n", res->score);
 
         telemetry_finalize(slot, "success");
-        queue_results.send(std::move(res));
+        const int64_t t_handoff = queue_results.send(std::move(res), true);
+        telemetry_on_response_handoff(slot, t_handoff);
     }
 
     //
@@ -5376,11 +5379,11 @@ private:
         GGML_ASSERT(slot.task);
         for (auto it = telemetry_kv_request_windows.rbegin(); it != telemetry_kv_request_windows.rend(); ++it) {
             if (it->trace_id == slot.task->trace_id) {
-                it->end_monotonic_us = slot.stats.t_complete;
+                it->end_monotonic_us = slot.stats.t_finalization_start;
                 break;
             }
         }
-        telemetry_kv_pressure_sample(slot.stats.t_complete, true);
+        telemetry_kv_pressure_sample(slot.stats.t_finalization_start, true);
     }
 
     std::vector<telemetry_kv_wait_identity> telemetry_kv_wait_identities(int32_t off, int32_t n_tokens) const {
@@ -6959,7 +6962,8 @@ private:
             {"prefill_end_monotonic_us", boundary(slot.stats.t_prefill_last)},
             {"first_token_monotonic_us", boundary(slot.stats.t_first_token)},
             {"last_generation_work_monotonic_us", boundary(slot.stats.t_gen_last)},
-            {"finalization_start_monotonic_us", boundary(slot.stats.t_complete)},
+            {"finalization_start_monotonic_us", boundary(slot.stats.t_finalization_start)},
+            {"response_handoff_monotonic_us", boundary(slot.stats.t_complete)},
             {"slot_release_monotonic_us", boundary(slot.stats.t_release)},
         };
     }
@@ -7032,12 +7036,12 @@ private:
             return;
         }
         slot.telemetry_finalized = true;
-        slot.stats.t_complete = ggml_time_us();
+        slot.stats.t_finalization_start = ggml_time_us();
         const char * wait_outcome = std::strcmp(outcome, "cancelled") == 0
             ? "cancelled"
             : std::strcmp(outcome, "error") == 0 ? "failed" : "resumed";
         if (telemetry_kv_pressure_active) {
-            telemetry_kv_wait_finish_request(slot, wait_outcome, slot.stats.t_complete);
+            telemetry_kv_wait_finish_request(slot, wait_outcome, slot.stats.t_finalization_start);
             telemetry_kv_request_finished(slot);
         }
         gpu_telemetry.record_operation(
@@ -7045,7 +7049,7 @@ private:
             slot.task->trace_id,
             slot.id,
             slot.stats.t_arrival,
-            slot.stats.t_complete,
+            slot.stats.t_finalization_start,
             -1,
             -1,
             -1,
@@ -7075,7 +7079,6 @@ private:
         if (slot.stats.n_gen_steps() > 0) {
             metrics.request_tpot_seconds.observe(slot.stats.t_gen_per_token_ms() / 1000.0);
         }
-        metrics.request_e2e_seconds.observe(slot.stats.t_e2e_ms() / 1000.0);
         metrics.request_prompt_tokens.observe(slot.task->n_tokens());
         metrics.request_output_tokens.observe(slot.stats.n_gen);
         metrics.request_cache_reuse_ratio.observe(slot.stats.cache_reuse_ratio());
@@ -7114,7 +7117,7 @@ private:
             {"task_id", slot.task->id},
             {"slot_id", slot.id},
             {"slot_assignment_ordinal", slot.telemetry_assignment_ordinal},
-            {"timestamp_unix_ms", telemetry_unix_ms(slot, slot.stats.t_complete)},
+            {"timestamp_unix_ms", telemetry_unix_ms(slot, slot.stats.t_finalization_start)},
             {"completion_id", slot.task->params.oaicompat_cmpl_id},
             {"model", slot.task->params.oaicompat_model},
             {"server_build", std::string(llama_build_info())},
@@ -7248,6 +7251,24 @@ private:
             };
         }
         slot.telemetry_pending_completion_event = std::move(event);
+    }
+
+    void telemetry_on_response_handoff(server_slot & slot, int64_t t_handoff) {
+        if (!slot.telemetry_finalized || t_handoff == 0) {
+            return;
+        }
+        GGML_ASSERT(slot.stats.t_complete == 0);
+        GGML_ASSERT(t_handoff >= slot.stats.t_finalization_start);
+        slot.stats.t_complete = t_handoff;
+        metrics.request_e2e_seconds.observe(slot.stats.t_e2e_ms() / 1000.0);
+
+        if (slot.telemetry_pending_completion_event.is_null()) {
+            return;
+        }
+
+        slot.telemetry_pending_completion_event["timestamp_unix_ms"] = telemetry_unix_ms(slot, slot.stats.t_complete);
+        slot.telemetry_pending_completion_event["timings"] = slot.stats.to_json();
+        slot.telemetry_pending_completion_event["lifecycle_clock"] = telemetry_lifecycle_clock_json(slot);
     }
 
     void telemetry_on_release(server_slot & slot) {

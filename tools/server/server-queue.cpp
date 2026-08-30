@@ -519,7 +519,7 @@ server_task_result_ptr server_response::recv(int id_task) {
     return recv(id_tasks);
 }
 
-void server_response::send(server_task_result_ptr && result) {
+int64_t server_response::send(server_task_result_ptr && result, bool capture_handoff) {
     RES_DBG("sending result for task id = %d\n", result->id);
 
     std::unique_lock<std::mutex> lock(mutex_results);
@@ -528,10 +528,18 @@ void server_response::send(server_task_result_ptr && result) {
             RES_DBG("task id = %d pushed to result queue\n", result->id);
 
             queue_results.emplace_back(std::move(result));
+            if (!capture_handoff) {
+                condition_results.notify_all();
+                return 0;
+            }
+            const int64_t t_handoff = ggml_time_us();
+            queue_results.back()->set_response_handoff_time(t_handoff);
             condition_results.notify_all();
-            return;
+            return t_handoff;
         }
     }
+
+    return 0;
 }
 
 void server_response::broadcast(server_task_result_ptr && result) {

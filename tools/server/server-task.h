@@ -329,6 +329,9 @@ struct server_task_result {
     virtual void update(task_result_state &) {
         // only used by server_task_result_cmpl_*
     }
+    virtual void set_response_handoff_time(int64_t) {
+        // only used by server_task_result_cmpl_final
+    }
     virtual json to_json() = 0;
     virtual ~server_task_result() = default;
     virtual server_task_result * clone() const {
@@ -413,6 +416,10 @@ struct server_task_result_cmpl_final : server_task_result {
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;
         oai_resp_message_id = state.oai_resp_message_id;
+    }
+
+    virtual void set_response_handoff_time(int64_t t_us) override {
+        stats.t_complete = t_us;
     }
 
     json to_json_non_oaicompat();

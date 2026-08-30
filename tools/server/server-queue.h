@@ -192,7 +192,7 @@ public:
     server_task_result_ptr recv(int id_task);
 
     // Send a new result to a waiting id_task
-    void send(server_task_result_ptr && result);
+    int64_t send(server_task_result_ptr && result, bool capture_handoff = false);
 
     // broadcast a new result to all waiting tasks
     // (used by router mode)

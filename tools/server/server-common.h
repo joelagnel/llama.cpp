@@ -377,6 +377,7 @@ struct server_slot_stats {
     int64_t t_prefill_start = 0;
     int64_t t_prefill_last  = 0;
     int64_t t_first_token   = 0;
+    int64_t t_finalization_start = 0;
     int64_t t_complete      = 0;
     int64_t t_release       = 0;
     int64_t t_arrival_unix_ms = 0;
