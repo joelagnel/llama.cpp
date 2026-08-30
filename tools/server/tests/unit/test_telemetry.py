@@ -1838,6 +1838,73 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         server.stop()
 
 
+def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
+    model_path = os.environ.get("LLAMA_TEST_MTP_MODEL_PATH")
+    if not model_path:
+        pytest.skip("requires LLAMA_TEST_MTP_MODEL_PATH for an embedded-MTP MoE fixture")
+
+    api_key = "moe-routing-mtp-test-key"
+    auth = {"Authorization": f"Bearer {api_key}"}
+    mtp_server = ServerPreset.stories15m_moe()
+    mtp_server.model_file = model_path
+    mtp_server.model_hf_repo = None
+    mtp_server.model_hf_file = None
+    mtp_server.server_props = True
+    mtp_server.api_key = api_key
+    mtp_server.spec_type = "draft-mtp"
+    mtp_server.spec_draft_n_min = 1
+    mtp_server.spec_draft_n_max = 3
+    mtp_server.n_batch = 4
+    mtp_server.n_ubatch = 2
+    mtp_server.start()
+
+    try:
+        control = mtp_server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"moe_routing": True}},
+            headers=auth,
+        )
+        assert control.status_code == 200
+
+        response = mtp_server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": "MTP routing captures the target verification pass.",
+                "n_predict": 16,
+                "ignore_eos": True,
+                "temperature": 0,
+            },
+            headers=auth,
+        )
+        assert response.status_code == 200
+
+        events = mtp_server.make_request(
+            "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
+        )
+        assert events.status_code == 200
+        decisions = [
+            decision
+            for event in events.body["events"]
+            if event["event"] == "moe_routing_chunk"
+            and event["trace_id"] == response.body["trace_id"]
+            and not event["final"]
+            for decision in event["decisions"]
+        ]
+        mtp_decisions = [decision for decision in decisions if decision["phase"] == "mtp_verify"]
+        assert mtp_decisions
+        # LLAMA_CONTEXT_TYPE_MTP maps directly to LLM_GRAPH_TYPE_DECODER_MTP (3).
+        assert all(decision["graph_type"] == 3 for decision in mtp_decisions)
+        assert all(decision["model_position"] is not None for decision in mtp_decisions)
+        assert all(decision["logical_step"] is not None for decision in mtp_decisions)
+        assert all(decision["actual_target_pass"] is not None for decision in mtp_decisions)
+        assert all(decision["proposal_position"] is not None for decision in mtp_decisions)
+        assert all(isinstance(decision["replay_pass"], bool) for decision in mtp_decisions)
+    finally:
+        mtp_server.stop()
+
+
 def test_moe_routing_chunks_mark_on_off_on_intervals_partial():
     global server
 
