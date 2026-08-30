@@ -4823,7 +4823,7 @@ private:
 
             // verify and try to accept the draft
             int64_t t_spec_sample = 0;
-            std::vector<float> spec_selected_probs;
+            std::vector<double> spec_selected_logprobs;
             const auto spec_rows = slot.spec_i_batch;
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
@@ -4934,9 +4934,9 @@ private:
 
                 const bool response_probability_enabled = slot.task->params.sampling.n_probs > 0
                     && slot.response_probability.unavailable_reason.empty();
-                spec_selected_probs.clear();
+                spec_selected_logprobs.clear();
                 if (response_probability_enabled) {
-                    spec_selected_probs.assign(slot.spec_draft.size(), std::numeric_limits<float>::quiet_NaN());
+                    spec_selected_logprobs.assign(slot.spec_draft.size(), std::numeric_limits<double>::quiet_NaN());
                 }
                 for (size_t i = 0; i < slot.spec_draft.size(); ++i) {
                     const bool candidate_enabled = telemetry_token_candidate_position_enabled(
@@ -4967,7 +4967,7 @@ private:
                     if (available) {
                         if (response_probability_enabled) {
                             slot.response_probability.observe(logprob);
-                            spec_selected_probs[i] = (float) std::exp(logprob);
+                            spec_selected_logprobs[i] = logprob;
                             if (i < slot.telemetry_mtp_proposals_pending.size() &&
                                     slot.telemetry_mtp_proposals_pending[i].disposition != TELEMETRY_MTP_PROPOSAL_INVALIDATED_TAIL) {
                                 slot.telemetry_mtp_proposals_pending[i].target_selected_log_probability_ln = logprob;
@@ -5048,9 +5048,13 @@ private:
 
                 result.tok          = ids[i];
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = i < spec_selected_probs.size() && std::isfinite(spec_selected_probs[i])
-                    ? spec_selected_probs[i]
+                const double selected_log_probability_ln = i < spec_selected_logprobs.size()
+                    ? spec_selected_logprobs[i]
+                    : std::numeric_limits<double>::quiet_NaN();
+                result.prob         = std::isfinite(selected_log_probability_ln)
+                    ? (float) std::exp(selected_log_probability_ln)
                     : 1.0f;
+                result.logprob      = selected_log_probability_ln;
 
                 // TODO: set result.probs
 
@@ -5060,9 +5064,6 @@ private:
                 metrics.n_spec_useful_tokens++;
                 useful_tokens_this_pass++;
 
-                const double selected_log_probability_ln = i < spec_selected_probs.size() && result.prob > 0.0f
-                    ? std::log((double) result.prob)
-                    : std::numeric_limits<double>::quiet_NaN();
                 const auto origin = i < slot.telemetry_spec_accepted_depth
                     ? TELEMETRY_OUTPUT_TOKEN_ORIGIN_MTP_ACCEPTED
                     : i == slot.telemetry_spec_accepted_depth &&

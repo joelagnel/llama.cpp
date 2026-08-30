@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <limits>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -348,6 +349,7 @@ struct completion_token_output {
         float prob;
     };
     std::vector<prob_info> probs;
+    double logprob = std::numeric_limits<double>::quiet_NaN();
 
     json to_json(bool post_sampling_probs) const;
 

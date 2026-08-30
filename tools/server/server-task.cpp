@@ -10,6 +10,7 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <cmath>
 #include <sstream>
 
 //
@@ -316,13 +317,18 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
     for (const auto & p : probs) {
         std::string txt(p.text_to_send);
         txt.resize(validate_utf8(txt));
+        const json probability = post_sampling_probs
+            ? json(p.prob)
+            : std::isfinite(p.logprob)
+                ? json(p.logprob)
+                : json(logarithm(p.prob));
         out.push_back(json {
             {"id",           p.tok},
             {"token",        txt},
             {"bytes",        str_to_bytes(p.text_to_send)},
             {
                 post_sampling_probs ? "prob" : "logprob",
-                post_sampling_probs ? p.prob : logarithm(p.prob)
+                probability
             },
             {
                 post_sampling_probs ? "top_probs" : "top_logprobs",
