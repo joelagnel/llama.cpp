@@ -285,6 +285,11 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
 
+llama_build(test-memory-occupancy.cpp)
+llama_test(test-memory-occupancy NAME test-memory-occupancy-unified LABEL "model" ARGS -m "${MODEL_DEST}" -c 256 -b 32 -ub 32 -np 2 --kv-unified)
+llama_test(test-memory-occupancy NAME test-memory-occupancy-partitioned LABEL "model" ARGS -m "${MODEL_DEST}" -c 256 -b 32 -ub 32 -np 2 --no-kv-unified)
+set_tests_properties(test-memory-occupancy-unified test-memory-occupancy-partitioned PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 

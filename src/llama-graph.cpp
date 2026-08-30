@@ -1336,6 +1336,7 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    moe_routing_outputs.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1398,6 +1399,23 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(tensor);
         }
     }
+    for (const auto & output : moe_routing_outputs) {
+        if (output.selected_experts != nullptr) {
+            ggml_set_output(output.selected_experts);
+        }
+        if (output.effective_weights != nullptr) {
+            ggml_set_output(output.effective_weights);
+        }
+    }
+}
+
+void llm_graph_result::add_moe_routing_output(
+        int32_t layer_index,
+        ggml_tensor * selected_experts,
+        ggml_tensor * effective_weights) {
+    GGML_ASSERT(selected_experts != nullptr);
+    GGML_ASSERT(effective_weights != nullptr);
+    moe_routing_outputs.push_back({ layer_index, selected_experts, effective_weights });
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -2094,6 +2112,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    if (cparams.moe_routing) {
+        // Both tensors are authoritative inputs to the existing MoE forward
+        // graph. Retaining them as optional outputs adds no router calculation;
+        // the diagnostic path only performs bounded asynchronous host copies.
+        cb(selected_experts, "ffn_moe_routing_ids", il);
+        cb(weights, "ffn_moe_routing_weights", il);
+        res->add_moe_routing_output(il, selected_experts, weights);
     }
 
     //call early so that topk-moe can be used

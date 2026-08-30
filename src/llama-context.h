@@ -115,6 +115,8 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_moe_routing(bool value);
+    const llama_moe_routing_entry * get_moe_routing(size_t * count);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -190,6 +192,7 @@ struct llama_context {
     llama_ubatch_stats ubatch_stats_get_data() const;
 
     llama_memory_breakdown memory_breakdown() const;
+    llama_memory_primary_occupancy memory_primary_occupancy() const;
     llama_memory_diagnostics memory_diagnostics() const;
 
     //
@@ -236,6 +239,7 @@ private:
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_moe_routing(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch);
 
     //
     // graph
@@ -306,6 +310,30 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    struct moe_routing_capture {
+        int32_t layer_index = -1;
+        size_t token_count = 0;
+        size_t experts_per_token = 0;
+        size_t expert_stride = 0;
+        size_t token_dim_1 = 0;
+        size_t token_dim_2 = 0;
+        size_t token_stride_1 = 0;
+        size_t token_stride_2 = 0;
+        size_t token_stride_3 = 0;
+        size_t weight_expert_stride = 0;
+        size_t weight_token_dim_1 = 0;
+        size_t weight_token_dim_2 = 0;
+        size_t weight_token_stride_1 = 0;
+        size_t weight_token_stride_2 = 0;
+        std::vector<int32_t> token_indices;
+        std::vector<uint8_t> data;
+        std::vector<uint8_t> weight_data;
+    };
+
+    std::vector<moe_routing_capture> moe_routing_captures;
+    size_t moe_routing_capture_count = 0;
+    std::vector<llama_moe_routing_entry> moe_routing_entries;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

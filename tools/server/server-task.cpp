@@ -72,6 +72,12 @@ json task_params::to_json(bool only_metrics) const {
             {"ignore_eos",                sampling.ignore_eos},
             {"stream",                    stream},
             {"prompt_perplexity",         prompt_perplexity},
+            {"output_token_telemetry",    output_token_telemetry},
+            {"output_token_candidate_telemetry", output_token_candidate_telemetry},
+            {"output_token_candidate_include_accepted", output_token_candidate_include_accepted},
+            {"output_token_candidate_top_k", output_token_candidate_top_k},
+            {"output_token_candidate_byte_cap", output_token_candidate_byte_cap},
+            {"moe_routing_telemetry",     moe_routing_telemetry},
             {"n_probs",                   sampling.n_probs},
             {"min_keep",                  sampling.min_keep},
             {"chat_format",               common_chat_format_name(chat_parser_params.format)},
@@ -127,6 +133,12 @@ json task_params::to_json(bool only_metrics) const {
         {"ignore_eos",                sampling.ignore_eos},
         {"stream",                    stream},
         {"prompt_perplexity",         prompt_perplexity},
+        {"output_token_telemetry",    output_token_telemetry},
+        {"output_token_candidate_telemetry", output_token_candidate_telemetry},
+        {"output_token_candidate_include_accepted", output_token_candidate_include_accepted},
+        {"output_token_candidate_top_k", output_token_candidate_top_k},
+        {"output_token_candidate_byte_cap", output_token_candidate_byte_cap},
+        {"moe_routing_telemetry",     moe_routing_telemetry},
         {"logit_bias",                format_logit_bias(sampling.logit_bias)},
         {"n_probs",                   sampling.n_probs},
         {"min_keep",                  sampling.min_keep},
@@ -247,6 +259,8 @@ json result_prompt_progress::to_json() const {
         {"cache",     cache},
         {"processed", processed},
         {"time_ms",   time_ms},
+        {"prompt_start_monotonic_us", prompt_start_monotonic_us},
+        {"monotonic_us", monotonic_us},
     };
 }
 
@@ -1567,6 +1581,10 @@ std::string server_task_result_metrics::to_metrics() {
             "server_output_tokens_total",
             "Number of model-generated tokens observed, updated during generation",
             (double) metrics.n_server_output_tokens
+        }, {
+            "generation_steps_total",
+            "Number of post-first-token generation steps completed",
+            (double) metrics.predict.steps
         }, {
             "tokens_predicted_seconds_total",
             "Total time spent generating tokens",

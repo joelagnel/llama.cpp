@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-gpu-telemetry.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -8,6 +9,7 @@
 #include "server-stream.h"
 
 #include "build-info.h"
+#include "base64.hpp"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -22,6 +24,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cinttypes>
+#include <cctype>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -140,6 +143,120 @@ struct telemetry_probability_accumulator {
         min_logprob = std::min(min_logprob, logprob);
         max_logprob = std::max(max_logprob, logprob);
     }
+};
+
+enum telemetry_output_token_origin {
+    TELEMETRY_OUTPUT_TOKEN_ORIGIN_NORMAL_DECODE,
+    TELEMETRY_OUTPUT_TOKEN_ORIGIN_MTP_ACCEPTED,
+    TELEMETRY_OUTPUT_TOKEN_ORIGIN_TARGET_AFTER_MISS,
+    TELEMETRY_OUTPUT_TOKEN_ORIGIN_TARGET_BONUS,
+};
+
+struct telemetry_output_token_record {
+    uint64_t ordinal = 0;
+    int64_t model_ready_offset_us = 0;
+    int64_t model_ready_monotonic_us = 0;
+    llama_pos model_position = -1;
+    llama_token token_id = LLAMA_TOKEN_NULL;
+    std::string token_piece;
+    double selected_log_probability_ln = std::numeric_limits<double>::quiet_NaN();
+    telemetry_output_token_origin origin = TELEMETRY_OUTPUT_TOKEN_ORIGIN_NORMAL_DECODE;
+    int64_t logical_step = -1;
+    int64_t actual_target_pass = -1;
+    int64_t proposal_position = -1;
+    int64_t accepted_depth = -1;
+    int64_t proposed_count = -1;
+    bool replay_pass = false;
+};
+
+enum telemetry_mtp_pass_outcome {
+    TELEMETRY_MTP_PASS_ZERO_ACCEPTANCE,
+    TELEMETRY_MTP_PASS_PARTIAL_ACCEPTANCE,
+    TELEMETRY_MTP_PASS_FULL_ACCEPTANCE,
+};
+
+enum telemetry_mtp_proposal_disposition {
+    TELEMETRY_MTP_PROPOSAL_ACCEPTED,
+    TELEMETRY_MTP_PROPOSAL_FIRST_MISMATCH,
+    TELEMETRY_MTP_PROPOSAL_INVALIDATED_TAIL,
+};
+
+struct telemetry_mtp_proposal_record {
+    uint64_t position = 0;
+    uint64_t evaluated_actual_target_pass = 0;
+    llama_token draft_token_id = LLAMA_TOKEN_NULL;
+    llama_token target_selected_token_id = LLAMA_TOKEN_NULL;
+    double target_selected_log_probability_ln = std::numeric_limits<double>::quiet_NaN();
+    int64_t committed_output_ordinal = -1;
+    telemetry_mtp_proposal_disposition disposition = TELEMETRY_MTP_PROPOSAL_INVALIDATED_TAIL;
+};
+
+struct telemetry_mtp_pass_record {
+    uint64_t logical_step = 0;
+    uint64_t actual_target_pass = 0;
+    int64_t replay_of_actual_target_pass = -1;
+    uint64_t proposed_count = 0;
+    uint64_t accepted_depth = 0;
+    uint64_t target_rows_evaluated = 0;
+    uint64_t committed_output_start_ordinal = 0;
+    uint64_t committed_token_count = 0;
+    uint64_t reached_rejected_token_count = 0;
+    uint64_t invalidated_token_count = 0;
+    telemetry_mtp_pass_outcome outcome = TELEMETRY_MTP_PASS_ZERO_ACCEPTANCE;
+    bool replay_pass = false;
+    bool discarded = false;
+    bool counts_as_logical_step = false;
+    std::vector<telemetry_mtp_proposal_record> proposals;
+};
+
+enum telemetry_token_candidate_decision_kind {
+    TELEMETRY_TOKEN_CANDIDATE_ACCEPTED,
+    TELEMETRY_TOKEN_CANDIDATE_FIRST_MISMATCH,
+    TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS,
+};
+
+struct telemetry_token_candidate_value {
+    llama_token token_id = LLAMA_TOKEN_NULL;
+    double log_probability_ln = std::numeric_limits<double>::quiet_NaN();
+    bool target_selected = false;
+    bool draft_proposed = false;
+};
+
+struct telemetry_token_candidate_decision {
+    uint64_t logical_step = 0;
+    uint64_t actual_target_pass = 0;
+    uint64_t proposal_position = 0;
+    int64_t related_output_ordinal = -1;
+    llama_token draft_token_id = LLAMA_TOKEN_NULL;
+    llama_token target_selected_token_id = LLAMA_TOKEN_NULL;
+    telemetry_token_candidate_decision_kind kind = TELEMETRY_TOKEN_CANDIDATE_FIRST_MISMATCH;
+    std::string probability_state = "available";
+    std::string probability_reason = "raw_target_model_pre_sampler_top_k";
+    std::vector<telemetry_token_candidate_value> target_candidates;
+};
+
+struct telemetry_token_candidate_block_entry {
+    std::string trace_id;
+    json data;
+    size_t bytes = 0;
+};
+
+enum telemetry_moe_token_phase {
+    TELEMETRY_MOE_TOKEN_PHASE_PREFILL_OUTPUT,
+    TELEMETRY_MOE_TOKEN_PHASE_NORMAL_DECODE,
+    TELEMETRY_MOE_TOKEN_PHASE_MTP_VERIFY,
+};
+
+struct telemetry_moe_token_activation_record {
+    llama_pos model_position = -1;
+    int32_t layer_index = -1;
+    int32_t expert_index = -1;
+    float effective_weight = std::numeric_limits<float>::quiet_NaN();
+    telemetry_moe_token_phase phase = TELEMETRY_MOE_TOKEN_PHASE_NORMAL_DECODE;
+    int64_t logical_step = -1;
+    int64_t actual_target_pass = -1;
+    int64_t proposal_position = -1;
+    bool replay_pass = false;
 };
 
 struct server_batch {
@@ -318,6 +435,28 @@ struct server_slot {
     std::vector<completion_token_output> generated_token_probs;
     telemetry_probability_accumulator response_probability;
     telemetry_probability_accumulator prompt_probability;
+    std::vector<telemetry_output_token_record> telemetry_output_tokens;
+    std::vector<telemetry_mtp_pass_record> telemetry_mtp_passes;
+    std::vector<telemetry_mtp_proposal_record> telemetry_mtp_proposals_pending;
+    std::vector<telemetry_token_candidate_decision> telemetry_token_candidate_decisions;
+    const char * telemetry_token_candidate_state = "not_captured";
+    const char * telemetry_token_candidate_reason = "candidate_detail_not_finalized";
+    size_t telemetry_token_candidate_stored_bytes = 0;
+    size_t telemetry_token_candidate_eligible_count = 0;
+    size_t telemetry_token_candidate_dropped_count = 0;
+    uint64_t telemetry_mtp_proposals_captured = 0;
+    std::vector<uint64_t> telemetry_moe_expert_activations;
+    std::vector<telemetry_moe_token_activation_record> telemetry_moe_token_activations;
+    std::set<int32_t> telemetry_moe_layers;
+    uint64_t telemetry_moe_routed_tokens = 0;
+    uint64_t telemetry_moe_routed_token_layers = 0;
+    uint64_t telemetry_moe_activations_total = 0;
+    uint64_t telemetry_moe_activations_captured = 0;
+    uint64_t telemetry_moe_token_decisions_total = 0;
+    uint64_t telemetry_moe_token_decisions_captured = 0;
+    uint64_t telemetry_moe_token_activations_total = 0;
+    uint64_t telemetry_moe_token_activations_captured = 0;
+    uint64_t telemetry_moe_token_activations_invalid = 0;
 
     bool has_next_token = true;
     bool has_new_line   = false;
@@ -391,6 +530,8 @@ struct server_slot {
 
     server_slot_stats stats;
     bool telemetry_finalized = false;
+    uint64_t telemetry_assignment_ordinal = 0;
+    json telemetry_pending_completion_event;
 
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
@@ -400,8 +541,12 @@ struct server_slot {
     uint64_t n_spec_target_tokens = 0;
     uint64_t n_spec_useful_tokens = 0;
     uint64_t n_spec_target_passes = 0;
+    uint64_t telemetry_spec_logical_step = 0;
+    uint64_t telemetry_spec_proposed_count = 0;
+    uint64_t telemetry_spec_accepted_depth = 0;
 
     std::function<void(int /* id_slot */)>   callback_on_release;
+    std::function<void(server_slot &)>       callback_on_idle;  // called after the slot becomes idle
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
     // this is for printing timings with slot progress, not part of metrics
@@ -430,6 +575,28 @@ struct server_slot {
         generated_token_probs.clear();
         response_probability.reset();
         prompt_probability.reset();
+        std::vector<telemetry_output_token_record>().swap(telemetry_output_tokens);
+        std::vector<telemetry_mtp_pass_record>().swap(telemetry_mtp_passes);
+        std::vector<telemetry_mtp_proposal_record>().swap(telemetry_mtp_proposals_pending);
+        std::vector<telemetry_token_candidate_decision>().swap(telemetry_token_candidate_decisions);
+        telemetry_token_candidate_state = "not_captured";
+        telemetry_token_candidate_reason = "candidate_detail_not_finalized";
+        telemetry_token_candidate_stored_bytes = 0;
+        telemetry_token_candidate_eligible_count = 0;
+        telemetry_token_candidate_dropped_count = 0;
+        telemetry_mtp_proposals_captured = 0;
+        telemetry_moe_expert_activations.clear();
+        std::vector<telemetry_moe_token_activation_record>().swap(telemetry_moe_token_activations);
+        telemetry_moe_layers.clear();
+        telemetry_moe_routed_tokens = 0;
+        telemetry_moe_routed_token_layers = 0;
+        telemetry_moe_activations_total = 0;
+        telemetry_moe_activations_captured = 0;
+        telemetry_moe_token_decisions_total = 0;
+        telemetry_moe_token_decisions_captured = 0;
+        telemetry_moe_token_activations_total = 0;
+        telemetry_moe_token_activations_captured = 0;
+        telemetry_moe_token_activations_invalid = 0;
         json_schema = json();
 
         task_prev = std::move(task);
@@ -438,12 +605,17 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         telemetry_finalized = false;
+        telemetry_assignment_ordinal = 0;
+        telemetry_pending_completion_event = json();
         n_accepted_per_pos.clear();
         n_draft_hit_steps = 0;
         n_draft_full_steps = 0;
         n_spec_target_tokens = 0;
         n_spec_useful_tokens = 0;
         n_spec_target_passes = 0;
+        telemetry_spec_logical_step = 0;
+        telemetry_spec_proposed_count = 0;
+        telemetry_spec_accepted_depth = 0;
 
         n_predict_max = -1;
 
@@ -603,8 +775,11 @@ struct server_slot {
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
             t_last_used = ggml_time_us();
+            stats.t_release = t_last_used;
 
             state = SLOT_STATE_IDLE;
+
+            callback_on_idle(*this);
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -951,12 +1126,78 @@ public:
         return telemetry_content;
     }
 
+    bool telemetry_output_tokens_enabled() const {
+        return telemetry_output_tokens;
+    }
+
+    bool telemetry_token_candidates_enabled() const {
+        return telemetry_token_candidates;
+    }
+
+    size_t telemetry_token_candidate_max_bytes() const {
+        return telemetry_token_candidate_max_block_bytes;
+    }
+
+    bool telemetry_moe_routing_enabled() const {
+        return telemetry_moe_routing;
+    }
+
+    size_t telemetry_output_tokens_limit() const {
+        return telemetry_output_token_limit;
+    }
+
+    size_t telemetry_mtp_passes_limit() const {
+        return telemetry_mtp_pass_limit;
+    }
+
+    size_t telemetry_mtp_proposals_limit() const {
+        return telemetry_mtp_proposal_limit;
+    }
+
+    size_t telemetry_token_candidate_decisions_limit() const {
+        return telemetry_token_candidate_decision_limit;
+    }
+
+    size_t telemetry_moe_activation_limit_value() const {
+        return telemetry_moe_activation_limit;
+    }
+
     size_t telemetry_event_capacity_bytes() const {
         return telemetry_event_max_bytes;
     }
 
     const std::string & telemetry_instance_id() const {
         return telemetry_server_instance_id;
+    }
+
+    json telemetry_gpu_capability_json() const {
+        return gpu_telemetry.capability_json();
+    }
+
+    json telemetry_kv_pressure_capability_json() const {
+        return {
+            {"state", telemetry_kv_primary_occupancy_available ? "available" : "partial"},
+            {"reason", telemetry_kv_primary_occupancy_available
+                ? "Bounded causal KV-pressure events and lightweight primary occupancy are available."
+                : "Causal KV-pressure events are available, but primary occupancy is unavailable."},
+            {"owner", "llama.cpp/llama-server"},
+            {"endpoint", "/telemetry/v1/kv-pressure"},
+            {"schema_version", 1},
+            {"sampling_interval_ms", telemetry_kv_pressure_sampling_interval_us / 1000},
+            {"event_capacity", TELEMETRY_KV_PRESSURE_EVENT_CAPACITY},
+            {"serialized_event_capacity_bytes", telemetry_kv_pressure_event_max_bytes},
+            {"request_window_capacity", telemetry_kv_request_window_capacity},
+            {"event_kinds", json::array({
+                "utilization_sample",
+                "decode_wait_started",
+                "decode_retry",
+                "decode_wait_finished",
+                "idle_slot_evicted",
+                "context_shift",
+            })},
+            {"decode_wait_semantics", "llama_decode_returned_1_no_kv_slot_available"},
+            {"retry_size_semantics", "effective_server_decode_batch_limit"},
+        };
     }
 
     void reset_metrics_bucket() {
@@ -1006,22 +1247,95 @@ private:
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
+    server_gpu_telemetry gpu_telemetry;
+    std::vector<int64_t> gpu_verify_proposal_positions;
 
     struct telemetry_event_entry {
         json data;
         size_t bytes;
     };
+    struct telemetry_kv_request_window {
+        std::string trace_id;
+        int64_t start_monotonic_us = 0;
+        int64_t end_monotonic_us = 0;
+    };
+    struct telemetry_kv_wait_identity {
+        std::string trace_id;
+        int32_t task_id = -1;
+        int32_t slot_id = -1;
+        int64_t started_monotonic_us = 0;
+        std::set<int32_t> pending_batch_indices;
+    };
+    struct telemetry_kv_wait_episode {
+        std::string id;
+        int64_t started_monotonic_us = 0;
+        int32_t retry_count = 0;
+        std::vector<telemetry_kv_wait_identity> identities;
+
+        bool active() const {
+            return started_monotonic_us != 0;
+        }
+
+        void clear() {
+            id.clear();
+            started_monotonic_us = 0;
+            retry_count = 0;
+            identities.clear();
+        }
+    };
+    struct telemetry_kv_eviction_result {
+        bool cleared = false;
+        int32_t victim_slot_id = -1;
+        std::string victim_trace_id;
+        uint64_t victim_prompt_tokens = 0;
+        bool released_entries_available = false;
+        uint64_t released_entries = 0;
+        uint64_t memberships_removed = 0;
+    };
     std::deque<telemetry_event_entry> telemetry_events;
+    std::deque<telemetry_event_entry> telemetry_kv_pressure_events;
+    std::deque<telemetry_kv_request_window> telemetry_kv_request_windows;
+    std::deque<telemetry_token_candidate_block_entry> telemetry_token_candidate_blocks;
+    std::deque<std::string> telemetry_token_candidate_expired_trace_ids;
     std::string telemetry_server_instance_id = "server-" + random_string();
     uint64_t telemetry_next_sequence = 1;
+    uint64_t telemetry_next_assignment_ordinal = 1;
     uint64_t telemetry_dropped_events = 0;
     uint64_t telemetry_last_dropped_sequence = 0;
     size_t telemetry_event_bytes = 0;
     size_t telemetry_event_max_bytes = 64 * 1024 * 1024;
+    uint64_t telemetry_kv_pressure_next_sequence = 1;
+    uint64_t telemetry_kv_pressure_dropped_events = 0;
+    uint64_t telemetry_kv_pressure_last_dropped_sequence = 0;
+    uint64_t telemetry_kv_pressure_next_episode = 1;
+    size_t telemetry_kv_pressure_event_bytes = 0;
+    size_t telemetry_kv_pressure_event_max_bytes = 16 * 1024 * 1024;
+    size_t telemetry_kv_request_window_capacity = 4096;
+    int64_t telemetry_kv_pressure_sampling_interval_us = 100 * 1000;
+    int64_t telemetry_kv_pressure_last_sample_us = 0;
+    std::string telemetry_kv_primary_component;
+    std::string telemetry_kv_primary_memory_kind;
+    std::string telemetry_kv_primary_entry_semantics;
+    bool telemetry_kv_primary_occupancy_available = false;
+    telemetry_kv_wait_episode telemetry_kv_wait;
     std::vector<uint64_t> telemetry_slot_marks;
     uint64_t telemetry_slot_epoch = 0;
     bool telemetry_content = false;
+    bool telemetry_output_tokens = false;
+    size_t telemetry_output_token_limit = 512;
+    size_t telemetry_mtp_pass_limit = 512;
+    size_t telemetry_mtp_proposal_limit = 512;
+    bool telemetry_token_candidates = false;
+    size_t telemetry_token_candidate_decision_limit = 512;
+    size_t telemetry_token_candidate_max_block_bytes = 1024 * 1024;
+    size_t telemetry_token_candidate_retained_bytes = 0;
+    static constexpr size_t TELEMETRY_TOKEN_CANDIDATE_BLOCK_CAPACITY = 256;
+    static constexpr size_t TELEMETRY_TOKEN_CANDIDATE_RETAINED_MAX_BYTES = 64 * 1024 * 1024;
+    bool telemetry_moe_routing = false;
+    size_t telemetry_moe_activation_limit = 65536;
     static constexpr size_t TELEMETRY_EVENT_CAPACITY = 2048;
+    static constexpr size_t TELEMETRY_KV_PRESSURE_EVENT_CAPACITY = 32768;
+    static constexpr size_t TELEMETRY_KV_REQUEST_WINDOW_MAX_CAPACITY = 32768;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
     // note: kept out of server_metrics, which is copied as-is into the task result
@@ -1043,6 +1357,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        gpu_telemetry.stop();
         spec.reset();
         spec_init.reset();
 
@@ -1362,6 +1677,7 @@ private:
             slots.emplace_back();
         }
         telemetry_slot_marks.assign(slots.size(), 0);
+        gpu_verify_proposal_positions.assign(slots.size(), 0);
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1409,6 +1725,10 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+            };
+
+            slot.callback_on_idle = [this](server_slot & slot) {
+                telemetry_on_release(slot);
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -1502,6 +1822,8 @@ private:
             callback_state(SERVER_STATE_READY, {});
         }
 
+        gpu_telemetry.start();
+
         return true;
     }
 
@@ -1527,14 +1849,75 @@ private:
 
         const char * telemetry_content_env = getenv("LLAMA_TELEMETRY_CONTENT");
         telemetry_content = telemetry_content_env && atoi(telemetry_content_env) != 0;
+        const char * telemetry_output_tokens_env = getenv("LLAMA_TELEMETRY_OUTPUT_TOKENS");
+        telemetry_output_tokens = telemetry_output_tokens_env && atoi(telemetry_output_tokens_env) != 0;
+        const char * telemetry_output_token_limit_env = getenv("LLAMA_TELEMETRY_OUTPUT_TOKEN_LIMIT");
+        if (telemetry_output_token_limit_env) {
+            telemetry_output_token_limit = (size_t) std::max(32, std::min(8192, atoi(telemetry_output_token_limit_env)));
+        }
+        const char * telemetry_mtp_pass_limit_env = getenv("LLAMA_TELEMETRY_MTP_PASS_LIMIT");
+        if (telemetry_mtp_pass_limit_env) {
+            telemetry_mtp_pass_limit = (size_t) std::max(32, std::min(4096, atoi(telemetry_mtp_pass_limit_env)));
+        }
+        const char * telemetry_mtp_proposal_limit_env = getenv("LLAMA_TELEMETRY_MTP_PROPOSAL_LIMIT");
+        if (telemetry_mtp_proposal_limit_env) {
+            telemetry_mtp_proposal_limit = (size_t) std::max(32, std::min(4096, atoi(telemetry_mtp_proposal_limit_env)));
+        }
+        const char * telemetry_candidate_decision_limit_env = getenv("LLAMA_TELEMETRY_TOKEN_CANDIDATE_DECISION_LIMIT");
+        if (telemetry_candidate_decision_limit_env) {
+            telemetry_token_candidate_decision_limit = (size_t) std::max(8, std::min(4096, atoi(telemetry_candidate_decision_limit_env)));
+        }
+        const char * telemetry_token_candidates_env = getenv("LLAMA_TELEMETRY_TOKEN_CANDIDATES");
+        telemetry_token_candidates = telemetry_token_candidates_env && atoi(telemetry_token_candidates_env) != 0;
+        const char * telemetry_token_candidate_max_bytes_env = getenv("LLAMA_TELEMETRY_TOKEN_CANDIDATE_MAX_BYTES");
+        if (telemetry_token_candidate_max_bytes_env) {
+            telemetry_token_candidate_max_block_bytes = (size_t) std::max(
+                8192,
+                std::min(1024 * 1024, atoi(telemetry_token_candidate_max_bytes_env)));
+        }
+        const char * telemetry_moe_routing_env = getenv("LLAMA_TELEMETRY_MOE_ROUTING");
+        telemetry_moe_routing = telemetry_moe_routing_env && atoi(telemetry_moe_routing_env) != 0;
+        const char * telemetry_moe_activation_limit_env = getenv("LLAMA_TELEMETRY_MOE_ACTIVATION_LIMIT");
+        if (telemetry_moe_activation_limit_env) {
+            telemetry_moe_activation_limit = (size_t) std::max(1024, std::min(1048576, atoi(telemetry_moe_activation_limit_env)));
+        }
         const char * telemetry_buffer_env = getenv("LLAMA_TELEMETRY_EVENT_BUFFER_MIB");
         if (telemetry_buffer_env) {
             const int mib = std::max(1, std::min(4096, atoi(telemetry_buffer_env)));
             telemetry_event_max_bytes = (size_t) mib * 1024 * 1024;
         }
+        const char * telemetry_kv_pressure_buffer_env = getenv("LLAMA_TELEMETRY_KV_PRESSURE_BUFFER_MIB");
+        if (telemetry_kv_pressure_buffer_env) {
+            const int mib = std::max(1, std::min(1024, atoi(telemetry_kv_pressure_buffer_env)));
+            telemetry_kv_pressure_event_max_bytes = (size_t) mib * 1024 * 1024;
+        }
+        const char * telemetry_kv_pressure_interval_env = getenv("LLAMA_TELEMETRY_KV_PRESSURE_INTERVAL_MS");
+        if (telemetry_kv_pressure_interval_env) {
+            const int interval_ms = std::max(10, std::min(5000, atoi(telemetry_kv_pressure_interval_env)));
+            telemetry_kv_pressure_sampling_interval_us = (int64_t) interval_ms * 1000;
+        }
+        const char * telemetry_kv_request_window_env = getenv("LLAMA_TELEMETRY_KV_PRESSURE_REQUEST_WINDOW_LIMIT");
+        if (telemetry_kv_request_window_env) {
+            telemetry_kv_request_window_capacity = (size_t) std::max(
+                1,
+                std::min((int) TELEMETRY_KV_REQUEST_WINDOW_MAX_CAPACITY, atoi(telemetry_kv_request_window_env)));
+        }
         if (telemetry_content) {
             SRV_WRN("%s", "LLAMA_TELEMETRY_CONTENT is enabled; prompt and response text will be retained in the in-memory event buffer\n");
         }
+        if (telemetry_output_tokens) {
+            SRV_WRN("output-token telemetry is enabled with a hard cap of %zu committed tokens per request; request defaults are automatic when content and candidate telemetry are also enabled\n", telemetry_output_token_limit);
+        }
+        if (telemetry_token_candidates) {
+            SRV_WRN("external target-candidate telemetry is enabled with a hard cap of %zu serialized bytes per request; request defaults are automatic when content and output-token telemetry are also enabled\n",
+                    telemetry_token_candidate_max_block_bytes);
+        }
+        if (telemetry_moe_routing) {
+            SRV_WRN("MoE routing telemetry is enabled for opted-in requests with a hard cap of %zu retained expert activations per request\n", telemetry_moe_activation_limit);
+        }
+
+        telemetry_kv_pressure_initialize();
+        telemetry_kv_pressure_sample(ggml_time_us(), true);
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
@@ -1622,6 +2005,7 @@ private:
             }
         }
 
+        gpu_telemetry.start();
         return true;
     }
 
@@ -1772,36 +2156,48 @@ private:
         return ret;
     }
 
-    // return true if at least one slot has been cleared
+    telemetry_kv_eviction_result clear_idle_slot(server_slot & slot) {
+        telemetry_kv_eviction_result result;
+        result.cleared = true;
+        result.victim_slot_id = slot.id;
+        result.victim_prompt_tokens = slot.prompt.n_tokens();
+        if (slot.task_prev) {
+            result.victim_trace_id = slot.task_prev->trace_id;
+        }
+        const llama_memory_primary_occupancy occupancy_before = llama_get_memory_primary_occupancy(ctx_tgt);
+        const llama_memory_diagnostics diagnostics_before = llama_get_memory_diagnostics(ctx_tgt);
+        slot.prompt_clear();
+        const llama_memory_primary_occupancy occupancy_after = llama_get_memory_primary_occupancy(ctx_tgt);
+        const llama_memory_diagnostics diagnostics_after = llama_get_memory_diagnostics(ctx_tgt);
+        result.released_entries_available = occupancy_before.available && occupancy_after.available &&
+            occupancy_before.used_entries >= occupancy_after.used_entries;
+        if (result.released_entries_available) {
+            result.released_entries = occupancy_before.used_entries - occupancy_after.used_entries;
+        }
+        if (diagnostics_after.churn.memberships_removed >= diagnostics_before.churn.memberships_removed) {
+            result.memberships_removed = diagnostics_after.churn.memberships_removed -
+                diagnostics_before.churn.memberships_removed;
+        }
+        return result;
+    }
+
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
-        bool res = false;
-
+    telemetry_kv_eviction_result try_clear_idle_slots() {
         if (!params_base.kv_unified) {
-            return res;
+            return {};
         }
 
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
-                continue;
-            }
-
-            if (slot.prompt.n_tokens() > 0) {
+            if (!slot.is_processing() && slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+                return clear_idle_slot(slot);
             }
         }
 
-        return res;
+        return {};
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -1931,6 +2327,7 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.telemetry_assignment_ordinal = telemetry_next_assignment_ordinal++;
 
         slot.stats.trace_id = slot.task->trace_id;
         slot.stats.t_arrival = slot.task->t_arrival;
@@ -2186,11 +2583,15 @@ private:
         res->index = slot.task->index;
 
         if (is_progress) {
+            const int64_t monotonic_us = ggml_time_us();
+            GGML_ASSERT(slot.stats.t_start > 0);
             res->is_progress        = true;
             res->progress.total     = slot.task->n_tokens();
             res->progress.cache     = slot.stats.n_prompt_cached;
             res->progress.processed = slot.prompt.tokens.size();
-            res->progress.time_ms   = slot.stats.t_elapsed_us() / 1000;
+            res->progress.prompt_start_monotonic_us = slot.stats.t_start;
+            res->progress.monotonic_us = monotonic_us;
+            res->progress.time_ms   = (monotonic_us - slot.stats.t_start) / 1000;
         }
         if (is_begin) {
             res->is_begin = true;
@@ -2223,7 +2624,6 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
-        telemetry_finalize(slot, "success");
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2237,17 +2637,9 @@ private:
             slot.debug_generated_text = slot.generated_text;
         }
 
-        // in stream mode, content and tokens are already in last partial chunk
-        if (slot.task->params.stream) {
-            res->content     = "";
-            res->tokens      = llama_tokens{};
-        } else {
-            res->content     = std::move(slot.generated_text);
-            res->tokens      = std::move(slot.generated_tokens);
-        }
         res->stats           = slot.stats;
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
-        res->response_fields = std::move(slot.task->params.response_fields);
+        res->response_fields = slot.task->params.response_fields;
 
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.stats.n_gen;
@@ -2284,10 +2676,19 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
+        telemetry_finalize(slot, "success");
+        res->stats.t_complete = slot.stats.t_complete;
+
+        // in stream mode, content and tokens are already in last partial chunk
+        if (!slot.task->params.stream) {
+            res->content = std::move(slot.generated_text);
+            res->tokens  = std::move(slot.generated_tokens);
+        }
+
         queue_results.send(std::move(res));
     }
 
-    void send_embedding(const server_slot & slot, const llama_batch & batch) {
+    void send_embedding(server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_embd>();
         res->id        = slot.task->id;
         res->index     = slot.task->index;
@@ -2329,10 +2730,11 @@ private:
 
         SLT_DBG(slot, "%s", "sending embeddings\n");
 
+        telemetry_finalize(slot, "success");
         queue_results.send(std::move(res));
     }
 
-    void send_rerank(const server_slot & slot, const llama_batch & batch) {
+    void send_rerank(server_slot & slot, const llama_batch & batch) {
         auto res = std::make_unique<server_task_result_rerank>();
         res->id       = slot.task->id;
         res->index    = slot.task->index;
@@ -2360,6 +2762,7 @@ private:
 
         SLT_DBG(slot, "sending rerank result, res.score = %f\n", res->score);
 
+        telemetry_finalize(slot, "success");
         queue_results.send(std::move(res));
     }
 
@@ -2415,6 +2818,7 @@ private:
                         slot.task->id == id_parent ||
                         slot.task->id_parent == id_parent
                 )) {
+                    telemetry_finalize(slot, "error", "failed to launch shared request", "server");
                     slot.release();
                 }
             }
@@ -2572,7 +2976,16 @@ private:
 
                                 if (params_base.kv_unified) {
                                     // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
+                                    if (slot.prompt.n_tokens() > 0) {
+                                        const telemetry_kv_eviction_result eviction = clear_idle_slot(slot);
+                                        telemetry_kv_record_eviction(
+                                            eviction,
+                                            "idle_cache_policy",
+                                            "idle cached state moved to the RAM prompt cache",
+                                            false);
+                                    } else {
+                                        slot.prompt_clear();
+                                    }
                                 }
                             }
                         }
@@ -2653,6 +3066,9 @@ private:
             case SERVER_TASK_TYPE_TELEMETRY_SNAPSHOT:
             case SERVER_TASK_TYPE_TELEMETRY_EVENTS:
             case SERVER_TASK_TYPE_TELEMETRY_KV:
+            case SERVER_TASK_TYPE_TELEMETRY_KV_PRESSURE:
+            case SERVER_TASK_TYPE_TELEMETRY_GPU:
+            case SERVER_TASK_TYPE_TELEMETRY_TOKEN_CANDIDATES:
                 {
                     auto res = std::make_unique<server_task_result_telemetry>();
                     res->id = task.id;
@@ -2660,8 +3076,21 @@ private:
                         res->data = telemetry_snapshot_json();
                     } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_EVENTS) {
                         res->data = telemetry_events_json(task.telemetry_cursor, task.telemetry_limit);
-                    } else {
+                    } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_KV) {
                         res->data = telemetry_kv_json();
+                    } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_KV_PRESSURE) {
+                        res->data = telemetry_kv_pressure_events_json(
+                            task.telemetry_cursor,
+                            task.telemetry_limit,
+                            task.telemetry_trace_id);
+                    } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_TOKEN_CANDIDATES) {
+                        res->data = telemetry_token_candidates_json(task.telemetry_trace_id);
+                    } else {
+                        res->data = gpu_telemetry.snapshot_json(
+                            telemetry_server_instance_id,
+                            task.telemetry_cursor,
+                            task.telemetry_limit,
+                            task.telemetry_trace_id);
                     }
                     queue_results.send(std::move(res));
                 } break;
@@ -3093,8 +3522,24 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
+                const llama_memory_diagnostics diagnostics_before = llama_get_memory_diagnostics(ctx_tgt);
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                const llama_memory_diagnostics diagnostics_after = llama_get_memory_diagnostics(ctx_tgt);
+                const uint64_t shifted_entries = diagnostics_after.churn.shifted_entries >= diagnostics_before.churn.shifted_entries
+                    ? diagnostics_after.churn.shifted_entries - diagnostics_before.churn.shifted_entries
+                    : 0;
+                telemetry_kv_pressure_append({
+                    {"kind", "context_shift"},
+                    {"trace_id", slot.task->trace_id},
+                    {"task_id", slot.task->id},
+                    {"slot_id", slot.id},
+                    {"role", "target"},
+                    {"discarded_tokens", n_discard},
+                    {"position_delta", -n_discard},
+                    {"shifted_entries", shifted_entries},
+                });
+                telemetry_kv_pressure_sample(ggml_time_us(), true);
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -3187,9 +3632,27 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t draft_started_us = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            const int64_t draft_completed_us = ggml_time_us();
+            for (const server_slot * slot : drafting) {
+                for (size_t proposal = 0; proposal < slot->spec_draft.size(); ++proposal) {
+                    gpu_telemetry.record_operation(
+                        SERVER_GPU_OPERATION_MTP_DRAFT,
+                        slot->task->trace_id,
+                        slot->id,
+                        draft_started_us,
+                        draft_completed_us,
+                        slot->prompt.n_tokens() + (int64_t) proposal,
+                        -1,
+                        slot->stats.n_draft_verif_steps,
+                        slot->n_spec_target_passes,
+                        proposal,
+                        SERVER_GPU_TIMING_SYNCHRONIZED_WINDOW);
+                }
+            }
         }
 
         // make checkpoints if needed
@@ -3846,19 +4309,68 @@ private:
         }
 
         bool has_output = false;
+        bool collect_moe_routing = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
+            const server_slot & slot = slots[batch.tokens[i].id_slot];
+            collect_moe_routing |= telemetry_moe_routing
+                && llama_model_n_expert(model_tgt) > 0
+                && slot.task
+                && slot.task->params.moe_routing_telemetry;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        std::vector<llama_moe_routing_entry> moe_routing_entries;
         queue_tasks.yield_to_queue([&]() {
+            llama_set_moe_routing(ctx_tgt, collect_moe_routing);
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            if (ret == 0 && collect_moe_routing) {
+                size_t count = 0;
+                const llama_moe_routing_entry * entries = llama_get_moe_routing(ctx_tgt, &count);
+                if (entries != nullptr && count > 0) {
+                    moe_routing_entries.assign(entries, entries + count);
+                }
+            }
         });
+        const int64_t decode_completed_us = ggml_time_us();
+
+        if (ret == 0 && collect_moe_routing) {
+            telemetry_record_moe_routing(moe_routing_entries, off, batch_view.n_tokens);
+        }
+
+        if (ret == 0 && gpu_telemetry.is_collecting()) {
+            std::fill(gpu_verify_proposal_positions.begin(), gpu_verify_proposal_positions.end(), 0);
+            for (int i = off; i < off + batch_view.n_tokens; ++i) {
+                const auto & token = batch.tokens[i];
+                const server_slot & slot = slots[token.id_slot];
+                const bool mtp_verify = !token.is_prompt && slot.can_speculate() && !slot.spec_draft.empty();
+                const server_gpu_operation_kind kind = token.is_prompt
+                    ? SERVER_GPU_OPERATION_PREFILL
+                    : mtp_verify ? SERVER_GPU_OPERATION_MTP_VERIFY : SERVER_GPU_OPERATION_NORMAL_DECODE;
+                gpu_telemetry.record_operation(
+                    kind,
+                    slot.task ? slot.task->trace_id : std::string(),
+                    slot.id,
+                    t_decode_start,
+                    decode_completed_us,
+                    token.pos,
+                    token.is_prompt || mtp_verify ? -1 : slot.stats.n_gen,
+                    mtp_verify ? (int64_t) slot.stats.n_draft_verif_steps : -1,
+                    mtp_verify ? (int64_t) slot.n_spec_target_passes : -1,
+                    mtp_verify ? gpu_verify_proposal_positions[token.id_slot]++ : -1,
+                    has_output ? SERVER_GPU_TIMING_SYNCHRONIZED_WINDOW : SERVER_GPU_TIMING_SUBMISSION_WINDOW);
+            }
+        }
+
+        if (ret == 1) {
+            telemetry_kv_wait_begin(off, batch_view.n_tokens, n_batch);
+            telemetry_kv_pressure_sample(decode_completed_us, true);
+        }
 
         if (ret != 0) {
             {
@@ -3882,6 +4394,14 @@ private:
                 // TODO: handle ret == 2 (abort) when we start aborting
 
                 if (!err.empty()) {
+                    if (telemetry_kv_wait.active()) {
+                        if (ret == 1) {
+                            telemetry_kv_wait_retry("terminal", n_batch, 0, decode_completed_us);
+                            telemetry_kv_wait_finish("context_exhausted", decode_completed_us);
+                        } else {
+                            telemetry_kv_wait_finish("failed", decode_completed_us);
+                        }
+                    }
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
                     for (auto & slot : slots) {
@@ -3900,8 +4420,28 @@ private:
                 }
             }
 
-            // retry with half the batch size to try to find a free slot in the KV cache
-            if (!try_clear_idle_slots()) {
+            if (ret == 1) {
+                const int32_t attempted_batch_size = n_batch;
+                const telemetry_kv_eviction_result eviction = try_clear_idle_slots();
+                if (eviction.cleared) {
+                    telemetry_kv_wait_retry(
+                        "emergency_idle_slot_eviction",
+                        attempted_batch_size,
+                        attempted_batch_size,
+                        decode_completed_us);
+                    telemetry_kv_record_eviction(
+                        eviction,
+                        "decode_pressure_recovery",
+                        "idle cached state cleared after llama_decode returned KV-slot unavailable",
+                        true);
+                } else {
+                    n_batch /= 2;
+                    telemetry_kv_wait_retry("batch_halved", attempted_batch_size, n_batch, decode_completed_us);
+                }
+            } else {
+                if (telemetry_kv_wait.active()) {
+                    telemetry_kv_wait_finish("failed", decode_completed_us);
+                }
                 n_batch /= 2;
             }
 
@@ -3909,6 +4449,9 @@ private:
 
             return false; // retry with the updated n_batch
         } else {
+            telemetry_kv_wait_finish_resumed(off, batch_view.n_tokens, decode_completed_us);
+            telemetry_kv_pressure_sample(decode_completed_us, false);
+
             // success, apply batch metrics
             metrics_post_decode(off, batch_view.n_tokens, has_output);
         }
@@ -4024,6 +4567,7 @@ private:
 
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
+            const llama_pos model_position = batch.tokens[slot.i_batch].pos + 1;
 
             llama_token id;
             {
@@ -4049,12 +4593,12 @@ private:
                 slot.n_gen_last = 0;
             }
 
-            slot.stats.update_gen_last();
-
             completion_token_output result;
             result.tok          = id;
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+
+            double selected_log_probability_ln = std::numeric_limits<double>::quiet_NaN();
 
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
@@ -4064,11 +4608,23 @@ private:
                     std::string reason;
                     if (selected_token_log_probability(ctx_tgt, tok_idx, id, logprob, reason)) {
                         slot.response_probability.observe(logprob);
+                        selected_log_probability_ln = logprob;
                     } else {
                         slot.response_probability.unavailable_reason = std::move(reason);
                     }
                 }
             }
+
+            telemetry_record_output_token(
+                slot,
+                id,
+                result.text_to_send,
+                t_now,
+                model_position,
+                selected_log_probability_ln,
+                TELEMETRY_OUTPUT_TOKEN_ORIGIN_NORMAL_DECODE);
+
+            slot.stats.update_gen_last();
 
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
@@ -4091,17 +4647,18 @@ private:
 
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
+            const bool replay_pass = slot.spec_is_replay;
 
             GGML_ASSERT(n_draft > 0);
 
             // verify and try to accept the draft
             int64_t t_spec_sample = 0;
             std::vector<float> spec_selected_probs;
+            const auto spec_rows = slot.spec_i_batch;
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                const auto spec_rows = slot.spec_i_batch;
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 auto accepted = synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_rows, slot.spec_draft)
@@ -4127,6 +4684,12 @@ private:
                 // create a second proposed/accepted-depth observation.
                 if (!slot.spec_is_replay) {
                     const size_t accepted_depth = accepted.size() - 1;
+                    if (telemetry_output_token_request_enabled(slot)) {
+                        slot.telemetry_spec_logical_step = slot.stats.n_draft_verif_steps;
+                        slot.telemetry_spec_proposed_count = n_draft;
+                        slot.telemetry_spec_accepted_depth = accepted_depth;
+                        telemetry_prepare_mtp_proposals(slot, slot.spec_draft, accepted);
+                    }
                     metrics.spec_draft_depth.observe(n_draft);
                     metrics.spec_accepted_depth.observe(accepted_depth);
                     if (accepted_depth > 0) {
@@ -4174,6 +4737,18 @@ private:
                         // This expensive target pass committed no output. The
                         // replay pass will receive its own target/useful entry.
                         metrics.spec_useful_tokens_per_pass.observe(0);
+                        telemetry_record_mtp_pass(
+                            slot,
+                            replay_pass,
+                            true,
+                            n_draft + 1,
+                            slot.stats.n_gen,
+                            0);
+                        if (telemetry_output_token_request_enabled(slot)) {
+                            slot.stats.update_gen_last();
+                        } else {
+                            slot.stats.t_gen_last = std::max(slot.stats.t_prompt_last, t_spec_sample);
+                        }
 
                         return;
                     }
@@ -4187,18 +4762,72 @@ private:
 
                 slot.spec_draft = std::move(accepted);
 
-                if (slot.task->params.sampling.n_probs > 0 && slot.response_probability.unavailable_reason.empty()) {
-                    spec_selected_probs.reserve(slot.spec_draft.size());
-                    for (size_t i = 0; i < slot.spec_draft.size(); ++i) {
-                        double logprob = 0.0;
-                        std::string reason;
-                        if (selected_token_log_probability(ctx_tgt, spec_rows[i], slot.spec_draft[i], logprob, reason)) {
+                const bool response_probability_enabled = slot.task->params.sampling.n_probs > 0
+                    && slot.response_probability.unavailable_reason.empty();
+                spec_selected_probs.clear();
+                if (response_probability_enabled) {
+                    spec_selected_probs.assign(slot.spec_draft.size(), std::numeric_limits<float>::quiet_NaN());
+                }
+                for (size_t i = 0; i < slot.spec_draft.size(); ++i) {
+                    const bool candidate_enabled = telemetry_token_candidate_position_enabled(
+                        slot,
+                        i,
+                        slot.telemetry_spec_accepted_depth,
+                        slot.telemetry_spec_proposed_count);
+                    if (!response_probability_enabled && !candidate_enabled) {
+                        continue;
+                    }
+
+                    double logprob = 0.0;
+                    std::string reason;
+                    std::vector<telemetry_token_candidate_value> candidates;
+                    const size_t top_k = candidate_enabled
+                        ? (size_t) slot.task->params.output_token_candidate_top_k
+                        : 0;
+                    const bool available = raw_target_token_probabilities(
+                        ctx_tgt,
+                        spec_rows[i],
+                        slot.spec_draft[i],
+                        top_k,
+                        logprob,
+                        candidate_enabled ? &candidates : nullptr,
+                        reason);
+                    if (available) {
+                        if (response_probability_enabled) {
                             slot.response_probability.observe(logprob);
-                            spec_selected_probs.push_back((float) std::exp(logprob));
-                        } else {
-                            slot.response_probability.unavailable_reason = std::move(reason);
-                            spec_selected_probs.clear();
-                            break;
+                            spec_selected_probs[i] = (float) std::exp(logprob);
+                            if (i < slot.telemetry_mtp_proposals_pending.size() &&
+                                    slot.telemetry_mtp_proposals_pending[i].disposition != TELEMETRY_MTP_PROPOSAL_INVALIDATED_TAIL) {
+                                slot.telemetry_mtp_proposals_pending[i].target_selected_log_probability_ln = logprob;
+                            }
+                        }
+                        if (candidate_enabled) {
+                            telemetry_record_token_candidates(
+                                slot,
+                                i,
+                                slot.telemetry_spec_accepted_depth,
+                                slot.telemetry_spec_proposed_count,
+                                slot.spec_draft[i],
+                                slot.stats.n_gen + i,
+                                std::move(candidates),
+                                "available",
+                                "raw_target_model_pre_sampler_top_k_from_one_full_vocabulary_normalization");
+                        }
+                    } else {
+                        if (response_probability_enabled && slot.response_probability.unavailable_reason.empty()) {
+                            slot.response_probability.unavailable_reason = reason;
+                        }
+                        if (candidate_enabled) {
+                            telemetry_record_token_candidates(
+                                slot,
+                                i,
+                                slot.telemetry_spec_accepted_depth,
+                                slot.telemetry_spec_proposed_count,
+                                slot.spec_draft[i],
+                                slot.stats.n_gen + i,
+                                {},
+                                "unavailable",
+                                reason);
                         }
                     }
                 }
@@ -4219,8 +4848,6 @@ private:
                 slot.t_print_last = t_spec_sample;
                 slot.n_gen_last = 0;
             }
-            slot.stats.t_gen_last = std::max(slot.stats.t_prompt_last, t_spec_sample);
-
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
@@ -4242,13 +4869,16 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+            const uint64_t committed_output_start_ordinal = slot.stats.n_gen;
             uint64_t useful_tokens_this_pass = 0;
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
                 result.tok          = ids[i];
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = i < spec_selected_probs.size() ? spec_selected_probs[i] : 1.0f;
+                result.prob         = i < spec_selected_probs.size() && std::isfinite(spec_selected_probs[i])
+                    ? spec_selected_probs[i]
+                    : 1.0f;
 
                 // TODO: set result.probs
 
@@ -4258,8 +4888,45 @@ private:
                 metrics.n_spec_useful_tokens++;
                 useful_tokens_this_pass++;
 
+                const double selected_log_probability_ln = i < spec_selected_probs.size() && result.prob > 0.0f
+                    ? std::log((double) result.prob)
+                    : std::numeric_limits<double>::quiet_NaN();
+                const auto origin = i < slot.telemetry_spec_accepted_depth
+                    ? TELEMETRY_OUTPUT_TOKEN_ORIGIN_MTP_ACCEPTED
+                    : i == slot.telemetry_spec_accepted_depth &&
+                            slot.telemetry_spec_accepted_depth < slot.telemetry_spec_proposed_count
+                        ? TELEMETRY_OUTPUT_TOKEN_ORIGIN_TARGET_AFTER_MISS
+                        : TELEMETRY_OUTPUT_TOKEN_ORIGIN_TARGET_BONUS;
+                telemetry_record_output_token(
+                    slot,
+                    result.tok,
+                    result.text_to_send,
+                    t_spec_sample,
+                    batch.tokens[spec_rows[i]].pos + 1,
+                    selected_log_probability_ln,
+                    origin,
+                    (int64_t) slot.telemetry_spec_logical_step,
+                    slot.n_spec_target_passes > 0 ? (int64_t) slot.n_spec_target_passes - 1 : -1,
+                    (int64_t) i,
+                    (int64_t) slot.telemetry_spec_accepted_depth,
+                    (int64_t) slot.telemetry_spec_proposed_count,
+                    replay_pass);
+
+                if (telemetry_output_token_request_enabled(slot) || slot.task->params.sampling.n_probs > 0) {
+                    slot.stats.update_gen_last();
+                } else {
+                    slot.stats.t_gen_last = std::max(slot.stats.t_prompt_last, t_spec_sample);
+                }
+
                 if (!process_token(result, slot)) {
                     metrics.spec_useful_tokens_per_pass.observe(useful_tokens_this_pass);
+                    telemetry_record_mtp_pass(
+                        slot,
+                        replay_pass,
+                        false,
+                        n_draft + 1,
+                        committed_output_start_ordinal,
+                        useful_tokens_this_pass);
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();
@@ -4269,6 +4936,13 @@ private:
             }
 
             metrics.spec_useful_tokens_per_pass.observe(useful_tokens_this_pass);
+            telemetry_record_mtp_pass(
+                slot,
+                replay_pass,
+                false,
+                n_draft + 1,
+                committed_output_start_ordinal,
+                useful_tokens_this_pass);
 
             slot.print_timings_tg();
 
@@ -4311,11 +4985,340 @@ private:
         }
     }
 
-    bool selected_token_log_probability(
+    static int64_t telemetry_wall_unix_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    void telemetry_kv_pressure_initialize() {
+        const llama_memory_diagnostics diagnostics = llama_get_memory_diagnostics(ctx_tgt);
+        const llama_memory_primary_occupancy occupancy = llama_get_memory_primary_occupancy(ctx_tgt);
+        telemetry_kv_primary_occupancy_available = occupancy.available && occupancy.capacity_entries > 0 &&
+            occupancy.used_entries <= occupancy.capacity_entries;
+        for (const auto & component : diagnostics.components) {
+            if (!component.logical_primary) {
+                continue;
+            }
+            telemetry_kv_primary_component = component.name;
+            telemetry_kv_primary_memory_kind = component.kind;
+            telemetry_kv_primary_entry_semantics = component.entry_semantics;
+            break;
+        }
+    }
+
+    void telemetry_kv_pressure_append(json event) {
+        if (!event.contains("timestamp_unix_ms")) {
+            event["timestamp_unix_ms"] = telemetry_wall_unix_ms();
+        }
+        if (!event.contains("monotonic_us")) {
+            event["monotonic_us"] = ggml_time_us();
+        }
+        event["schema_version"] = 1;
+        event["server_instance_id"] = telemetry_server_instance_id;
+        event["sequence"] = telemetry_kv_pressure_next_sequence++;
+        const size_t bytes = event.dump().size();
+        if (bytes > telemetry_kv_pressure_event_max_bytes) {
+            telemetry_kv_pressure_dropped_events++;
+            telemetry_kv_pressure_last_dropped_sequence = event.at("sequence").get<uint64_t>();
+            return;
+        }
+        telemetry_kv_pressure_event_bytes += bytes;
+        telemetry_kv_pressure_events.push_back({std::move(event), bytes});
+        while (telemetry_kv_pressure_events.size() > TELEMETRY_KV_PRESSURE_EVENT_CAPACITY ||
+                telemetry_kv_pressure_event_bytes > telemetry_kv_pressure_event_max_bytes) {
+            telemetry_kv_pressure_event_bytes -= telemetry_kv_pressure_events.front().bytes;
+            telemetry_kv_pressure_last_dropped_sequence = telemetry_kv_pressure_events.front().data.at("sequence").get<uint64_t>();
+            telemetry_kv_pressure_events.pop_front();
+            telemetry_kv_pressure_dropped_events++;
+        }
+    }
+
+    void telemetry_kv_pressure_sample(int64_t monotonic_us, bool force) {
+        if (monotonic_us <= 0) {
+            monotonic_us = ggml_time_us();
+        }
+        if (!force && telemetry_kv_pressure_last_sample_us > 0 &&
+                monotonic_us - telemetry_kv_pressure_last_sample_us < telemetry_kv_pressure_sampling_interval_us) {
+            return;
+        }
+        telemetry_kv_pressure_last_sample_us = monotonic_us;
+
+        const llama_memory_primary_occupancy occupancy = llama_get_memory_primary_occupancy(ctx_tgt);
+        const bool valid = occupancy.available && occupancy.capacity_entries > 0 &&
+            occupancy.used_entries <= occupancy.capacity_entries;
+        const char * state = valid ? "available" : occupancy.available ? "no_data" : "unsupported";
+        const char * reason = valid
+            ? "authoritative lightweight primary memory occupancy"
+            : occupancy.available
+                ? "the primary memory component has no usable capacity"
+                : "the active memory backend does not expose primary occupancy";
+        telemetry_kv_pressure_append({
+            {"kind", "utilization_sample"},
+            {"monotonic_us", monotonic_us},
+            {"component", telemetry_kv_primary_component.empty() ? json(nullptr) : json(telemetry_kv_primary_component)},
+            {"memory_kind", telemetry_kv_primary_memory_kind.empty() ? json(nullptr) : json(telemetry_kv_primary_memory_kind)},
+            {"entry_semantics", telemetry_kv_primary_entry_semantics.empty() ? json(nullptr) : json(telemetry_kv_primary_entry_semantics)},
+            {"utilization_state", state},
+            {"utilization_reason", reason},
+            {"capacity_entries", valid ? json(occupancy.capacity_entries) : json(nullptr)},
+            {"used_entries", valid ? json(occupancy.used_entries) : json(nullptr)},
+            {"free_entries", valid ? json(occupancy.capacity_entries - occupancy.used_entries) : json(nullptr)},
+            {"utilization", valid ? json((double) occupancy.used_entries / occupancy.capacity_entries) : json(nullptr)},
+        });
+    }
+
+    void telemetry_kv_request_started(const server_slot & slot) {
+        GGML_ASSERT(slot.task);
+        const std::string & trace_id = slot.task->trace_id;
+        for (auto it = telemetry_kv_request_windows.begin(); it != telemetry_kv_request_windows.end();) {
+            if (it->trace_id == trace_id) {
+                it = telemetry_kv_request_windows.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        telemetry_kv_request_windows.push_back({
+            trace_id,
+            slot.stats.t_arrival > 0 ? slot.stats.t_arrival : ggml_time_us(),
+            0,
+        });
+        while (telemetry_kv_request_windows.size() > telemetry_kv_request_window_capacity) {
+            telemetry_kv_request_windows.pop_front();
+        }
+        telemetry_kv_pressure_sample(ggml_time_us(), true);
+    }
+
+    void telemetry_kv_request_finished(const server_slot & slot) {
+        GGML_ASSERT(slot.task);
+        for (auto it = telemetry_kv_request_windows.rbegin(); it != telemetry_kv_request_windows.rend(); ++it) {
+            if (it->trace_id == slot.task->trace_id) {
+                it->end_monotonic_us = slot.stats.t_complete;
+                break;
+            }
+        }
+        telemetry_kv_pressure_sample(slot.stats.t_complete, true);
+    }
+
+    std::vector<telemetry_kv_wait_identity> telemetry_kv_wait_identities(int32_t off, int32_t n_tokens) const {
+        std::vector<telemetry_kv_wait_identity> result;
+        for (int32_t i = off; i < off + n_tokens; ++i) {
+            const int32_t slot_id = batch.tokens[i].id_slot;
+            const server_slot & slot = slots[slot_id];
+            if (!slot.task) {
+                continue;
+            }
+            auto identity = std::find_if(result.begin(), result.end(), [&](const auto & candidate) {
+                return candidate.trace_id == slot.task->trace_id &&
+                    candidate.task_id == slot.task->id && candidate.slot_id == slot.id;
+            });
+            if (identity == result.end()) {
+                result.push_back({slot.task->trace_id, slot.task->id, slot.id, 0, {}});
+                identity = std::prev(result.end());
+            }
+            identity->pending_batch_indices.insert(i);
+        }
+        return result;
+    }
+
+    static void telemetry_kv_add_identity(json & event, const telemetry_kv_wait_identity & identity) {
+        event["trace_id"] = identity.trace_id;
+        event["task_id"] = identity.task_id;
+        event["slot_id"] = identity.slot_id;
+        event["role"] = "target";
+    }
+
+    static bool telemetry_kv_same_identity(
+            const telemetry_kv_wait_identity & lhs,
+            const telemetry_kv_wait_identity & rhs) {
+        return lhs.trace_id == rhs.trace_id && lhs.task_id == rhs.task_id && lhs.slot_id == rhs.slot_id;
+    }
+
+    void telemetry_kv_wait_finish_identity(
+            const telemetry_kv_wait_identity & identity,
+            const char * outcome,
+            int64_t completed_monotonic_us) {
+        const int64_t started_monotonic_us = identity.started_monotonic_us > 0
+            ? identity.started_monotonic_us
+            : telemetry_kv_wait.started_monotonic_us;
+        const int64_t duration_us = std::max<int64_t>(
+            0, completed_monotonic_us - started_monotonic_us);
+        json event = {
+            {"kind", "decode_wait_finished"},
+            {"monotonic_us", completed_monotonic_us},
+            {"episode_id", telemetry_kv_wait.id},
+            {"wait_duration_us", duration_us},
+            {"outcome", outcome},
+        };
+        telemetry_kv_add_identity(event, identity);
+        telemetry_kv_pressure_append(std::move(event));
+    }
+
+    void telemetry_kv_wait_begin(int32_t off, int32_t n_tokens, int32_t attempted_batch_size) {
+        const int64_t started_monotonic_us = t_decode_start > 0 ? t_decode_start : ggml_time_us();
+        if (!telemetry_kv_wait.active()) {
+            telemetry_kv_wait.id = "kv-wait-" + std::to_string(telemetry_kv_pressure_next_episode++);
+            telemetry_kv_wait.started_monotonic_us = started_monotonic_us;
+        }
+        std::vector<telemetry_kv_wait_identity> failed = telemetry_kv_wait_identities(off, n_tokens);
+        for (auto & identity : failed) {
+            auto active = std::find_if(
+                telemetry_kv_wait.identities.begin(),
+                telemetry_kv_wait.identities.end(),
+                [&](const auto & candidate) { return telemetry_kv_same_identity(candidate, identity); });
+            if (active != telemetry_kv_wait.identities.end()) {
+                active->pending_batch_indices.insert(
+                    identity.pending_batch_indices.begin(),
+                    identity.pending_batch_indices.end());
+                continue;
+            }
+            identity.started_monotonic_us = started_monotonic_us;
+            telemetry_kv_wait.identities.push_back(std::move(identity));
+            const auto & added = telemetry_kv_wait.identities.back();
+            json event = {
+                {"kind", "decode_wait_started"},
+                {"monotonic_us", added.started_monotonic_us},
+                {"episode_id", telemetry_kv_wait.id},
+                {"attempted_batch_size", attempted_batch_size},
+            };
+            telemetry_kv_add_identity(event, added);
+            telemetry_kv_pressure_append(std::move(event));
+        }
+        if (telemetry_kv_wait.identities.empty()) {
+            telemetry_kv_wait.clear();
+        }
+    }
+
+    void telemetry_kv_wait_retry(
+            const char * action,
+            int32_t attempted_batch_size,
+            int32_t next_batch_size,
+            int64_t monotonic_us) {
+        if (!telemetry_kv_wait.active()) {
+            return;
+        }
+        telemetry_kv_wait.retry_count++;
+        for (const auto & identity : telemetry_kv_wait.identities) {
+            json event = {
+                {"kind", "decode_retry"},
+                {"monotonic_us", monotonic_us},
+                {"episode_id", telemetry_kv_wait.id},
+                {"retry_count", telemetry_kv_wait.retry_count},
+                {"action", action},
+                {"attempted_batch_size", attempted_batch_size},
+                {"next_batch_size", next_batch_size},
+            };
+            telemetry_kv_add_identity(event, identity);
+            telemetry_kv_pressure_append(std::move(event));
+        }
+    }
+
+    void telemetry_kv_wait_finish(const char * outcome, int64_t completed_monotonic_us) {
+        if (!telemetry_kv_wait.active()) {
+            return;
+        }
+        for (const auto & identity : telemetry_kv_wait.identities) {
+            telemetry_kv_wait_finish_identity(identity, outcome, completed_monotonic_us);
+        }
+        telemetry_kv_wait.clear();
+    }
+
+    void telemetry_kv_wait_finish_resumed(
+            int32_t off,
+            int32_t n_tokens,
+            int64_t completed_monotonic_us) {
+        if (!telemetry_kv_wait.active()) {
+            return;
+        }
+        const std::vector<telemetry_kv_wait_identity> completed = telemetry_kv_wait_identities(off, n_tokens);
+        for (auto it = telemetry_kv_wait.identities.begin(); it != telemetry_kv_wait.identities.end();) {
+            const auto matched = std::find_if(completed.begin(), completed.end(), [&](const auto & identity) {
+                return telemetry_kv_same_identity(*it, identity);
+            });
+            if (matched == completed.end()) {
+                ++it;
+                continue;
+            }
+            for (const int32_t index : matched->pending_batch_indices) {
+                it->pending_batch_indices.erase(index);
+            }
+            if (!it->pending_batch_indices.empty()) {
+                ++it;
+                continue;
+            }
+            telemetry_kv_wait_finish_identity(*it, "resumed", completed_monotonic_us);
+            it = telemetry_kv_wait.identities.erase(it);
+        }
+        if (telemetry_kv_wait.identities.empty()) {
+            telemetry_kv_wait.clear();
+        }
+    }
+
+    void telemetry_kv_wait_finish_request(
+            const server_slot & slot,
+            const char * outcome,
+            int64_t completed_monotonic_us) {
+        if (!telemetry_kv_wait.active() || !slot.task) {
+            return;
+        }
+        const telemetry_kv_wait_identity request_identity = {
+            slot.task->trace_id,
+            slot.task->id,
+            slot.id,
+            0,
+            {},
+        };
+        for (auto it = telemetry_kv_wait.identities.begin(); it != telemetry_kv_wait.identities.end();) {
+            if (!telemetry_kv_same_identity(*it, request_identity)) {
+                ++it;
+                continue;
+            }
+            telemetry_kv_wait_finish_identity(*it, outcome, completed_monotonic_us);
+            it = telemetry_kv_wait.identities.erase(it);
+        }
+        if (telemetry_kv_wait.identities.empty()) {
+            telemetry_kv_wait.clear();
+        }
+    }
+
+    void telemetry_kv_record_eviction(
+            const telemetry_kv_eviction_result & eviction,
+            const char * cause,
+            const char * reason,
+            bool attach_wait) {
+        if (!eviction.cleared) {
+            return;
+        }
+        json event = {
+            {"kind", "idle_slot_evicted"},
+            {"cause", cause},
+            {"eviction_reason", reason},
+            {"victim_slot_id", eviction.victim_slot_id},
+            {"victim_trace_id", eviction.victim_trace_id.empty() ? json(nullptr) : json(eviction.victim_trace_id)},
+            {"victim_prompt_tokens", eviction.victim_prompt_tokens},
+            {"released_entries_state", eviction.released_entries_available ? "available" : "unavailable"},
+            {"released_entries_reason", eviction.released_entries_available
+                ? "before/after primary physical occupancy delta"
+                : "primary physical occupancy was unavailable"},
+            {"released_entries", eviction.released_entries_available ? json(eviction.released_entries) : json(nullptr)},
+            {"memberships_removed", eviction.memberships_removed},
+        };
+        if (attach_wait && telemetry_kv_wait.active()) {
+            event["episode_id"] = telemetry_kv_wait.id;
+            if (!telemetry_kv_wait.identities.empty()) {
+                telemetry_kv_add_identity(event, telemetry_kv_wait.identities.front());
+            }
+        }
+        telemetry_kv_pressure_append(std::move(event));
+        telemetry_kv_pressure_sample(ggml_time_us(), true);
+    }
+
+    bool raw_target_token_probabilities(
             llama_context * ctx,
             int idx,
             llama_token selected,
+            size_t top_k,
             double & logprob,
+            std::vector<telemetry_token_candidate_value> * candidates,
             std::string & unavailable_reason) const {
         const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
         if (selected < 0 || selected >= n_vocab) {
@@ -4329,8 +5332,7 @@ private:
             return false;
         }
 
-        // Backend sampling may expose only a sampled candidate subset. That is
-        // not the full raw-model distribution and must not be called raw PPL.
+        // Backend-sampled subsets are not the full raw-model distribution.
         if (llama_get_sampled_candidates_count_ith(ctx, idx) > 0 ||
                 llama_get_sampled_logits_count_ith(ctx, idx) != n_vocab) {
             unavailable_reason = "full_raw_target_logits_unavailable_with_backend_sampling";
@@ -4338,12 +5340,30 @@ private:
         }
 
         double max_logit = -std::numeric_limits<double>::infinity();
+        std::vector<std::pair<double, llama_token>> top_logits;
+        top_logits.reserve(std::min<size_t>(top_k, (size_t) n_vocab));
         for (int32_t i = 0; i < n_vocab; ++i) {
             if (std::isnan(logits[i])) {
                 unavailable_reason = "target_logits_contain_nan";
                 return false;
             }
             max_logit = std::max(max_logit, (double) logits[i]);
+            if (top_k > 0) {
+                const auto value = std::make_pair((double) logits[i], (llama_token) i);
+                auto insertion = std::lower_bound(
+                    top_logits.begin(),
+                    top_logits.end(),
+                    value,
+                    [](const auto & lhs, const auto & rhs) {
+                        return lhs.first > rhs.first || (lhs.first == rhs.first && lhs.second < rhs.second);
+                    });
+                if (insertion != top_logits.end() || top_logits.size() < top_k) {
+                    top_logits.insert(insertion, value);
+                    if (top_logits.size() > top_k) {
+                        top_logits.pop_back();
+                    }
+                }
+            }
         }
         if (!std::isfinite(max_logit) || !std::isfinite(logits[selected])) {
             unavailable_reason = "selected_or_max_target_logit_not_finite";
@@ -4364,7 +5384,34 @@ private:
             unavailable_reason = "selected_token_log_probability_not_finite";
             return false;
         }
+        if (candidates != nullptr) {
+            candidates->clear();
+            candidates->reserve(top_logits.size());
+            for (const auto & item : top_logits) {
+                telemetry_token_candidate_value candidate;
+                candidate.token_id = item.second;
+                candidate.log_probability_ln = item.first - max_logit - std::log(sum_exp);
+                candidate.target_selected = item.second == selected;
+                candidates->push_back(candidate);
+            }
+        }
         return true;
+    }
+
+    bool selected_token_log_probability(
+            llama_context * ctx,
+            int idx,
+            llama_token selected,
+            double & logprob,
+            std::string & unavailable_reason) const {
+        return raw_target_token_probabilities(
+            ctx,
+            idx,
+            selected,
+            0,
+            logprob,
+            nullptr,
+            unavailable_reason);
     }
 
     int64_t telemetry_unix_ms(const server_slot & slot, int64_t t_us) const {
@@ -4385,7 +5432,1288 @@ private:
         };
     }
 
-    void telemetry_on_start(const server_slot & slot) {
+    bool telemetry_moe_request_enabled(const server_slot & slot) const {
+        return telemetry_moe_routing
+            && llama_model_n_expert(model_tgt) > 0
+            && slot.task
+            && slot.task->params.moe_routing_telemetry;
+    }
+
+    void telemetry_record_moe_routing(
+            const std::vector<llama_moe_routing_entry> & entries,
+            int32_t batch_offset,
+            int32_t batch_token_count) {
+        if (entries.empty()) {
+            return;
+        }
+
+        const int32_t configured_experts = llama_model_n_expert(model_tgt);
+        const int32_t model_layers = llama_model_n_layer(model_tgt);
+        std::vector<bool> routed_tokens((size_t) batch_token_count, false);
+        int32_t previous_layer = -1;
+        int32_t previous_token = -1;
+
+        for (const llama_moe_routing_entry & entry : entries) {
+            if (entry.token_index < 0 || entry.token_index >= batch_token_count) {
+                continue;
+            }
+
+            const auto & token = batch.tokens[batch_offset + entry.token_index];
+            server_slot & slot = slots[token.id_slot];
+            if (!telemetry_moe_request_enabled(slot)) {
+                continue;
+            }
+
+            if (entry.layer_index != previous_layer || entry.token_index != previous_token) {
+                slot.telemetry_moe_routed_token_layers++;
+                slot.telemetry_moe_layers.insert(entry.layer_index);
+                if (!routed_tokens[(size_t) entry.token_index]) {
+                    routed_tokens[(size_t) entry.token_index] = true;
+                    slot.telemetry_moe_routed_tokens++;
+                }
+                previous_layer = entry.layer_index;
+                previous_token = entry.token_index;
+            }
+
+            slot.telemetry_moe_activations_total++;
+            if (entry.layer_index < 0 || entry.layer_index >= model_layers
+                    || entry.expert_index < 0 || entry.expert_index >= configured_experts
+                    || slot.telemetry_moe_activations_captured >= telemetry_moe_activation_limit) {
+                continue;
+            }
+
+            const size_t histogram_size = (size_t) model_layers*(size_t) configured_experts;
+            if (slot.telemetry_moe_expert_activations.size() != histogram_size) {
+                slot.telemetry_moe_expert_activations.assign(histogram_size, 0);
+            }
+            const size_t histogram_index = (size_t) entry.layer_index*(size_t) configured_experts
+                + (size_t) entry.expert_index;
+            slot.telemetry_moe_expert_activations[histogram_index]++;
+            slot.telemetry_moe_activations_captured++;
+        }
+
+        bool has_mtp_verify = false;
+        for (int32_t i = 0; i < batch_token_count; ++i) {
+            const auto & token = batch.tokens[batch_offset + i];
+            const server_slot & slot = slots[token.id_slot];
+            if (!token.is_prompt && slot.can_speculate() && !slot.spec_draft.empty()) {
+                has_mtp_verify = true;
+                break;
+            }
+        }
+
+        std::vector<int64_t> proposal_positions;
+        if (has_mtp_verify) {
+            proposal_positions.assign((size_t) batch_token_count, -1);
+            std::vector<int64_t> next_proposal_position(slots.size(), 0);
+            for (int32_t i = 0; i < batch_token_count; ++i) {
+                const auto & token = batch.tokens[batch_offset + i];
+                const server_slot & slot = slots[token.id_slot];
+                const bool mtp_verify = !token.is_prompt && slot.can_speculate() && !slot.spec_draft.empty();
+                if (mtp_verify) {
+                    proposal_positions[(size_t) i] = next_proposal_position[(size_t) token.id_slot]++;
+                }
+            }
+        }
+
+        size_t group_start = 0;
+        while (group_start < entries.size()) {
+            const int32_t token_index = entries[group_start].token_index;
+            const int32_t layer_index = entries[group_start].layer_index;
+            size_t group_end = group_start + 1;
+            while (group_end < entries.size()
+                    && entries[group_end].token_index == token_index
+                    && entries[group_end].layer_index == layer_index) {
+                group_end++;
+            }
+
+            if (token_index < 0 || token_index >= batch_token_count) {
+                group_start = group_end;
+                continue;
+            }
+
+            const auto & token = batch.tokens[batch_offset + token_index];
+            server_slot & slot = slots[token.id_slot];
+            if (!telemetry_moe_request_enabled(slot) || !token.output) {
+                group_start = group_end;
+                continue;
+            }
+
+            const size_t activation_count = group_end - group_start;
+            slot.telemetry_moe_token_decisions_total++;
+            slot.telemetry_moe_token_activations_total += activation_count;
+
+            bool valid = layer_index >= 0 && layer_index < model_layers
+                && activation_count == (size_t) llama_model_n_expert_used(model_tgt);
+            for (size_t i = group_start; valid && i < group_end; ++i) {
+                valid = entries[i].expert_index >= 0 && entries[i].expert_index < configured_experts;
+            }
+            if (!valid) {
+                slot.telemetry_moe_token_activations_invalid += activation_count;
+                group_start = group_end;
+                continue;
+            }
+            if (slot.telemetry_moe_token_activations_captured + activation_count > telemetry_moe_activation_limit) {
+                group_start = group_end;
+                continue;
+            }
+
+            const bool mtp_verify = !token.is_prompt && slot.can_speculate() && !slot.spec_draft.empty();
+            const telemetry_moe_token_phase phase = token.is_prompt
+                ? TELEMETRY_MOE_TOKEN_PHASE_PREFILL_OUTPUT
+                : mtp_verify ? TELEMETRY_MOE_TOKEN_PHASE_MTP_VERIFY : TELEMETRY_MOE_TOKEN_PHASE_NORMAL_DECODE;
+            for (size_t i = group_start; i < group_end; ++i) {
+                telemetry_moe_token_activation_record record;
+                record.model_position = token.pos + 1;
+                record.layer_index = layer_index;
+                record.expert_index = entries[i].expert_index;
+                record.effective_weight = entries[i].effective_weight;
+                record.phase = phase;
+                record.logical_step = mtp_verify ? (int64_t) slot.stats.n_draft_verif_steps : -1;
+                record.actual_target_pass = mtp_verify ? (int64_t) slot.n_spec_target_passes : -1;
+                record.proposal_position = mtp_verify ? proposal_positions[(size_t) token_index] : -1;
+                record.replay_pass = mtp_verify && slot.spec_is_replay;
+                slot.telemetry_moe_token_activations.push_back(record);
+            }
+            slot.telemetry_moe_token_decisions_captured++;
+            slot.telemetry_moe_token_activations_captured += activation_count;
+            group_start = group_end;
+        }
+    }
+
+    bool telemetry_output_token_request_enabled(const server_slot & slot) const {
+        return telemetry_output_tokens && slot.task && slot.task->params.output_token_telemetry;
+    }
+
+    bool telemetry_token_candidate_request_enabled(const server_slot & slot) const {
+        return telemetry_token_candidates
+            && telemetry_output_token_request_enabled(slot)
+            && slot.task->params.output_token_candidate_telemetry;
+    }
+
+    size_t telemetry_token_candidate_request_cap(const server_slot & slot) const {
+        return (size_t) std::max(
+            8192,
+            std::min(
+                (int) telemetry_token_candidate_max_block_bytes,
+                slot.task->params.output_token_candidate_byte_cap));
+    }
+
+    size_t telemetry_token_candidate_capture_limit(const server_slot & slot) const {
+        const size_t top_k = (size_t) std::max(1, slot.task->params.output_token_candidate_top_k);
+        const size_t estimated_decision_bytes = 768 + top_k * 384;
+        return std::max<size_t>(
+            1,
+            std::min(telemetry_token_candidate_decision_limit, telemetry_token_candidate_request_cap(slot) / estimated_decision_bytes));
+    }
+
+    bool telemetry_token_candidate_position_enabled(
+            server_slot & slot,
+            size_t position,
+            size_t accepted_depth,
+            size_t proposed_count) const {
+        if (!telemetry_token_candidate_request_enabled(slot)) {
+            return false;
+        }
+        bool eligible = false;
+        if (position < accepted_depth) {
+            eligible = slot.task->params.output_token_candidate_include_accepted;
+        } else {
+            // The first mismatch/replacement or target bonus is the default high-value population.
+            eligible = position == accepted_depth || position == proposed_count;
+        }
+        if (!eligible) {
+            return false;
+        }
+        slot.telemetry_token_candidate_eligible_count++;
+        if (slot.telemetry_token_candidate_decisions.size() >= telemetry_token_candidate_capture_limit(slot)) {
+            slot.telemetry_token_candidate_dropped_count++;
+            return false;
+        }
+        return true;
+    }
+
+    void telemetry_record_token_candidates(
+            server_slot & slot,
+            size_t position,
+            size_t accepted_depth,
+            size_t proposed_count,
+            llama_token selected,
+            uint64_t related_output_ordinal,
+            std::vector<telemetry_token_candidate_value> candidates,
+            const std::string & probability_state,
+            const std::string & probability_reason) {
+        telemetry_token_candidate_decision record;
+        record.logical_step = slot.telemetry_spec_logical_step;
+        record.actual_target_pass = slot.n_spec_target_passes > 0 ? slot.n_spec_target_passes - 1 : 0;
+        record.proposal_position = position;
+        record.related_output_ordinal = (int64_t) related_output_ordinal;
+        record.target_selected_token_id = selected;
+        record.probability_state = probability_state;
+        record.probability_reason = probability_reason;
+        record.kind = position < accepted_depth
+            ? TELEMETRY_TOKEN_CANDIDATE_ACCEPTED
+            : accepted_depth < proposed_count
+                ? TELEMETRY_TOKEN_CANDIDATE_FIRST_MISMATCH
+                : TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS;
+        if (position < slot.telemetry_mtp_proposals_pending.size()) {
+            record.draft_token_id = slot.telemetry_mtp_proposals_pending[position].draft_token_id;
+        }
+        for (auto & candidate : candidates) {
+            candidate.target_selected = candidate.token_id == selected;
+            candidate.draft_proposed = candidate.token_id == record.draft_token_id;
+        }
+        record.target_candidates = std::move(candidates);
+        slot.telemetry_token_candidate_decisions.push_back(std::move(record));
+    }
+
+    void telemetry_record_output_token(
+            server_slot & slot,
+            llama_token token_id,
+            const std::string & token_piece,
+            int64_t model_ready_us,
+            llama_pos model_position,
+            double selected_log_probability_ln,
+            telemetry_output_token_origin origin,
+            int64_t logical_step = -1,
+            int64_t actual_target_pass = -1,
+            int64_t proposal_position = -1,
+            int64_t accepted_depth = -1,
+            int64_t proposed_count = -1,
+            bool replay_pass = false) {
+        if (!telemetry_output_token_request_enabled(slot) || slot.telemetry_output_tokens.size() >= telemetry_output_token_limit) {
+            return;
+        }
+
+        telemetry_output_token_record record;
+        record.ordinal = slot.stats.n_gen > 0 ? slot.stats.n_gen - 1 : 0;
+        record.model_ready_offset_us = std::max<int64_t>(0, model_ready_us - slot.stats.t_arrival);
+        record.model_ready_monotonic_us = model_ready_us;
+        record.model_position = model_position;
+        record.token_id = telemetry_content ? token_id : LLAMA_TOKEN_NULL;
+        if (telemetry_content) {
+            record.token_piece = token_piece;
+        }
+        record.selected_log_probability_ln = selected_log_probability_ln;
+        record.origin = origin;
+        record.logical_step = logical_step;
+        record.actual_target_pass = actual_target_pass;
+        record.proposal_position = proposal_position;
+        record.accepted_depth = accepted_depth;
+        record.proposed_count = proposed_count;
+        record.replay_pass = replay_pass;
+        slot.telemetry_output_tokens.push_back(std::move(record));
+    }
+
+    void telemetry_prepare_mtp_proposals(
+            server_slot & slot,
+            const llama_tokens & draft,
+            const llama_tokens & accepted) {
+        slot.telemetry_mtp_proposals_pending.clear();
+        const size_t remaining = telemetry_mtp_proposal_limit > slot.telemetry_mtp_proposals_captured
+            ? telemetry_mtp_proposal_limit - slot.telemetry_mtp_proposals_captured
+            : 0;
+        const size_t captured = std::min(draft.size(), remaining);
+        const size_t accepted_depth = accepted.empty() ? 0 : accepted.size() - 1;
+        const uint64_t actual_target_pass = slot.n_spec_target_passes > 0 ? slot.n_spec_target_passes - 1 : 0;
+        slot.telemetry_mtp_proposals_pending.reserve(captured);
+        for (size_t position = 0; position < captured; ++position) {
+            telemetry_mtp_proposal_record record;
+            record.position = position;
+            record.evaluated_actual_target_pass = actual_target_pass;
+            record.draft_token_id = telemetry_content ? draft[position] : LLAMA_TOKEN_NULL;
+            if (position < accepted_depth) {
+                record.disposition = TELEMETRY_MTP_PROPOSAL_ACCEPTED;
+            } else if (position == accepted_depth && accepted_depth < draft.size()) {
+                record.disposition = TELEMETRY_MTP_PROPOSAL_FIRST_MISMATCH;
+            } else {
+                record.disposition = TELEMETRY_MTP_PROPOSAL_INVALIDATED_TAIL;
+            }
+            if (record.disposition != TELEMETRY_MTP_PROPOSAL_INVALIDATED_TAIL && position < accepted.size()) {
+                record.target_selected_token_id = telemetry_content ? accepted[position] : LLAMA_TOKEN_NULL;
+            }
+            slot.telemetry_mtp_proposals_pending.push_back(record);
+        }
+    }
+
+    void telemetry_record_mtp_pass(
+            server_slot & slot,
+            bool replay_pass,
+            bool discarded,
+            uint64_t target_rows_evaluated,
+            uint64_t committed_output_start_ordinal,
+            uint64_t committed_token_count) {
+        if (!telemetry_output_token_request_enabled(slot)) {
+            slot.telemetry_mtp_proposals_pending.clear();
+            return;
+        }
+        if (slot.telemetry_mtp_passes.size() >= telemetry_mtp_pass_limit) {
+            if (!discarded) {
+                slot.telemetry_mtp_proposals_pending.clear();
+            }
+            return;
+        }
+
+        telemetry_mtp_pass_record record;
+        record.logical_step = slot.telemetry_spec_logical_step;
+        record.actual_target_pass = slot.n_spec_target_passes > 0 ? slot.n_spec_target_passes - 1 : 0;
+        record.replay_of_actual_target_pass = replay_pass && record.actual_target_pass > 0
+            ? (int64_t) record.actual_target_pass - 1
+            : -1;
+        record.proposed_count = slot.telemetry_spec_proposed_count;
+        record.accepted_depth = slot.telemetry_spec_accepted_depth;
+        record.target_rows_evaluated = target_rows_evaluated;
+        record.committed_output_start_ordinal = committed_output_start_ordinal;
+        record.committed_token_count = committed_token_count;
+        record.reached_rejected_token_count = record.accepted_depth < record.proposed_count ? 1 : 0;
+        record.invalidated_token_count = record.proposed_count
+            - record.accepted_depth
+            - record.reached_rejected_token_count;
+        record.outcome = record.accepted_depth == 0
+            ? TELEMETRY_MTP_PASS_ZERO_ACCEPTANCE
+            : record.accepted_depth == record.proposed_count
+                ? TELEMETRY_MTP_PASS_FULL_ACCEPTANCE
+                : TELEMETRY_MTP_PASS_PARTIAL_ACCEPTANCE;
+        record.replay_pass = replay_pass;
+        record.discarded = discarded;
+        record.counts_as_logical_step = !discarded;
+        if (!discarded) {
+            for (telemetry_mtp_proposal_record & proposal : slot.telemetry_mtp_proposals_pending) {
+                if (proposal.disposition != TELEMETRY_MTP_PROPOSAL_INVALIDATED_TAIL &&
+                        proposal.position < committed_token_count) {
+                    proposal.committed_output_ordinal = committed_output_start_ordinal + proposal.position;
+                }
+            }
+            record.proposals = std::move(slot.telemetry_mtp_proposals_pending);
+            slot.telemetry_mtp_proposals_captured += record.proposals.size();
+        }
+        slot.telemetry_mtp_passes.push_back(std::move(record));
+    }
+
+    static size_t telemetry_json_size(const json & value) {
+        return value.dump().size();
+    }
+
+    static std::string telemetry_piece_base64(const std::string & piece) {
+        return base64::encode(piece.data(), piece.size());
+    }
+
+    std::string telemetry_token_piece_base64(const server_slot & slot, llama_token token) const {
+        if (!telemetry_content || token == LLAMA_TOKEN_NULL) {
+            return {};
+        }
+        const std::string piece = common_token_to_piece(slot.ctx_tgt, token, true);
+        return telemetry_piece_base64(piece);
+    }
+
+    void telemetry_store_token_candidate_detail(server_slot & slot) {
+        if (!telemetry_token_candidates) {
+            return;
+        }
+        if (!slot.task->params.output_token_telemetry) {
+            return;
+        }
+        if (!slot.task->params.output_token_candidate_telemetry) {
+            return;
+        }
+
+        const size_t request_cap = telemetry_token_candidate_request_cap(slot);
+        json decisions = json::array();
+        for (const auto & record : slot.telemetry_token_candidate_decisions) {
+            json candidates = json::array();
+            size_t rank = 1;
+            for (const auto & candidate : record.target_candidates) {
+                const bool identity_available = telemetry_content && candidate.token_id != LLAMA_TOKEN_NULL;
+                const std::string token_piece_base64 = identity_available
+                    ? telemetry_token_piece_base64(slot, candidate.token_id)
+                    : std::string();
+                const bool probability_available = std::isfinite(candidate.log_probability_ln);
+                candidates.push_back({
+                    {"rank", rank++},
+                    {"token_id", identity_available ? json(candidate.token_id) : json(nullptr)},
+                    {"token_identity_state", identity_available ? "available" : "not_captured"},
+                    {"token_identity_reason", identity_available
+                        ? "content_capture_enabled"
+                        : "content_capture_disabled; candidate token IDs are treated as response content"},
+                    {"token_piece_base64", identity_available ? json(token_piece_base64) : json(nullptr)},
+                    {"token_piece_state", identity_available ? "available" : "not_captured"},
+                    {"token_piece_reason", identity_available
+                        ? "authoritative_target_tokenizer_piece_bytes"
+                        : "content_capture_disabled; tokenizer pieces are treated as response content"},
+                    {"log_probability_ln", probability_available ? json(candidate.log_probability_ln) : json(nullptr)},
+                    {"probability_state", probability_available ? "available" : "unavailable"},
+                    {"probability_reason", probability_available
+                        ? "raw_target_model_pre_sampler_probability"
+                        : "raw_target_probability_not_finite"},
+                    {"target_selected", candidate.target_selected},
+                    {"draft_proposed", candidate.draft_proposed},
+                });
+            }
+            const char * kind = record.kind == TELEMETRY_TOKEN_CANDIDATE_ACCEPTED
+                ? "accepted_draft_position"
+                : record.kind == TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS
+                    ? "target_bonus"
+                    : "first_mismatch";
+            const bool draft_identity_available = telemetry_content && record.draft_token_id != LLAMA_TOKEN_NULL;
+            const bool selected_identity_available = telemetry_content && record.target_selected_token_id != LLAMA_TOKEN_NULL;
+            const std::string draft_piece_base64 = draft_identity_available
+                ? telemetry_token_piece_base64(slot, record.draft_token_id)
+                : std::string();
+            const std::string selected_piece_base64 = selected_identity_available
+                ? telemetry_token_piece_base64(slot, record.target_selected_token_id)
+                : std::string();
+            decisions.push_back({
+                {"logical_step", record.logical_step},
+                {"actual_target_pass", record.actual_target_pass},
+                {"proposal_position", record.proposal_position},
+                {"related_output_ordinal", record.related_output_ordinal >= 0 ? json(record.related_output_ordinal) : json(nullptr)},
+                {"decision_kind", kind},
+                {"draft_token_id", draft_identity_available ? json(record.draft_token_id) : json(nullptr)},
+                {"draft_token_identity_state", draft_identity_available ? "available" : record.kind == TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS ? "not_applicable" : "not_captured"},
+                {"draft_token_identity_reason", draft_identity_available
+                    ? "content_capture_enabled"
+                    : record.kind == TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS
+                        ? "A target bonus has no draft-proposed token at this position."
+                        : "content_capture_disabled; candidate token IDs are treated as response content"},
+                {"draft_token_piece_base64", draft_identity_available ? json(draft_piece_base64) : json(nullptr)},
+                {"draft_token_piece_state", draft_identity_available ? "available" : record.kind == TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS ? "not_applicable" : "not_captured"},
+                {"draft_token_piece_reason", draft_identity_available
+                    ? "authoritative_target_tokenizer_piece_bytes"
+                    : record.kind == TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS
+                        ? "A target bonus has no draft-proposed tokenizer piece at this position."
+                        : "content_capture_disabled; tokenizer pieces are treated as response content"},
+                {"target_selected_token_id", selected_identity_available ? json(record.target_selected_token_id) : json(nullptr)},
+                {"target_selected_token_identity_state", selected_identity_available ? "available" : "not_captured"},
+                {"target_selected_token_identity_reason", selected_identity_available
+                    ? "content_capture_enabled"
+                    : "content_capture_disabled; candidate token IDs are treated as response content"},
+                {"target_selected_token_piece_base64", selected_identity_available ? json(selected_piece_base64) : json(nullptr)},
+                {"target_selected_token_piece_state", selected_identity_available ? "available" : "not_captured"},
+                {"target_selected_token_piece_reason", selected_identity_available
+                    ? "authoritative_target_tokenizer_piece_bytes"
+                    : "content_capture_disabled; tokenizer pieces are treated as response content"},
+                {"target_probability_state", record.probability_state},
+                {"target_probability_reason", record.probability_reason},
+                {"target_candidates", std::move(candidates)},
+                {"draft_candidates_state", "unsupported"},
+                {"draft_candidates_reason", "The current producer tier retains the draft proposal identity but does not retain a draft-model top-K distribution."},
+                {"draft_candidates", json::array()},
+            });
+        }
+
+        const size_t eligible = slot.telemetry_token_candidate_eligible_count;
+        auto build_block = [&](const json & retained, size_t stored_bytes) {
+            const size_t dropped = eligible - retained.size();
+            const char * state = eligible == 0 ? "no_data" : dropped > 0 ? "truncated" : "available";
+            const char * reason = eligible == 0
+                ? "request_produced_no_eligible_mtp_candidate_positions"
+                : dropped > 0
+                    ? "per_request_candidate_detail_byte_cap_reached"
+                    : "all_eligible_candidate_decisions_retained";
+            return json {
+                {"schema_version", 2},
+                {"server_instance_id", telemetry_server_instance_id},
+                {"trace_id", slot.task->trace_id},
+                {"state", state},
+                {"reason", reason},
+                {"storage_kind", "external_bounded_detail_block"},
+                {"population", "mtp_mismatch_replacement_and_bonus_positions_plus_opted_in_accepted_positions"},
+                {"target_probability_semantics", "raw_target_model_pre_sampler_top_k_from_one_full_vocabulary_normalization"},
+                {"target_top_k", slot.task->params.output_token_candidate_top_k},
+                {"include_accepted_positions", slot.task->params.output_token_candidate_include_accepted},
+                {"draft_candidates_state", "unsupported"},
+                {"draft_candidates_reason", "Draft-model top-K capture is not implemented in this producer tier."},
+                {"token_identity_state", telemetry_content ? "available" : "not_captured"},
+                {"token_identity_reason", telemetry_content ? "content_capture_enabled" : "content_capture_disabled; token IDs are treated as response content"},
+                {"token_piece_state", telemetry_content ? "available" : "not_captured"},
+                {"token_piece_reason", telemetry_content ? "authoritative_target_tokenizer_piece_bytes" : "content_capture_disabled; tokenizer pieces are treated as response content"},
+                {"eligible_decisions", eligible},
+                {"captured_decisions", retained.size()},
+                {"dropped_decisions", dropped},
+                {"byte_cap", request_cap},
+                {"stored_bytes", stored_bytes},
+                {"decisions", retained},
+            };
+        };
+
+        json block = build_block(decisions, 0);
+        while (!decisions.empty() && telemetry_json_size(block) > request_cap) {
+            decisions.erase(decisions.end() - 1);
+            block = build_block(decisions, 0);
+        }
+        for (size_t iteration = 0; iteration < 16; ++iteration) {
+            const size_t bytes = telemetry_json_size(block);
+            if (block.at("stored_bytes").get<size_t>() == bytes) {
+                break;
+            }
+            block["stored_bytes"] = bytes;
+        }
+        const size_t bytes = telemetry_json_size(block);
+        if (bytes > request_cap) {
+            slot.telemetry_token_candidate_state = "dropped";
+            slot.telemetry_token_candidate_reason = "candidate_detail_envelope_exceeded_normalized_byte_cap";
+            slot.telemetry_token_candidate_stored_bytes = 0;
+            slot.telemetry_token_candidate_dropped_count = eligible;
+            return;
+        }
+
+        for (auto it = telemetry_token_candidate_blocks.begin(); it != telemetry_token_candidate_blocks.end(); ++it) {
+            if (it->trace_id == slot.task->trace_id) {
+                telemetry_token_candidate_retained_bytes -= it->bytes;
+                telemetry_token_candidate_blocks.erase(it);
+                break;
+            }
+        }
+        telemetry_token_candidate_retained_bytes += bytes;
+        telemetry_token_candidate_blocks.push_back({slot.task->trace_id, block, bytes});
+        while (telemetry_token_candidate_blocks.size() > TELEMETRY_TOKEN_CANDIDATE_BLOCK_CAPACITY ||
+                telemetry_token_candidate_retained_bytes > TELEMETRY_TOKEN_CANDIDATE_RETAINED_MAX_BYTES) {
+            telemetry_token_candidate_retained_bytes -= telemetry_token_candidate_blocks.front().bytes;
+            telemetry_token_candidate_expired_trace_ids.push_back(telemetry_token_candidate_blocks.front().trace_id);
+            telemetry_token_candidate_blocks.pop_front();
+            while (telemetry_token_candidate_expired_trace_ids.size() > TELEMETRY_TOKEN_CANDIDATE_BLOCK_CAPACITY * 4) {
+                telemetry_token_candidate_expired_trace_ids.pop_front();
+            }
+        }
+
+        slot.telemetry_token_candidate_state = eligible == 0
+            ? "no_data"
+            : decisions.size() < eligible ? "truncated" : "available";
+        slot.telemetry_token_candidate_reason = eligible == 0
+            ? "request_produced_no_eligible_mtp_candidate_positions"
+            : decisions.size() < eligible
+                ? "per_request_candidate_detail_byte_cap_reached"
+                : "all_eligible_candidate_decisions_retained";
+        slot.telemetry_token_candidate_stored_bytes = bytes;
+        slot.telemetry_token_candidate_eligible_count = eligible;
+        slot.telemetry_token_candidate_dropped_count = eligible - decisions.size();
+    }
+
+    json telemetry_token_candidates_json(const std::string & trace_id) const {
+        if (!telemetry_token_candidates) {
+            return {
+                {"schema_version", 2},
+                {"server_instance_id", telemetry_server_instance_id},
+                {"trace_id", trace_id},
+                {"state", "disabled"},
+                {"reason", "admin_gate_disabled; enable LLAMA_TELEMETRY_TOKEN_CANDIDATES=1"},
+                {"token_identity_state", "disabled"},
+                {"token_identity_reason", "output_token_candidate_telemetry_admin_gate_disabled"},
+                {"token_piece_state", "disabled"},
+                {"token_piece_reason", "output_token_candidate_telemetry_admin_gate_disabled"},
+                {"decisions", json::array()},
+            };
+        }
+        for (auto it = telemetry_token_candidate_blocks.rbegin(); it != telemetry_token_candidate_blocks.rend(); ++it) {
+            if (it->trace_id == trace_id) {
+                return it->data;
+            }
+        }
+        if (std::find(
+                telemetry_token_candidate_expired_trace_ids.begin(),
+                telemetry_token_candidate_expired_trace_ids.end(),
+                trace_id) != telemetry_token_candidate_expired_trace_ids.end()) {
+            return {
+                {"schema_version", 2},
+                {"server_instance_id", telemetry_server_instance_id},
+                {"trace_id", trace_id},
+                {"state", "expired"},
+                {"reason", "The bounded in-memory candidate-detail retention ring evicted this trace."},
+                {"token_identity_state", "expired"},
+                {"token_identity_reason", "The content-gated candidate identities expired with the detail block."},
+                {"token_piece_state", "expired"},
+                {"token_piece_reason", "The content-gated tokenizer pieces expired with the detail block."},
+                {"decisions", json::array()},
+            };
+        }
+        return {
+            {"schema_version", 2},
+            {"server_instance_id", telemetry_server_instance_id},
+            {"trace_id", trace_id},
+            {"state", "not_captured"},
+            {"reason", "No external candidate-detail block is retained for this exact trace ID."},
+            {"token_identity_state", "not_captured"},
+            {"token_identity_reason", "No retained candidate-detail block contains token identities for this exact trace ID."},
+            {"token_piece_state", "not_captured"},
+            {"token_piece_reason", "No retained candidate-detail block contains tokenizer pieces for this exact trace ID."},
+            {"decisions", json::array()},
+        };
+    }
+
+    json telemetry_output_token_json(const server_slot & slot) const {
+        if (!telemetry_output_tokens) {
+            return {
+                {"schema_version", 3},
+                {"mtp_pass_record_schema_version", 2},
+                {"state", "disabled"},
+                {"reason", "admin_gate_disabled; enable LLAMA_TELEMETRY_OUTPUT_TOKENS=1"},
+                {"population", "committed_generation_tokens"},
+                {"total_committed_tokens", slot.stats.n_gen},
+                {"captured_tokens", 0},
+                {"scored_tokens", 0},
+                {"maximum_captured_tokens", telemetry_output_token_limit},
+                {"dropped_tokens", slot.stats.n_gen},
+                {"probability_state", "disabled"},
+                {"probability_reason", "output_token_telemetry_admin_gate_disabled"},
+                {"token_identity_state", telemetry_content ? "available" : "not_captured"},
+                {"token_identity_reason", telemetry_content ? "content_capture_enabled" : "content_capture_disabled"},
+                {"token_piece_state", "disabled"},
+                {"token_piece_reason", "output_token_telemetry_admin_gate_disabled"},
+                {"mtp_pass_state", "disabled"},
+                {"mtp_pass_reason", "admin_gate_disabled; enable LLAMA_TELEMETRY_OUTPUT_TOKENS=1"},
+                {"mtp_passes_total", slot.n_spec_target_passes},
+                {"mtp_passes_captured", 0},
+                {"mtp_passes_dropped", 0},
+                {"mtp_proposal_state", "disabled"},
+                {"mtp_proposal_reason", "admin_gate_disabled; enable LLAMA_TELEMETRY_OUTPUT_TOKENS=1"},
+                {"mtp_proposals_total", slot.stats.n_draft_tokens},
+                {"mtp_proposals_captured", 0},
+                {"maximum_captured_mtp_passes", telemetry_mtp_pass_limit},
+                {"maximum_captured_mtp_proposals", telemetry_mtp_proposal_limit},
+                {"mtp_proposals_dropped", slot.stats.n_draft_tokens},
+                {"candidate_detail_state", "disabled"},
+                {"candidate_detail_reason", "output_token_telemetry_admin_gate_disabled"},
+                {"candidate_detail_key", slot.task ? json(slot.task->trace_id) : json(nullptr)},
+                {"candidate_detail_eligible_decisions", 0},
+                {"candidate_detail_dropped_decisions", 0},
+                {"candidate_detail_stored_bytes", 0},
+                {"mtp_pass_records", json::array()},
+                {"records", json::array()},
+            };
+        }
+        if (!slot.task->params.output_token_telemetry) {
+            return {
+                {"schema_version", 3},
+                {"mtp_pass_record_schema_version", 2},
+                {"state", "not_enabled_for_request"},
+                {"reason", "request_did_not_set_output_token_telemetry=true"},
+                {"population", "committed_generation_tokens"},
+                {"total_committed_tokens", slot.stats.n_gen},
+                {"captured_tokens", 0},
+                {"scored_tokens", 0},
+                {"maximum_captured_tokens", telemetry_output_token_limit},
+                {"dropped_tokens", slot.stats.n_gen},
+                {"probability_state", "not_enabled_for_request"},
+                {"probability_reason", "output_token_telemetry_not_enabled_for_request"},
+                {"token_identity_state", telemetry_content ? "available" : "not_captured"},
+                {"token_identity_reason", telemetry_content ? "content_capture_enabled" : "content_capture_disabled"},
+                {"token_piece_state", "not_enabled_for_request"},
+                {"token_piece_reason", "request_did_not_set_output_token_telemetry=true"},
+                {"mtp_pass_state", "not_enabled_for_request"},
+                {"mtp_pass_reason", "request_did_not_set_output_token_telemetry=true"},
+                {"mtp_passes_total", slot.n_spec_target_passes},
+                {"mtp_passes_captured", 0},
+                {"mtp_passes_dropped", 0},
+                {"mtp_proposal_state", "not_enabled_for_request"},
+                {"mtp_proposal_reason", "request_did_not_set_output_token_telemetry=true"},
+                {"mtp_proposals_total", slot.stats.n_draft_tokens},
+                {"mtp_proposals_captured", 0},
+                {"maximum_captured_mtp_passes", telemetry_mtp_pass_limit},
+                {"maximum_captured_mtp_proposals", telemetry_mtp_proposal_limit},
+                {"mtp_proposals_dropped", slot.stats.n_draft_tokens},
+                {"candidate_detail_state", "not_enabled_for_request"},
+                {"candidate_detail_reason", "candidate detail requires output_token_telemetry=true"},
+                {"candidate_detail_key", slot.task->trace_id},
+                {"candidate_detail_eligible_decisions", 0},
+                {"candidate_detail_dropped_decisions", 0},
+                {"candidate_detail_stored_bytes", 0},
+                {"mtp_pass_records", json::array()},
+                {"records", json::array()},
+            };
+        }
+
+        const char * candidate_state = !telemetry_token_candidates
+            ? "disabled"
+            : !slot.task->params.output_token_candidate_telemetry
+                ? "not_enabled_for_request"
+                : slot.telemetry_token_candidate_state;
+        const char * candidate_reason = !telemetry_token_candidates
+            ? "admin_gate_disabled; enable LLAMA_TELEMETRY_TOKEN_CANDIDATES=1"
+            : !slot.task->params.output_token_candidate_telemetry
+                ? "request_did_not_set_output_token_candidate_telemetry=true"
+                : slot.telemetry_token_candidate_reason;
+
+        const uint64_t total = slot.stats.n_gen;
+        const uint64_t captured = slot.telemetry_output_tokens.size();
+        const uint64_t scored = std::count_if(
+            slot.telemetry_output_tokens.begin(),
+            slot.telemetry_output_tokens.end(),
+            [](const telemetry_output_token_record & record) {
+                return std::isfinite(record.selected_log_probability_ln);
+            });
+        const bool truncated = captured < total;
+        const char * state = total == 0 ? "no_data" : truncated ? "truncated" : "available";
+        const char * reason = total == 0
+            ? "request_committed_no_generation_tokens"
+            : truncated
+                ? "per_request_output_token_limit_reached"
+                : "all_committed_generation_tokens_captured";
+        const char * probability_state = slot.task->params.sampling.n_probs == 0
+            ? "not_enabled_for_request"
+            : scored == captured
+                ? "available"
+                : scored > 0
+                    ? "partial"
+                    : "unavailable";
+        const char * probability_reason = slot.task->params.sampling.n_probs == 0
+            ? "enable n_probs > 0 to retain raw target selected-token log probability"
+            : scored == captured
+                ? "raw target selected-token log probability retained for every captured token"
+                : "raw target selected-token log probability was unavailable for one or more captured tokens";
+
+        json records = json::array();
+        for (const telemetry_output_token_record & record : slot.telemetry_output_tokens) {
+            const bool probability_available = std::isfinite(record.selected_log_probability_ln);
+            const bool identity_available = record.token_id != LLAMA_TOKEN_NULL;
+            const bool piece_available = telemetry_content && identity_available;
+            const std::string piece_base64 = piece_available
+                ? telemetry_piece_base64(record.token_piece)
+                : std::string();
+            const bool mtp_linkage_available = record.origin != TELEMETRY_OUTPUT_TOKEN_ORIGIN_NORMAL_DECODE;
+            const char * origin = record.origin == TELEMETRY_OUTPUT_TOKEN_ORIGIN_MTP_ACCEPTED
+                ? "mtp_accepted"
+                : record.origin == TELEMETRY_OUTPUT_TOKEN_ORIGIN_TARGET_AFTER_MISS
+                    ? "target_after_miss"
+                    : record.origin == TELEMETRY_OUTPUT_TOKEN_ORIGIN_TARGET_BONUS
+                        ? "target_bonus"
+                        : "normal_decode";
+            const std::string probability_reason = probability_available
+                ? "raw_target_model_pre_sampler_selected_token_probability"
+                : slot.task->params.sampling.n_probs == 0
+                    ? "request_did_not_enable_logprobs"
+                    : slot.response_probability.unavailable_reason.empty()
+                        ? "raw_target_selected_probability_not_retained"
+                        : slot.response_probability.unavailable_reason;
+            records.push_back({
+                {"ordinal", record.ordinal},
+                {"model_ready_offset_us", record.model_ready_offset_us},
+                {"model_ready_monotonic_us", record.model_ready_monotonic_us},
+                {"model_position", record.model_position >= 0 ? json(record.model_position) : json(nullptr)},
+                {"model_position_state", record.model_position >= 0 ? "available" : "unavailable"},
+                {"model_position_reason", record.model_position >= 0
+                    ? "Position of the committed token in the target-model context, derived directly from the evaluated logits-row position plus one."
+                    : "The target-model context position was unavailable at commit time."},
+                {"selected_log_probability_ln", probability_available ? json(record.selected_log_probability_ln) : json(nullptr)},
+                {"probability_state", probability_available ? "available" : slot.task->params.sampling.n_probs == 0 ? "not_enabled_for_request" : "unavailable"},
+                {"probability_reason", probability_reason},
+                {"token_id", identity_available ? json(record.token_id) : json(nullptr)},
+                {"token_identity_state", identity_available ? "available" : "not_captured"},
+                {"token_identity_reason", identity_available ? "content_capture_enabled" : "content_capture_disabled; token IDs are treated as response content"},
+                {"token_piece_base64", piece_available ? json(piece_base64) : json(nullptr)},
+                {"token_piece_state", piece_available ? "available" : "not_captured"},
+                {"token_piece_reason", piece_available
+                    ? "authoritative_tokenizer_piece_bytes_reused_from_committed_server_output"
+                    : "content_capture_disabled; tokenizer pieces are treated as response content"},
+                {"origin", origin},
+                {"origin_state", "available"},
+                {"origin_reason", mtp_linkage_available
+                    ? "Classified by llama.cpp/llama-server while committing the speculative verification result."
+                    : "The token was committed by ordinary target-model decoding."},
+                {"logical_step", mtp_linkage_available ? json(record.logical_step) : json(nullptr)},
+                {"actual_target_pass", mtp_linkage_available ? json(record.actual_target_pass) : json(nullptr)},
+                {"proposal_position", mtp_linkage_available ? json(record.proposal_position) : json(nullptr)},
+                {"accepted_depth", mtp_linkage_available ? json(record.accepted_depth) : json(nullptr)},
+                {"proposed_count", mtp_linkage_available ? json(record.proposed_count) : json(nullptr)},
+                {"replay_pass", mtp_linkage_available ? json(record.replay_pass) : json(nullptr)},
+                {"mtp_linkage_state", mtp_linkage_available ? "available" : "not_applicable"},
+                {"mtp_linkage_reason", mtp_linkage_available
+                    ? "Zero-based logical-step, actual-target-pass, and proposal-position linkage retained at commit time."
+                    : "MTP linkage does not apply to an ordinary target-model decode token."},
+            });
+        }
+
+        const uint64_t mtp_pass_total = slot.n_spec_target_passes;
+        const uint64_t mtp_pass_captured = slot.telemetry_mtp_passes.size();
+        const bool mtp_pass_truncated = mtp_pass_captured < mtp_pass_total;
+        const char * mtp_pass_state = !slot.can_speculate()
+            ? "not_applicable"
+            : mtp_pass_total == 0
+                ? "no_data"
+                : mtp_pass_truncated
+                    ? "truncated"
+                    : "available";
+        const char * mtp_pass_reason = !slot.can_speculate()
+            ? "The request used ordinary target-model decoding, so MTP pass detail does not apply."
+            : mtp_pass_total == 0
+                ? "Speculative decoding was configured, but this request completed without a target verification pass."
+                : mtp_pass_truncated
+                    ? "The per-request MTP pass-detail cap was reached; later actual target passes were not retained."
+                    : "Every successful target verification pass, including discarded replay work, was retained.";
+        const uint64_t mtp_proposal_total = slot.stats.n_draft_tokens;
+        const uint64_t mtp_proposal_captured = slot.telemetry_mtp_proposals_captured;
+        const bool mtp_proposal_truncated = mtp_proposal_captured < mtp_proposal_total;
+        const char * mtp_proposal_state = !slot.can_speculate()
+            ? "not_applicable"
+            : mtp_proposal_total == 0
+                ? "no_data"
+                : mtp_proposal_truncated
+                    ? "truncated"
+                    : "available";
+        const char * mtp_proposal_reason = !slot.can_speculate()
+            ? "The request used ordinary target-model decoding, so an MTP proposal ledger does not apply."
+            : mtp_proposal_total == 0
+                ? "Speculative decoding was configured, but this request produced no draft proposals."
+                : mtp_proposal_truncated
+                    ? "The per-request MTP proposal cap was reached; later draft positions were not retained."
+                    : "Every logical MTP draft position was retained with its producer-observed disposition.";
+        json mtp_pass_records = json::array();
+        for (const telemetry_mtp_pass_record & record : slot.telemetry_mtp_passes) {
+            const char * outcome = record.outcome == TELEMETRY_MTP_PASS_FULL_ACCEPTANCE
+                ? "full_acceptance"
+                : record.outcome == TELEMETRY_MTP_PASS_PARTIAL_ACCEPTANCE
+                    ? "partial_acceptance"
+                    : "zero_acceptance";
+            json proposals = json::array();
+            for (const telemetry_mtp_proposal_record & proposal : record.proposals) {
+                const bool draft_identity_available = proposal.draft_token_id != LLAMA_TOKEN_NULL;
+                const bool target_identity_available = proposal.target_selected_token_id != LLAMA_TOKEN_NULL;
+                const bool target_selected = proposal.disposition != TELEMETRY_MTP_PROPOSAL_INVALIDATED_TAIL;
+                const std::string draft_piece_base64 = draft_identity_available
+                    ? telemetry_token_piece_base64(slot, proposal.draft_token_id)
+                    : std::string();
+                const std::string target_piece_base64 = target_identity_available
+                    ? telemetry_token_piece_base64(slot, proposal.target_selected_token_id)
+                    : std::string();
+                const bool probability_available = std::isfinite(proposal.target_selected_log_probability_ln);
+                const char * disposition = proposal.disposition == TELEMETRY_MTP_PROPOSAL_ACCEPTED
+                    ? "accepted"
+                    : proposal.disposition == TELEMETRY_MTP_PROPOSAL_FIRST_MISMATCH
+                        ? "first_mismatch"
+                        : "invalidated_tail";
+                const std::string probability_reason = probability_available
+                    ? "raw_target_model_pre_sampler_selected_token_probability"
+                    : !target_selected
+                        ? "position_was_not_evaluated_after_first_mismatch"
+                        : slot.task->params.sampling.n_probs == 0
+                            ? "request_did_not_enable_logprobs"
+                            : slot.response_probability.unavailable_reason.empty()
+                                ? "raw_target_selected_probability_not_retained"
+                                : slot.response_probability.unavailable_reason;
+                proposals.push_back({
+                    {"position", proposal.position},
+                    {"evaluated_actual_target_pass", proposal.evaluated_actual_target_pass},
+                    {"disposition", disposition},
+                    {"draft_token_id", draft_identity_available ? json(proposal.draft_token_id) : json(nullptr)},
+                    {"draft_token_identity_state", draft_identity_available ? "available" : "not_captured"},
+                    {"draft_token_identity_reason", draft_identity_available ? "content_capture_enabled" : "content_capture_disabled; token IDs are treated as response content"},
+                    {"draft_token_piece_base64", draft_identity_available ? json(draft_piece_base64) : json(nullptr)},
+                    {"draft_token_piece_state", draft_identity_available ? "available" : "not_captured"},
+                    {"draft_token_piece_reason", draft_identity_available ? "authoritative_target_tokenizer_piece_bytes" : "content_capture_disabled; tokenizer pieces are treated as response content"},
+                    {"target_selected_token_id", target_identity_available ? json(proposal.target_selected_token_id) : json(nullptr)},
+                    {"target_selected_token_identity_state", !target_selected ? "not_applicable" : target_identity_available ? "available" : "not_captured"},
+                    {"target_selected_token_identity_reason", !target_selected
+                        ? "position_was_not_evaluated_after_first_mismatch"
+                        : target_identity_available ? "content_capture_enabled" : "content_capture_disabled; token IDs are treated as response content"},
+                    {"target_selected_token_piece_base64", target_identity_available ? json(target_piece_base64) : json(nullptr)},
+                    {"target_selected_token_piece_state", !target_selected ? "not_applicable" : target_identity_available ? "available" : "not_captured"},
+                    {"target_selected_token_piece_reason", !target_selected
+                        ? "position_was_not_evaluated_after_first_mismatch"
+                        : target_identity_available ? "authoritative_target_tokenizer_piece_bytes" : "content_capture_disabled; tokenizer pieces are treated as response content"},
+                    {"target_selected_log_probability_ln", probability_available ? json(proposal.target_selected_log_probability_ln) : json(nullptr)},
+                    {"target_selected_probability_state", probability_available ? "available" : !target_selected ? "not_applicable" : slot.task->params.sampling.n_probs == 0 ? "not_enabled_for_request" : "unavailable"},
+                    {"target_selected_probability_reason", probability_reason},
+                    {"committed_output_ordinal", proposal.committed_output_ordinal >= 0 ? json(proposal.committed_output_ordinal) : json(nullptr)},
+                });
+            }
+            const bool proposal_complete = record.proposals.size() == record.proposed_count;
+            const char * proposal_state = record.discarded
+                ? "not_applicable"
+                : proposal_complete
+                    ? "available"
+                    : "truncated";
+            const char * proposal_reason = record.discarded
+                ? "The logical proposal ledger is attached to the committing replay pass to avoid duplicate rows."
+                : proposal_complete
+                    ? "Every draft position in this logical decision was retained."
+                    : "The per-request MTP proposal cap truncated this logical decision.";
+            mtp_pass_records.push_back({
+                {"logical_step", record.logical_step},
+                {"actual_target_pass", record.actual_target_pass},
+                {"replay_of_actual_target_pass", record.replay_of_actual_target_pass >= 0
+                    ? json(record.replay_of_actual_target_pass)
+                    : json(nullptr)},
+                {"proposed_count", record.proposed_count},
+                {"accepted_depth", record.accepted_depth},
+                {"reached_rejected_tokens", record.reached_rejected_token_count},
+                {"invalidated_tokens", record.invalidated_token_count},
+                {"target_rows_evaluated", record.target_rows_evaluated},
+                {"committed_output_start_ordinal", record.committed_token_count > 0
+                    ? json(record.committed_output_start_ordinal)
+                    : json(nullptr)},
+                {"committed_token_count", record.committed_token_count},
+                {"outcome", outcome},
+                {"replay_pass", record.replay_pass},
+                {"discarded", record.discarded},
+                {"counts_as_logical_step", record.counts_as_logical_step},
+                {"proposal_state", proposal_state},
+                {"proposal_reason", proposal_reason},
+                {"proposals", std::move(proposals)},
+            });
+        }
+
+        return {
+            {"schema_version", 3},
+            {"mtp_pass_record_schema_version", 2},
+            {"state", state},
+            {"reason", reason},
+            {"population", "committed_generation_tokens"},
+            {"total_committed_tokens", total},
+            {"captured_tokens", captured},
+            {"scored_tokens", scored},
+            {"maximum_captured_tokens", telemetry_output_token_limit},
+            {"dropped_tokens", total - captured},
+            {"probability_state", probability_state},
+            {"probability_reason", probability_reason},
+            {"token_identity_state", telemetry_content ? "available" : "not_captured"},
+            {"token_identity_reason", telemetry_content ? "content_capture_enabled" : "content_capture_disabled; token IDs are treated as response content"},
+            {"token_piece_state", telemetry_content ? "available" : "not_captured"},
+            {"token_piece_reason", telemetry_content ? "authoritative_tokenizer_piece_bytes" : "content_capture_disabled; tokenizer pieces are treated as response content"},
+            {"mtp_pass_state", mtp_pass_state},
+            {"mtp_pass_reason", mtp_pass_reason},
+            {"mtp_passes_total", mtp_pass_total},
+            {"mtp_passes_captured", mtp_pass_captured},
+            {"maximum_captured_mtp_passes", telemetry_mtp_pass_limit},
+            {"mtp_passes_dropped", mtp_pass_total - mtp_pass_captured},
+            {"mtp_proposal_state", mtp_proposal_state},
+            {"mtp_proposal_reason", mtp_proposal_reason},
+            {"mtp_proposals_total", mtp_proposal_total},
+            {"mtp_proposals_captured", mtp_proposal_captured},
+            {"maximum_captured_mtp_proposals", telemetry_mtp_proposal_limit},
+            {"mtp_proposals_dropped", mtp_proposal_total - mtp_proposal_captured},
+            {"candidate_detail_state", candidate_state},
+            {"candidate_detail_reason", candidate_reason},
+            {"candidate_detail_key", slot.task->trace_id},
+            {"candidate_detail_eligible_decisions", slot.telemetry_token_candidate_eligible_count},
+            {"candidate_detail_dropped_decisions", slot.telemetry_token_candidate_dropped_count},
+            {"candidate_detail_stored_bytes", slot.telemetry_token_candidate_stored_bytes},
+            {"mtp_pass_records", std::move(mtp_pass_records)},
+            {"records", std::move(records)},
+        };
+    }
+
+    json telemetry_moe_routing_json(const server_slot & slot) const {
+        const int32_t configured_experts = llama_model_n_expert(model_tgt);
+        const int32_t experts_per_token = llama_model_n_expert_used(model_tgt);
+        const auto base = [&]() {
+            const bool routed_model = configured_experts > 0;
+            return json {
+                {"schema_version", 2},
+                {"token_detail_schema_version", 2},
+                {"configuration_state", routed_model ? "available" : "not_applicable"},
+                {"configuration_reason", routed_model
+                    ? "The loaded target model exposes routed-expert configuration metadata."
+                    : "The loaded target model is dense and has no routed-expert configuration."},
+                {"configured_experts", routed_model ? json(configured_experts) : json(nullptr)},
+                {"experts_per_token", experts_per_token > 0 ? json(experts_per_token) : json(nullptr)},
+                {"moe_layers", nullptr},
+                {"routed_tokens", nullptr},
+                {"routed_token_layer_decisions", nullptr},
+                {"expert_activations_total", nullptr},
+                {"expert_activations_captured", 0},
+                {"maximum_captured_activations", telemetry_moe_activation_limit},
+                {"dropped_activations", nullptr},
+                {"population", "target_model_routed_token_layer_decisions"},
+                {"expert_activations", json::array()},
+                {"token_detail_state", routed_model ? "unavailable" : "not_applicable"},
+                {"token_detail_reason", routed_model
+                    ? "No exact target-model output-row routing decision has been evaluated for this request yet."
+                    : "Exact-token expert routing does not apply to a dense target model."},
+                {"token_detail_population", "target_model_output_logit_rows_by_layer"},
+                {"token_detail_decisions_total", nullptr},
+                {"token_detail_decisions_captured", 0},
+                {"token_detail_decisions_dropped", nullptr},
+                {"token_detail_activations_total", nullptr},
+                {"token_detail_activations_captured", 0},
+                {"token_detail_activations_dropped", nullptr},
+                {"token_detail_invalid_activations", 0},
+                {"maximum_captured_token_detail_activations", telemetry_moe_activation_limit},
+                {"selected_expert_ids_state", routed_model ? "unavailable" : "not_applicable"},
+                {"selected_expert_ids_reason", routed_model
+                    ? "No exact target-model output-row routing decision has been evaluated for this request yet."
+                    : "Selected routed-expert IDs do not apply to a dense target model."},
+                {"routing_weights_state", routed_model ? "unavailable" : "not_applicable"},
+                {"routing_weights_reason", routed_model
+                    ? "No exact target-model output-row routing weights have been evaluated for this request yet."
+                    : "Router weights do not apply to a dense target model."},
+                {"router_margin_state", routed_model && experts_per_token >= 2 ? "unavailable" : "not_applicable"},
+                {"router_margin_reason", routed_model && experts_per_token >= 2
+                    ? "No exact target-model output-row routing margin has been evaluated for this request yet."
+                    : routed_model
+                        ? "A top-two router margin does not apply when the model selects fewer than two experts per token-layer decision."
+                        : "Router margin does not apply to a dense target model."},
+                {"token_decisions", json::array()},
+            };
+        };
+        const auto set_token_detail_state = [](
+                json & result,
+                const char * state,
+                const std::string & reason) {
+            result["token_detail_state"] = state;
+            result["token_detail_reason"] = reason;
+            result["selected_expert_ids_state"] = state;
+            result["selected_expert_ids_reason"] = reason;
+        };
+        const auto set_weight_state = [experts_per_token](
+                json & result,
+                const char * state,
+                const std::string & reason) {
+            result["routing_weights_state"] = state;
+            result["routing_weights_reason"] = reason;
+            result["router_margin_state"] = experts_per_token >= 2 ? state : "not_applicable";
+            result["router_margin_reason"] = experts_per_token >= 2
+                ? reason
+                : "A top-two router margin does not apply when the model selects fewer than two experts per token-layer decision.";
+        };
+
+        if (configured_experts <= 0) {
+            json result = base();
+            result["state"] = "not_applicable";
+            result["reason"] = "The loaded target model has no routed MoE experts.";
+            return result;
+        }
+        if (!telemetry_moe_routing) {
+            json result = base();
+            result["state"] = "disabled";
+            result["reason"] = "admin_gate_disabled; enable LLAMA_TELEMETRY_MOE_ROUTING=1";
+            set_token_detail_state(result, "disabled", "admin_gate_disabled; enable LLAMA_TELEMETRY_MOE_ROUTING=1");
+            set_weight_state(result, "disabled", "admin_gate_disabled; enable LLAMA_TELEMETRY_MOE_ROUTING=1");
+            return result;
+        }
+        if (!slot.task || !slot.task->params.moe_routing_telemetry) {
+            json result = base();
+            result["state"] = "not_enabled_for_request";
+            result["reason"] = "request_did_not_set_moe_routing_telemetry=true";
+            set_token_detail_state(result, "not_enabled_for_request", "request_did_not_set_moe_routing_telemetry=true");
+            set_weight_state(result, "not_enabled_for_request", "request_did_not_set_moe_routing_telemetry=true");
+            return result;
+        }
+        if (slot.telemetry_moe_activations_total == 0) {
+            json result = base();
+            result["state"] = "no_data";
+            result["reason"] = "The opted-in request completed without a retained routed-expert decision.";
+            result["moe_layers"] = 0;
+            result["routed_tokens"] = 0;
+            result["routed_token_layer_decisions"] = 0;
+            result["expert_activations_total"] = 0;
+            result["dropped_activations"] = 0;
+            set_token_detail_state(result, "no_data", "The opted-in request completed without a target-model output-row routed-expert decision.");
+            result["token_detail_decisions_total"] = 0;
+            result["token_detail_decisions_dropped"] = 0;
+            result["token_detail_activations_total"] = 0;
+            result["token_detail_activations_dropped"] = 0;
+            set_weight_state(result, "no_data", "The opted-in request completed without an exact target-model output-row routing decision.");
+            return result;
+        }
+
+        const bool truncated = slot.telemetry_moe_activations_captured < slot.telemetry_moe_activations_total;
+        json activations = json::array();
+        std::vector<uint64_t> layer_totals((size_t) llama_model_n_layer(model_tgt), 0);
+        for (size_t index = 0; index < slot.telemetry_moe_expert_activations.size(); ++index) {
+            layer_totals[index/(size_t) configured_experts] += slot.telemetry_moe_expert_activations[index];
+        }
+        for (size_t index = 0; index < slot.telemetry_moe_expert_activations.size(); ++index) {
+            const uint64_t count = slot.telemetry_moe_expert_activations[index];
+            if (count == 0) {
+                continue;
+            }
+            const size_t layer = index/(size_t) configured_experts;
+            const size_t expert = index%(size_t) configured_experts;
+            activations.push_back({
+                {"layer_index", layer},
+                {"expert_index", expert},
+                {"activation_count", count},
+                {"share_percent", slot.telemetry_moe_activations_captured > 0
+                    ? json(100.0*count/slot.telemetry_moe_activations_captured)
+                    : json(nullptr)},
+                {"layer_share_percent", layer_totals[layer] > 0
+                    ? json(100.0*count/layer_totals[layer])
+                    : json(nullptr)},
+            });
+        }
+
+        json result = base();
+        result["state"] = truncated ? "truncated" : "available";
+        result["reason"] = truncated
+            ? "The per-request routed-expert activation cap was reached; the histogram covers only the retained prefix."
+            : "All selected routed-expert IDs produced for this request were retained.";
+        result["moe_layers"] = slot.telemetry_moe_layers.size();
+        result["routed_tokens"] = slot.telemetry_moe_routed_tokens;
+        result["routed_token_layer_decisions"] = slot.telemetry_moe_routed_token_layers;
+        result["expert_activations_total"] = slot.telemetry_moe_activations_total;
+        result["expert_activations_captured"] = slot.telemetry_moe_activations_captured;
+        result["dropped_activations"] = slot.telemetry_moe_activations_total - slot.telemetry_moe_activations_captured;
+        result["expert_activations"] = std::move(activations);
+
+        const uint64_t token_activations_dropped = slot.telemetry_moe_token_activations_total
+            - slot.telemetry_moe_token_activations_captured;
+        const bool token_detail_truncated = token_activations_dropped > slot.telemetry_moe_token_activations_invalid;
+        const bool token_detail_partial = slot.telemetry_moe_token_activations_invalid > 0;
+        const char * token_detail_state = token_detail_truncated
+            ? "truncated"
+            : token_detail_partial ? "partial"
+            : slot.telemetry_moe_token_decisions_total > 0 ? "available" : "no_data";
+        const std::string token_detail_reason = token_detail_truncated
+            ? "The exact-token routed-expert activation cap was reached; only complete retained-prefix decisions are present."
+            : token_detail_partial
+                ? "One or more routed-expert output rows were malformed and were excluded from exact-token detail."
+                : slot.telemetry_moe_token_decisions_total > 0
+                    ? "All selected expert IDs for retained target-model output rows were captured."
+                    : "The request produced routed prompt rows but no target-model output-row routing decision.";
+        set_token_detail_state(result, token_detail_state, token_detail_reason);
+        result["token_detail_decisions_total"] = slot.telemetry_moe_token_decisions_total;
+        result["token_detail_decisions_captured"] = slot.telemetry_moe_token_decisions_captured;
+        result["token_detail_decisions_dropped"] = slot.telemetry_moe_token_decisions_total
+            - slot.telemetry_moe_token_decisions_captured;
+        result["token_detail_activations_total"] = slot.telemetry_moe_token_activations_total;
+        result["token_detail_activations_captured"] = slot.telemetry_moe_token_activations_captured;
+        result["token_detail_activations_dropped"] = token_activations_dropped;
+        result["token_detail_invalid_activations"] = slot.telemetry_moe_token_activations_invalid;
+
+        json token_decisions = json::array();
+        uint64_t decisions_with_weights = 0;
+        uint64_t decisions_with_margin = 0;
+        size_t decision_start = 0;
+        while (decision_start < slot.telemetry_moe_token_activations.size()) {
+            const auto & first = slot.telemetry_moe_token_activations[decision_start];
+            size_t decision_end = decision_start + 1;
+            while (decision_end < slot.telemetry_moe_token_activations.size()) {
+                const auto & next = slot.telemetry_moe_token_activations[decision_end];
+                if (next.model_position != first.model_position
+                        || next.layer_index != first.layer_index
+                        || next.phase != first.phase
+                        || next.logical_step != first.logical_step
+                        || next.actual_target_pass != first.actual_target_pass
+                        || next.proposal_position != first.proposal_position
+                        || next.replay_pass != first.replay_pass) {
+                    break;
+                }
+                decision_end++;
+            }
+            json selected_expert_ids = json::array();
+            json effective_expert_weights = json::array();
+            json normalized_expert_weight_shares = json::array();
+            bool weights_available = true;
+            double effective_weight_sum = 0.0;
+            for (size_t i = decision_start; i < decision_end; ++i) {
+                const auto & activation = slot.telemetry_moe_token_activations[i];
+                selected_expert_ids.push_back(activation.expert_index);
+                if (std::isfinite(activation.effective_weight) && activation.effective_weight >= 0.0f) {
+                    effective_expert_weights.push_back(activation.effective_weight);
+                    effective_weight_sum += activation.effective_weight;
+                } else {
+                    weights_available = false;
+                }
+            }
+            weights_available = weights_available
+                && effective_expert_weights.size() == selected_expert_ids.size()
+                && effective_weight_sum > 0.0;
+            json normalized_router_margin = nullptr;
+            if (weights_available) {
+                double largest_share = -1.0;
+                double second_largest_share = -1.0;
+                for (const auto & weight : effective_expert_weights) {
+                    const double share = weight.get<double>()/effective_weight_sum;
+                    normalized_expert_weight_shares.push_back(share);
+                    if (share > largest_share) {
+                        second_largest_share = largest_share;
+                        largest_share = share;
+                    } else if (share > second_largest_share) {
+                        second_largest_share = share;
+                    }
+                }
+                decisions_with_weights++;
+                if (second_largest_share >= 0.0) {
+                    normalized_router_margin = largest_share - second_largest_share;
+                    decisions_with_margin++;
+                }
+            } else {
+                effective_expert_weights = json::array();
+            }
+            const char * phase = first.phase == TELEMETRY_MOE_TOKEN_PHASE_PREFILL_OUTPUT
+                ? "prefill_output"
+                : first.phase == TELEMETRY_MOE_TOKEN_PHASE_MTP_VERIFY ? "mtp_verify" : "normal_decode";
+            token_decisions.push_back({
+                {"model_position", first.model_position},
+                {"layer_index", first.layer_index},
+                {"phase", phase},
+                {"logical_step", first.logical_step >= 0 ? json(first.logical_step) : json(nullptr)},
+                {"actual_target_pass", first.actual_target_pass >= 0 ? json(first.actual_target_pass) : json(nullptr)},
+                {"proposal_position", first.proposal_position >= 0 ? json(first.proposal_position) : json(nullptr)},
+                {"replay_pass", first.replay_pass},
+                {"selected_expert_ids", std::move(selected_expert_ids)},
+                {"effective_expert_weights", std::move(effective_expert_weights)},
+                {"normalized_expert_weight_shares", std::move(normalized_expert_weight_shares)},
+                {"normalized_router_margin", std::move(normalized_router_margin)},
+            });
+            decision_start = decision_end;
+        }
+
+        const uint64_t captured_decisions = slot.telemetry_moe_token_decisions_captured;
+        const char * weights_state = decisions_with_weights == captured_decisions && captured_decisions > 0
+            ? token_detail_state
+            : decisions_with_weights > 0 ? "partial" : captured_decisions > 0 ? "unavailable" : "no_data";
+        const std::string weights_reason = decisions_with_weights == captured_decisions && captured_decisions > 0
+            ? "llama.cpp/llama-server retained the exact effective expert coefficients and normalized selected-expert shares for every retained token-layer decision."
+            : decisions_with_weights > 0
+                ? "Effective expert coefficients were unavailable for one or more retained token-layer decisions; no missing value was replaced with zero."
+                : "The backend did not expose usable effective expert coefficients for the retained token-layer decisions.";
+        result["routing_weights_state"] = weights_state;
+        result["routing_weights_reason"] = weights_reason;
+
+        if (experts_per_token < 2) {
+            result["router_margin_state"] = "not_applicable";
+            result["router_margin_reason"] = "A top-two router margin does not apply when the model selects fewer than two experts per token-layer decision.";
+        } else {
+            const char * margin_state = decisions_with_margin == captured_decisions && captured_decisions > 0
+                ? token_detail_state
+                : decisions_with_margin > 0 ? "partial" : captured_decisions > 0 ? "unavailable" : "no_data";
+            result["router_margin_state"] = margin_state;
+            result["router_margin_reason"] = decisions_with_margin == captured_decisions && captured_decisions > 0
+                ? "llama-server derived the normalized top-two selected-expert share difference from every retained decision's exact effective coefficients."
+                : decisions_with_margin > 0
+                    ? "A normalized top-two margin could be derived for only part of the retained token-layer population."
+                    : "No retained token-layer decision contained two usable effective expert coefficients for a normalized margin.";
+        }
+        result["token_decisions"] = std::move(token_decisions);
+        return result;
+    }
+
+    json telemetry_lifecycle_clock_json(const server_slot & slot) const {
+        auto boundary = [](int64_t value) {
+            return value > 0 ? json(value) : json(nullptr);
+        };
+        return {
+            {"schema_version", 1},
+            {"clock_domain", "server_process_monotonic_microseconds"},
+            {"arrival_monotonic_us", boundary(slot.stats.t_arrival)},
+            {"enqueue_monotonic_us", boundary(slot.stats.t_enqueue)},
+            {"slot_start_monotonic_us", boundary(slot.stats.t_slot_start)},
+            {"cache_start_monotonic_us", boundary(slot.stats.t_cache_start)},
+            {"cache_end_monotonic_us", boundary(slot.stats.t_cache_last)},
+            {"prefill_start_monotonic_us", boundary(slot.stats.t_prefill_start)},
+            {"prefill_end_monotonic_us", boundary(slot.stats.t_prefill_last)},
+            {"first_token_monotonic_us", boundary(slot.stats.t_first_token)},
+            {"last_generation_work_monotonic_us", boundary(slot.stats.t_gen_last)},
+            {"finalization_start_monotonic_us", boundary(slot.stats.t_complete)},
+            {"slot_release_monotonic_us", boundary(slot.stats.t_release)},
+        };
+    }
+
+    void telemetry_on_start(server_slot & slot) {
+        telemetry_kv_request_started(slot);
+        if (telemetry_output_token_request_enabled(slot)) {
+            slot.telemetry_output_tokens.reserve(telemetry_output_token_limit);
+            slot.telemetry_mtp_passes.reserve(telemetry_mtp_pass_limit);
+        }
+        if (telemetry_token_candidate_request_enabled(slot)) {
+            slot.telemetry_token_candidate_decisions.reserve(
+                std::min<size_t>(telemetry_token_candidate_decision_limit, 64));
+        }
+        if (telemetry_moe_request_enabled(slot)) {
+            slot.telemetry_moe_expert_activations.assign(
+                (size_t) llama_model_n_layer(model_tgt)*(size_t) llama_model_n_expert(model_tgt), 0);
+            slot.telemetry_moe_token_activations.reserve(telemetry_moe_activation_limit);
+        }
         telemetry_append({
             {"event", "request_started"},
             {"trace_id", slot.task->trace_id},
@@ -4393,6 +6721,7 @@ private:
             {"w3c_traceparent", slot.task->traceparent.empty() ? json(nullptr) : json(slot.task->traceparent)},
             {"task_id", slot.task->id},
             {"slot_id", slot.id},
+            {"slot_assignment_ordinal", slot.telemetry_assignment_ordinal},
             {"completion_id", slot.task->params.oaicompat_cmpl_id},
             {"model", slot.task->params.oaicompat_model},
             {"server_build", std::string(llama_build_info())},
@@ -4401,6 +6730,7 @@ private:
             {"queue_ms", slot.stats.t_queue_ms()},
             {"prompt_tokens", slot.task->n_tokens()},
             {"server_configuration", telemetry_server_configuration()},
+            {"lifecycle_clock", telemetry_lifecycle_clock_json(slot)},
         });
     }
 
@@ -4412,6 +6742,7 @@ private:
             {"w3c_traceparent", slot.task->traceparent.empty() ? json(nullptr) : json(slot.task->traceparent)},
             {"task_id", slot.task->id},
             {"slot_id", slot.id},
+            {"slot_assignment_ordinal", slot.telemetry_assignment_ordinal},
             {"timestamp_unix_ms", telemetry_unix_ms(slot, slot.stats.t_first_token)},
             {"ttft_ms", slot.stats.t_ttft_ms()},
             {"queue_ms", slot.stats.t_queue_ms()},
@@ -4425,6 +6756,7 @@ private:
             {"cache_lookup_ms", slot.stats.t_cache_ms()},
             {"actual_prefill_ms", slot.stats.t_prefill_actual_ms()},
             {"server_configuration", telemetry_server_configuration()},
+            {"lifecycle_clock", telemetry_lifecycle_clock_json(slot)},
         });
     }
 
@@ -4434,6 +6766,24 @@ private:
         }
         slot.telemetry_finalized = true;
         slot.stats.t_complete = ggml_time_us();
+        const char * wait_outcome = std::strcmp(outcome, "cancelled") == 0
+            ? "cancelled"
+            : std::strcmp(outcome, "error") == 0 ? "failed" : "resumed";
+        telemetry_kv_wait_finish_request(slot, wait_outcome, slot.stats.t_complete);
+        telemetry_kv_request_finished(slot);
+        gpu_telemetry.record_operation(
+            SERVER_GPU_OPERATION_REQUEST,
+            slot.task->trace_id,
+            slot.id,
+            slot.stats.t_arrival,
+            slot.stats.t_complete,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            SERVER_GPU_TIMING_REQUEST_LIFECYCLE_WINDOW);
+        telemetry_store_token_candidate_detail(slot);
 
         metrics.n_requests_total++;
         if (std::strcmp(outcome, "success") == 0) {
@@ -4483,7 +6833,9 @@ private:
         json sampling = slot.task->params.to_json(false);
         sampling["requested_temperature"] = slot.task->telemetry_requested_temperature;
         sampling["effective_temperature"] = slot.task->params.sampling.temp;
-        sampling["effective_seed"] = common_sampler_get_seed(slot.smpl.get());
+        sampling["effective_seed"] = slot.smpl
+            ? json(common_sampler_get_seed(slot.smpl.get()))
+            : json(nullptr);
 
         json event = {
             {"event", std::strcmp(outcome, "success") == 0 ? "request_completed" : "request_ended"},
@@ -4492,6 +6844,7 @@ private:
             {"w3c_traceparent", slot.task->traceparent.empty() ? json(nullptr) : json(slot.task->traceparent)},
             {"task_id", slot.task->id},
             {"slot_id", slot.id},
+            {"slot_assignment_ordinal", slot.telemetry_assignment_ordinal},
             {"timestamp_unix_ms", telemetry_unix_ms(slot, slot.stats.t_complete)},
             {"completion_id", slot.task->params.oaicompat_cmpl_id},
             {"model", slot.task->params.oaicompat_model},
@@ -4513,6 +6866,7 @@ private:
             {"timings", slot.stats.to_json()},
             {"sampling", std::move(sampling)},
             {"server_configuration", telemetry_server_configuration()},
+            {"lifecycle_clock", telemetry_lifecycle_clock_json(slot)},
             {"speculative", {
                 {"draft_tokens", slot.stats.n_draft_tokens},
                 {"accepted_tokens", slot.stats.n_draft_accepted},
@@ -4545,6 +6899,10 @@ private:
                 }},
             }},
         };
+
+        event["output_token_telemetry"] = telemetry_output_token_json(slot);
+
+        event["moe_routing"] = telemetry_moe_routing_json(slot);
 
         auto probability_json = [](const telemetry_probability_accumulator & probability, const char * semantics) {
             const double mean_nll = probability.nll_sum / probability.count;
@@ -4614,8 +6972,24 @@ private:
         if (telemetry_content) {
             event["request"] = slot.task->telemetry_request;
             event["response"] = slot.generated_text;
+        } else {
+            event["request"] = {
+                {"content_omitted", true},
+                {"reason", "content_logging_disabled"},
+            };
         }
-        telemetry_append(std::move(event));
+        slot.telemetry_pending_completion_event = std::move(event);
+    }
+
+    void telemetry_on_release(server_slot & slot) {
+        if (!slot.telemetry_finalized || slot.telemetry_pending_completion_event.is_null()) {
+            return;
+        }
+
+        slot.telemetry_pending_completion_event["lifecycle_clock"] = telemetry_lifecycle_clock_json(slot);
+        slot.telemetry_pending_completion_event["slot_release_unix_ms"] = telemetry_unix_ms(slot, slot.stats.t_release);
+        telemetry_append(std::move(slot.telemetry_pending_completion_event));
+        slot.telemetry_pending_completion_event = json();
     }
 
     json telemetry_events_json(uint64_t cursor, size_t limit) const {
@@ -4649,8 +7023,125 @@ private:
         };
     }
 
+    json telemetry_kv_pressure_events_json(
+            uint64_t cursor,
+            size_t limit,
+            const std::string & trace_id) const {
+        const uint64_t oldest = telemetry_kv_pressure_events.empty()
+            ? telemetry_kv_pressure_next_sequence
+            : telemetry_kv_pressure_events.front().data.at("sequence").get<uint64_t>();
+        const uint64_t latest = telemetry_kv_pressure_next_sequence - 1;
+        const bool future_cursor = cursor > latest;
+        const uint64_t effective_cursor = future_cursor ? latest : cursor;
+        const bool gap = future_cursor || effective_cursor < telemetry_kv_pressure_last_dropped_sequence ||
+            (effective_cursor == 0 && oldest > 1) ||
+            (effective_cursor != 0 && effective_cursor < oldest && oldest - effective_cursor > 1);
+
+        const telemetry_kv_request_window * request_window = nullptr;
+        if (!trace_id.empty()) {
+            for (auto it = telemetry_kv_request_windows.rbegin(); it != telemetry_kv_request_windows.rend(); ++it) {
+                if (it->trace_id == trace_id) {
+                    request_window = &*it;
+                    break;
+                }
+            }
+        }
+
+        auto matches_explicit_trace = [&](const json & event) {
+            if (event.contains("trace_id") && event.at("trace_id").is_string() &&
+                    event.at("trace_id").get_ref<const std::string &>() == trace_id) {
+                return true;
+            }
+            if (event.contains("victim_trace_id") && event.at("victim_trace_id").is_string() &&
+                    event.at("victim_trace_id").get_ref<const std::string &>() == trace_id) {
+                return true;
+            }
+            return false;
+        };
+        const bool retained_explicit_trace = !trace_id.empty() && std::any_of(
+            telemetry_kv_pressure_events.begin(),
+            telemetry_kv_pressure_events.end(),
+            [&](const auto & entry) { return matches_explicit_trace(entry.data); });
+
+        auto matches_trace = [&](const json & event) {
+            if (trace_id.empty() || matches_explicit_trace(event)) {
+                return true;
+            }
+            if (request_window && event.at("kind") == "utilization_sample") {
+                const int64_t monotonic_us = event.at("monotonic_us").get<int64_t>();
+                return monotonic_us >= request_window->start_monotonic_us &&
+                    (request_window->end_monotonic_us == 0 || monotonic_us <= request_window->end_monotonic_us);
+            }
+            return false;
+        };
+
+        json events = json::array();
+        uint64_t next_cursor = effective_cursor;
+        for (const auto & entry : telemetry_kv_pressure_events) {
+            const json & event = entry.data;
+            const uint64_t sequence = event.at("sequence").get<uint64_t>();
+            if (sequence <= effective_cursor) {
+                continue;
+            }
+            next_cursor = sequence;
+            if (!matches_trace(event)) {
+                continue;
+            }
+            events.push_back(event);
+            if (events.size() >= limit) {
+                break;
+            }
+        }
+
+        const llama_memory_primary_occupancy occupancy = llama_get_memory_primary_occupancy(ctx_tgt);
+        const bool occupancy_available = occupancy.available && occupancy.capacity_entries > 0 &&
+            occupancy.used_entries <= occupancy.capacity_entries;
+        const char * state = "available";
+        const char * reason = "bounded native KV-pressure event stream";
+        if (future_cursor) {
+            state = "partial";
+            reason = "the supplied cursor was ahead of this server instance and was reset to its high-water mark";
+        } else if (!trace_id.empty() && !request_window) {
+            if (retained_explicit_trace) {
+                state = "partial";
+                reason = "matching trace events are retained, but the request window metadata has expired";
+            } else {
+                state = "no_data";
+                reason = "the requested trace is not retained by this server instance";
+            }
+        } else if (gap) {
+            state = "partial";
+            reason = "older KV-pressure events were evicted from the bounded native buffer";
+        } else if (!occupancy_available) {
+            state = "partial";
+            reason = "causal events are available, but primary occupancy is unavailable";
+        }
+
+        return {
+            {"schema_version", 1},
+            {"state", state},
+            {"reason", reason},
+            {"server_instance_id", telemetry_server_instance_id},
+            {"trace_filter", trace_id.empty() ? json(nullptr) : json(trace_id)},
+            {"request_start_monotonic_us", request_window
+                ? json(request_window->start_monotonic_us) : json(nullptr)},
+            {"request_end_monotonic_us", request_window && request_window->end_monotonic_us > 0
+                ? json(request_window->end_monotonic_us) : json(nullptr)},
+            {"events", std::move(events)},
+            {"cursor", next_cursor},
+            {"oldest_sequence", oldest},
+            {"next_sequence", telemetry_kv_pressure_next_sequence},
+            {"gap", gap},
+            {"dropped_events", telemetry_kv_pressure_dropped_events},
+            {"last_dropped_sequence", telemetry_kv_pressure_last_dropped_sequence},
+            {"retained_serialized_bytes", telemetry_kv_pressure_event_bytes},
+        };
+    }
+
     static json telemetry_churn_json(const llama_memory_churn_data & churn) {
         return {
+            {"state", "available"},
+            {"reason", "authoritative monotonic memory-backend churn counters"},
             {"entries_allocated", churn.entries_allocated},
             {"entries_released", churn.entries_released},
             {"entries_overwritten", churn.entries_overwritten},
@@ -4676,6 +7167,7 @@ private:
         if (diagnostics.state != "available") {
             return {
                 {"state", diagnostics.state},
+                {"reason", "the active memory backend did not expose structured memory diagnostics"},
                 {"components", json::array()},
             };
         }
@@ -4698,6 +7190,9 @@ private:
                 {"utilization", component.capacity_entries > 0 ? json((double) component.used_entries / component.capacity_entries) : json(nullptr)},
                 {"resident_tokens", component.resident_tokens_supported ? json(component.resident_tokens) : json(nullptr)},
                 {"resident_tokens_state", component.resident_tokens_supported ? "available" : "not_applicable"},
+                {"resident_tokens_reason", component.resident_tokens_supported
+                    ? "the memory component exposes authoritative resident-token membership"
+                    : "this memory component does not represent token-addressable KV residency"},
                 {"sequences_represented", component.sequences_represented},
                 {"physical_sharing", {
                     {"state", component.physical_sharing_supported ? "available" : "not_applicable"},
@@ -4716,8 +7211,14 @@ private:
             });
         }
 
-        json live = {{"state", primary ? "available" : "unsupported"}};
-        json sharing = {{"state", primary && primary->physical_sharing_supported ? "available" : "not_applicable"}};
+        json live = {
+            {"state", primary ? "available" : "unsupported"},
+            {"reason", primary ? "authoritative primary memory-component counters" : "no logical primary memory component exposed live occupancy"},
+        };
+        json sharing = {
+            {"state", primary && primary->physical_sharing_supported ? "available" : "not_applicable"},
+            {"reason", primary && primary->physical_sharing_supported ? "authoritative physical sequence membership" : "the primary memory component does not expose physical prefix sharing"},
+        };
         if (primary) {
             live.update({
                 {"memory_kind", primary->kind},
@@ -4728,6 +7229,9 @@ private:
                 {"utilization", primary->capacity_entries > 0 ? json((double) primary->used_entries / primary->capacity_entries) : json(nullptr)},
                 {"resident_tokens", primary->resident_tokens_supported ? json(primary->resident_tokens) : json(nullptr)},
                 {"resident_tokens_state", primary->resident_tokens_supported ? "available" : "not_applicable"},
+                {"resident_tokens_reason", primary->resident_tokens_supported
+                    ? "the primary memory component exposes authoritative resident-token membership"
+                    : "the primary memory component does not expose token-addressable residency"},
                 {"sequences_represented", primary->sequences_represented},
                 {"allocated_bytes", primary->allocated_bytes},
                 {"occupied_bytes_estimate", primary->occupied_bytes_estimate},
@@ -4857,6 +7361,7 @@ private:
                 {"decode_tps_window", metrics.predict_bucket.n_per_second()},
                 {"evaluated_prompt_tokens_total", metrics.prompt.count},
                 {"server_output_tokens_total", metrics.n_server_output_tokens},
+                {"generation_steps_total", metrics.predict.steps},
                 {"prefill_state", metrics.prompt_bucket.time > 0 ? "available" : "no_data"},
                 {"decode_state", metrics.predict_bucket.time > 0 ? "available" : "no_data"},
                 {"server_output_tps", nullptr},
@@ -4908,9 +7413,18 @@ private:
             {"kv", {
                 {"resident_slot_tokens_upper_bound", resident_slot_tokens},
                 {"represented_slots", std::count_if(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.prompt.n_tokens() > 0; })},
-                {"live_occupancy", memory_diagnostics.value("live_occupancy", json {{"state", "unsupported"}})},
-                {"physical_prefix_sharing", memory_diagnostics.value("physical_prefix_sharing", json {{"state", "unsupported"}})},
-                {"churn", memory_diagnostics.value("churn", json {{"state", "unsupported"}})},
+                {"live_occupancy", memory_diagnostics.value("live_occupancy", json {
+                    {"state", memory_diagnostics.value("state", "unsupported")},
+                    {"reason", memory_diagnostics.value("reason", "the active memory backend did not expose live occupancy")},
+                })},
+                {"physical_prefix_sharing", memory_diagnostics.value("physical_prefix_sharing", json {
+                    {"state", memory_diagnostics.value("state", "unsupported")},
+                    {"reason", memory_diagnostics.value("reason", "the active memory backend did not expose physical sequence membership")},
+                })},
+                {"churn", memory_diagnostics.value("churn", json {
+                    {"state", memory_diagnostics.value("state", "unsupported")},
+                    {"reason", memory_diagnostics.value("reason", "the active memory backend did not expose churn counters")},
+                })},
             }},
         };
     }
@@ -5050,6 +7564,7 @@ private:
             : json(nullptr);
         return {
             {"state", primary ? "available" : "not_applicable"},
+            {"reason", primary ? "bounded compatible-prefix analysis over server slot metadata" : "the active memory backend has no token-KV primary component"},
             {"semantics", "optimization_estimate_from_compatible_token_metadata_validated_against_physical_sequence_membership"},
             {"compatible_sequences_examined", candidates.size()},
             {"duplicate_prefix_groups", groups.size()},
@@ -5107,6 +7622,8 @@ private:
             {"schema_version", 1},
             {"server_instance_id", telemetry_server_instance_id},
             {"allocated", {
+                {"state", "available"},
+                {"reason", "authoritative model/context/compute allocation totals grouped by backend buffer type"},
                 {"model_bytes", total.model},
                 {"context_bytes", total.context},
                 {"compute_bytes", total.compute},
@@ -5114,13 +7631,24 @@ private:
                 {"by_buffer_type", std::move(devices)},
             }},
             {"slot_metadata", {
+                {"state", "available"},
+                {"reason", "bounded server-slot metadata; resident token count is explicitly an upper bound"},
                 {"resident_tokens_upper_bound", resident_slot_tokens},
                 {"represented_slots", represented_slots},
             }},
-            {"live_occupancy", diagnostics.value("live_occupancy", json {{"state", "unsupported"}})},
-            {"physical_prefix_sharing", diagnostics.value("physical_prefix_sharing", json {{"state", "unsupported"}})},
+            {"live_occupancy", diagnostics.value("live_occupancy", json {
+                {"state", diagnostics.value("state", "unsupported")},
+                {"reason", diagnostics.value("reason", "the active memory backend did not expose live occupancy")},
+            })},
+            {"physical_prefix_sharing", diagnostics.value("physical_prefix_sharing", json {
+                {"state", diagnostics.value("state", "unsupported")},
+                {"reason", diagnostics.value("reason", "the active memory backend did not expose physical sequence membership")},
+            })},
             {"components", diagnostics.value("components", json::array())},
-            {"churn", diagnostics.value("churn", json {{"state", "unsupported"}})},
+            {"churn", diagnostics.value("churn", json {
+                {"state", diagnostics.value("state", "unsupported")},
+                {"reason", diagnostics.value("reason", "the active memory backend did not expose churn counters")},
+            })},
             {"duplicate_prefix_opportunities", std::move(duplicate_prefixes)},
         };
     }
@@ -5503,6 +8031,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
 
+            // A trusted local diagnostic server can make the bounded request
+            // switches implicit. Partial administrator enablement preserves the
+            // normal request-gated behavior.
+            const bool automatic_output_token_diagnostics =
+                    ctx_server.telemetry_content_enabled()
+                    && ctx_server.telemetry_output_tokens_enabled()
+                    && ctx_server.telemetry_token_candidates_enabled();
+            if (automatic_output_token_diagnostics) {
+                task.params.output_token_telemetry = true;
+                task.params.output_token_candidate_telemetry = true;
+                task.params.sampling.n_probs = std::max(task.params.sampling.n_probs, 1);
+            }
+
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
             task.id_slot = json_value(data, "id_slot", -1);
@@ -5837,12 +8378,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_telemetry(
         const server_http_req & req,
         server_task_type type,
         uint64_t cursor,
-        size_t limit) {
+        size_t limit,
+        const std::string & trace_id) {
     auto res = create_response();
     server_task task(type);
     task.id = res->rd.get_new_id();
     task.telemetry_cursor = cursor;
     task.telemetry_limit = limit;
+    task.telemetry_trace_id = trace_id;
     res->rd.post_task(std::move(task), true);
 
     auto result = res->rd.next(req.should_stop);
@@ -5880,6 +8423,10 @@ void server_routes::init_routes() {
     this->get_telemetry_capabilities = [this](const server_http_req &) {
         auto res = create_response(true);
         res->headers["Cache-Control"] = "no-store";
+        const bool automatic_output_token_diagnostics =
+                ctx_server.telemetry_content_enabled()
+                && ctx_server.telemetry_output_tokens_enabled()
+                && ctx_server.telemetry_token_candidates_enabled();
         res->ok({
             {"schema_version", 1},
             {"server_instance_id", ctx_server.telemetry_instance_id()},
@@ -5909,8 +8456,10 @@ void server_routes::init_routes() {
                 {"physical_ubatch_observed", {{"state", "available"}, {"semantics", "actual llama_ubatch graph submissions"}}},
                 {"speculative", {{"state", "available"}, {"enabled", common_speculative_n_max(&params.speculative) > 0}}},
                 {"response_perplexity", {
-                    {"state", "conditional"},
-                    {"requires", "n_probs > 0 and full raw target logits"},
+                    {"state", automatic_output_token_diagnostics ? "available" : "conditional"},
+                    {"requires", automatic_output_token_diagnostics
+                        ? "enabled automatically because all three output-token administrator gates are enabled"
+                        : "n_probs > 0 and full raw target logits"},
                     {"supports_speculative_output", true},
                     {"semantics", "committed emitted tokens only; rejected and replayed speculative tokens are excluded"},
                 }},
@@ -5923,8 +8472,87 @@ void server_routes::init_routes() {
                 }},
                 {"kv_allocation", {{"state", "available"}, {"semantics", "typed memory components plus model/context/compute allocation by buffer type"}}},
                 {"kv_live_occupancy", {{"state", "available"}, {"semantics", "authoritative memory metadata; occupied bytes are a labeled dense-allocation estimate"}}},
+                {"kv_pressure", ctx_server.telemetry_kv_pressure_capability_json()},
                 {"physical_prefix_sharing", {{"state", "available"}, {"semantics", "authoritative multi-sequence membership in physical memory entries"}}},
                 {"duplicate_prefix_opportunities", {{"state", "available"}, {"semantics", "bounded metadata-only optimization estimate; multimodal histories are skipped"}}},
+                {"gpu_gpm", ctx_server.telemetry_gpu_capability_json()},
+                {"moe_routing", llama_model_n_expert(ctx_server.model_tgt) <= 0
+                    ? json {{"state", "not_applicable"}, {"reason", "The loaded target model has no routed MoE experts."}}
+                    : json {
+                        {"state", ctx_server.telemetry_moe_routing_enabled() ? "conditional" : "disabled"},
+                        {"configured_experts", llama_model_n_expert(ctx_server.model_tgt)},
+                        {"experts_per_token", llama_model_n_expert_used(ctx_server.model_tgt)},
+                        {"reason", ctx_server.telemetry_moe_routing_enabled()
+                            ? "Bounded layer-qualified histograms and exact target-output-row selected-expert IDs are retained when a request sets moe_routing_telemetry=true."
+                            : "The admin gate is disabled; set LLAMA_TELEMETRY_MOE_ROUTING=1 when starting llama-server."},
+                        {"enable_with", "LLAMA_TELEMETRY_MOE_ROUTING=1 plus request moe_routing_telemetry=true"},
+                        {"population", "target_model_routed_token_layer_decisions"},
+                        {"token_detail_population", "target_model_output_logit_rows_by_layer"},
+                        {"token_detail_schema_version", 2},
+                        {"retained_token_detail_linkage", json::array({"model_position", "phase", "logical_step", "actual_target_pass", "proposal_position", "replay_pass"})},
+                        {"routing_weights_state", ctx_server.telemetry_moe_routing_enabled() ? "conditional" : "disabled"},
+                        {"routing_weights_reason", ctx_server.telemetry_moe_routing_enabled()
+                            ? "Exact effective expert coefficients and normalized selected-expert shares require request moe_routing_telemetry=true."
+                            : "The admin gate is disabled; set LLAMA_TELEMETRY_MOE_ROUTING=1 when starting llama-server."},
+                        {"router_margin_state", llama_model_n_expert_used(ctx_server.model_tgt) >= 2
+                            ? (ctx_server.telemetry_moe_routing_enabled() ? "conditional" : "disabled")
+                            : "not_applicable"},
+                        {"router_margin_reason", llama_model_n_expert_used(ctx_server.model_tgt) >= 2
+                            ? (ctx_server.telemetry_moe_routing_enabled()
+                                ? "The normalized top-two selected-expert share difference requires request moe_routing_telemetry=true."
+                                : "The admin gate is disabled; set LLAMA_TELEMETRY_MOE_ROUTING=1 when starting llama-server.")
+                            : "A top-two margin does not apply when fewer than two experts are selected per token-layer decision."},
+                        {"maximum_captured_activations", ctx_server.telemetry_moe_activation_limit_value()},
+                        {"disabled_path_changes_graph", false},
+                    }},
+                {"output_token_telemetry", {
+                    {"state", ctx_server.telemetry_output_tokens_enabled()
+                        ? (automatic_output_token_diagnostics ? "available" : "conditional")
+                        : "disabled"},
+                    {"reason", ctx_server.telemetry_output_tokens_enabled()
+                        ? (automatic_output_token_diagnostics
+                            ? "Bounded committed-token detail and raw target probability are enabled automatically for every request because all three administrator gates are enabled."
+                            : "Bounded committed-token timing, target-model position, decode origin, MTP commit linkage, and actual target-pass records are available when the request sets output_token_telemetry=true; raw target probability additionally requires n_probs > 0.")
+                        : "The admin gate is disabled; set LLAMA_TELEMETRY_OUTPUT_TOKENS=1 when starting llama-server."},
+                    {"enable_with", "LLAMA_TELEMETRY_OUTPUT_TOKENS=1 plus request output_token_telemetry=true"},
+                    {"probability_enable_with", "n_probs > 0"},
+                    {"automatic_request_defaults", automatic_output_token_diagnostics},
+                    {"token_identity_policy", "token IDs and authoritative tokenizer-piece bytes require LLAMA_TELEMETRY_CONTENT=1"},
+                    {"population", "committed_generation_tokens"},
+                    {"record_schema_version", 3},
+                    {"mtp_pass_record_schema_version", 2},
+                    {"retained_linkage", json::array({"model_ready_monotonic_us", "model_position", "origin", "logical_step", "actual_target_pass", "proposal_position", "accepted_depth", "proposed_count", "replay_pass"})},
+                    {"retained_mtp_proposal_fields", json::array({"position", "disposition", "evaluated_actual_target_pass", "draft_token_id", "draft_token_piece_base64", "target_selected_token_id", "target_selected_token_piece_base64", "target_selected_log_probability_ln", "committed_output_ordinal"})},
+                    {"maximum_captured_tokens", ctx_server.telemetry_output_tokens_limit()},
+                    {"maximum_captured_mtp_passes", ctx_server.telemetry_mtp_passes_limit()},
+                    {"maximum_captured_mtp_proposals", ctx_server.telemetry_mtp_proposals_limit()},
+                    {"normal_request_telemetry_unaffected", !automatic_output_token_diagnostics},
+                }},
+                {"output_token_candidates", {
+                    {"state", ctx_server.telemetry_token_candidates_enabled()
+                        ? (automatic_output_token_diagnostics ? "available" : "conditional")
+                        : "disabled"},
+                    {"reason", ctx_server.telemetry_token_candidates_enabled()
+                        ? (automatic_output_token_diagnostics
+                            ? "A separately retained target-model top-K block is enabled automatically for every MTP request and fetched lazily by exact trace ID."
+                            : "A separately retained target-model top-K block is available for opted-in MTP requests and fetched lazily by exact trace ID.")
+                        : "The admin gate is disabled; set LLAMA_TELEMETRY_TOKEN_CANDIDATES=1 when starting llama-server."},
+                    {"enable_with", "LLAMA_TELEMETRY_OUTPUT_TOKENS=1 plus LLAMA_TELEMETRY_TOKEN_CANDIDATES=1 plus request output_token_telemetry=true and output_token_candidate_telemetry=true"},
+                    {"automatic_request_defaults", automatic_output_token_diagnostics},
+                    {"endpoint", "/telemetry/v1/token-candidates?trace_id=<exact-trace-id>"},
+                    {"schema_version", 2},
+                    {"default_target_top_k", 5},
+                    {"maximum_target_top_k", 5},
+                    {"default_population", "mtp_mismatch_replacement_and_bonus_positions"},
+                    {"accepted_positions", "separate_request_opt_in"},
+                    {"draft_top_k_state", "unsupported"},
+                    {"draft_top_k_reason", "The current producer tier retains draft proposal identity but not the draft-model top-K distribution."},
+                    {"maximum_serialized_bytes_per_request", ctx_server.telemetry_token_candidate_max_bytes()},
+                    {"maximum_decisions_per_request", ctx_server.telemetry_token_candidate_decisions_limit()},
+                    {"token_identity_policy", "token IDs and authoritative tokenizer-piece bytes require LLAMA_TELEMETRY_CONTENT=1"},
+                    {"normal_event_payload_contains_candidates", false},
+                    {"normal_request_telemetry_unaffected", !automatic_output_token_diagnostics},
+                }},
                 {"content_events", {{"state", ctx_server.telemetry_content_enabled() ? "enabled" : "disabled"}, {"enable_with", "LLAMA_TELEMETRY_CONTENT=1"}}},
             }},
             {"content_policy", {
@@ -5933,6 +8561,10 @@ void server_routes::init_routes() {
                 {"serialized_event_capacity_bytes", ctx_server.telemetry_event_capacity_bytes()},
                 {"event_buffer_env", "LLAMA_TELEMETRY_EVENT_BUFFER_MIB"},
                 {"request_capture_limit_bytes", 4 * 1024 * 1024},
+                {"output_token_record_limit", ctx_server.telemetry_output_tokens_limit()},
+                {"token_candidate_max_serialized_bytes", ctx_server.telemetry_token_candidate_max_bytes()},
+                {"moe_activation_record_limit", ctx_server.telemetry_moe_activation_limit_value()},
+                {"moe_token_detail_activation_record_limit", ctx_server.telemetry_moe_activation_limit_value()},
                 {"prometheus_content", false},
             }},
         });
@@ -5975,6 +8607,111 @@ void server_routes::init_routes() {
 
     this->get_telemetry_kv = [this](const server_http_req & req) {
         return handle_telemetry(req, SERVER_TASK_TYPE_TELEMETRY_KV);
+    };
+
+    this->get_telemetry_kv_pressure = [this](const server_http_req & req) {
+        uint64_t cursor = 0;
+        size_t limit = 256;
+        try {
+            auto parse_unsigned = [](const std::string & value) {
+                if (value.empty() || value.front() == '-') {
+                    throw std::invalid_argument("expected unsigned integer");
+                }
+                size_t end = 0;
+                const uint64_t parsed = std::stoull(value, &end);
+                if (end != value.size()) {
+                    throw std::invalid_argument("unexpected trailing characters");
+                }
+                return parsed;
+            };
+            if (!req.get_param("cursor").empty()) {
+                cursor = parse_unsigned(req.get_param("cursor"));
+            }
+            if (!req.get_param("limit").empty()) {
+                limit = parse_unsigned(req.get_param("limit"));
+            }
+        } catch (const std::exception &) {
+            auto res = create_response(true);
+            res->error(format_error_response(
+                "cursor and limit must be non-negative integers",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (limit < 1 || limit > 4096) {
+            auto res = create_response(true);
+            res->error(format_error_response(
+                "limit must be between 1 and 4096",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string trace_id = req.get_param("trace_id");
+        if (trace_id.size() > 256 ||
+                std::any_of(trace_id.begin(), trace_id.end(), [](unsigned char c) { return std::iscntrl(c) != 0; })) {
+            auto res = create_response(true);
+            res->error(format_error_response(
+                "trace_id must contain at most 256 non-control characters",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        return handle_telemetry(
+            req,
+            SERVER_TASK_TYPE_TELEMETRY_KV_PRESSURE,
+            cursor,
+            limit,
+            trace_id);
+    };
+
+    this->get_telemetry_gpu = [this](const server_http_req & req) {
+        uint64_t cursor = 0;
+        size_t limit = 256;
+        try {
+            auto parse_unsigned = [](const std::string & value) {
+                if (value.empty() || value.front() == '-') {
+                    throw std::invalid_argument("expected unsigned integer");
+                }
+                size_t end = 0;
+                const uint64_t parsed = std::stoull(value, &end);
+                if (end != value.size()) {
+                    throw std::invalid_argument("unexpected trailing characters");
+                }
+                return parsed;
+            };
+            if (!req.get_param("cursor").empty()) {
+                cursor = parse_unsigned(req.get_param("cursor"));
+            }
+            if (!req.get_param("limit").empty()) {
+                limit = parse_unsigned(req.get_param("limit"));
+            }
+        } catch (const std::exception &) {
+            auto res = create_response(true);
+            res->error(format_error_response("cursor and limit must be non-negative integers", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        limit = std::max<size_t>(1, std::min<size_t>(limit, 4096));
+        return handle_telemetry(
+            req,
+            SERVER_TASK_TYPE_TELEMETRY_GPU,
+            cursor,
+            limit,
+            req.get_param("trace_id"));
+    };
+
+    this->get_telemetry_token_candidates = [this](const server_http_req & req) {
+        const std::string trace_id = req.get_param("trace_id");
+        if (trace_id.empty() || trace_id.size() > 256 ||
+                std::any_of(trace_id.begin(), trace_id.end(), [](unsigned char c) { return std::iscntrl(c) != 0; })) {
+            auto res = create_response(true);
+            res->error(format_error_response(
+                "trace_id is required and must contain at most 256 non-control characters",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        return handle_telemetry(
+            req,
+            SERVER_TASK_TYPE_TELEMETRY_TOKEN_CANDIDATES,
+            0,
+            1,
+            trace_id);
     };
 
     this->get_metrics = [this](const server_http_req & req) {
@@ -6503,6 +9240,8 @@ void server_routes::init_routes() {
                 server_task task = server_task(SERVER_TASK_TYPE_RERANK);
                 task.id     = rd.get_new_id();
                 task.tokens = std::move(tmp);
+                task.t_arrival = req.t_arrival;
+                task.t_arrival_unix_ms = req.t_arrival_unix_ms;
                 tasks.push_back(std::move(task));
             }
             rd.post_tasks(std::move(tasks));
@@ -6764,6 +9503,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
 
             task.id     = rd.get_new_id();
             task.tokens = std::move(tokenized_prompts[i]);
+            task.t_arrival = req.t_arrival;
+            task.t_arrival_unix_ms = req.t_arrival_unix_ms;
 
             // OAI-compat
             task.params.res_type = res_type;

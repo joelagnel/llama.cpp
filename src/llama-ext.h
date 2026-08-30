@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -87,6 +88,7 @@ struct llama_device_memory_data {
 using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
 
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
+LLAMA_API int32_t llama_model_n_expert_used(const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
@@ -112,6 +114,23 @@ struct llama_ubatch_stats {
 
 LLAMA_API const std::array<uint32_t, LLAMA_UBATCH_HISTOGRAM_BUCKET_COUNT> & llama_ubatch_histogram_bounds();
 LLAMA_API llama_ubatch_stats llama_get_ubatch_stats(const struct llama_context * ctx);
+
+// Optional diagnostic output containing the selected routed expert IDs for the
+// most recent logical llama_decode() batch. Disabled collection changes no graph
+// outputs and performs no host copy. Enabling it changes graph topology and is
+// intended for explicitly opted-in, bounded diagnostics rather than normal
+// inference.
+struct llama_moe_routing_entry {
+    int32_t layer_index = -1;
+    int32_t token_index = -1; // zero-based position in the logical llama_decode() batch
+    int32_t expert_index = -1;
+    float effective_weight = std::numeric_limits<float>::quiet_NaN(); // exact coefficient applied to this selected expert
+};
+
+LLAMA_API void llama_set_moe_routing(struct llama_context * ctx, bool enabled);
+LLAMA_API const llama_moe_routing_entry * llama_get_moe_routing(
+        struct llama_context * ctx,
+        size_t * count);
 
 struct llama_memory_churn_data {
     uint64_t entries_allocated = 0;
@@ -177,6 +196,13 @@ struct llama_memory_diagnostics {
     llama_memory_churn_data churn;
 };
 
+struct llama_memory_primary_occupancy {
+    bool available = false;
+    uint64_t capacity_entries = 0;
+    uint64_t used_entries = 0;
+};
+
+LLAMA_API llama_memory_primary_occupancy llama_get_memory_primary_occupancy(const struct llama_context * ctx);
 LLAMA_API llama_memory_diagnostics llama_get_memory_diagnostics(const struct llama_context * ctx);
 
 // Returns the number of leading token positions represented by one physical

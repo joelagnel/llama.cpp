@@ -30,6 +30,9 @@ enum server_task_type {
     SERVER_TASK_TYPE_TELEMETRY_SNAPSHOT,
     SERVER_TASK_TYPE_TELEMETRY_EVENTS,
     SERVER_TASK_TYPE_TELEMETRY_KV,
+    SERVER_TASK_TYPE_TELEMETRY_KV_PRESSURE,
+    SERVER_TASK_TYPE_TELEMETRY_GPU,
+    SERVER_TASK_TYPE_TELEMETRY_TOKEN_CANDIDATES,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -55,6 +58,12 @@ struct task_params {
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool prompt_perplexity = false; // opt-in cold prompt scoring diagnostic
+    bool output_token_telemetry = false; // opt-in bounded per-token timing/probability diagnostics
+    bool output_token_candidate_telemetry = false; // opt-in external bounded target top-K detail
+    bool output_token_candidate_include_accepted = false; // include accepted MTP positions in target top-K detail
+    int32_t output_token_candidate_top_k = 5;
+    int32_t output_token_candidate_byte_cap = 32 * 1024;
+    bool moe_routing_telemetry = false; // opt-in bounded routed-expert diagnostics
     bool return_tokens   = false;
     bool return_progress = false;
 
@@ -189,6 +198,7 @@ struct server_task {
 
     uint64_t telemetry_cursor = 0;
     size_t telemetry_limit = 100;
+    std::string telemetry_trace_id;
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
@@ -290,6 +300,8 @@ struct result_prompt_progress {
     int32_t cache = 0;
     int32_t processed = 0;
     int64_t time_ms = 0;
+    int64_t prompt_start_monotonic_us = 0;
+    int64_t monotonic_us = 0;
 
     json to_json() const;
 };
