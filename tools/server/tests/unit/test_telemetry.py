@@ -145,6 +145,10 @@ def test_event_ring_reuses_serialized_payload_bytes_for_retention_and_response()
     assert body["retained_serialized_bytes"] <= byte_cap
     assert body["dropped_events"] > 0
     assert body["gap"] is True
+    assert body["gap_ranges"] == [{
+        "first_sequence": 1,
+        "last_sequence": body["oldest_sequence"] - 1,
+    }]
     assert b'"events":[' + b",".join(serialized_events) + b"]" in response.content
 
 
@@ -1726,6 +1730,100 @@ def test_prompt_perplexity_is_exact_and_opt_in():
         "available": False,
         "reason": "request_did_not_enable_prompt_perplexity",
     }
+
+
+def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
+    global server
+
+    api_key = "moe-routing-chunk-test-key"
+    auth = {"Authorization": f"Bearer {api_key}"}
+    server = ServerPreset.stories15m_moe()
+    server.server_metrics = True
+    server.server_props = True
+    server.api_key = api_key
+    server.n_batch = 16
+    server.n_ubatch = 2
+    server.start()
+
+    try:
+        control = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"moe_routing": True}},
+            headers=auth,
+        )
+        assert control.status_code == 200
+        assert control.body["telemetry_control"]["generation"] == 1
+
+        response = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": "A routed prefill and decode capture.",
+                "n_predict": 3,
+                "ignore_eos": True,
+                "temperature": 0,
+            },
+            headers=auth,
+        )
+        assert response.status_code == 200
+        trace_id = response.body["trace_id"]
+        events_response = server.make_request(
+            "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
+        )
+        assert events_response.status_code == 200
+        chunks = [
+            event for event in events_response.body["events"]
+            if event["event"] == "moe_routing_chunk" and event["trace_id"] == trace_id
+        ]
+        assert chunks
+        assert [chunk["trace_chunk_sequence"] for chunk in chunks] == list(range(1, len(chunks) + 1))
+        assert chunks[-1]["final"] is True
+        assert chunks[-1]["decisions"] == []
+
+        decisions = [
+            decision for chunk in chunks if not chunk["final"] for decision in chunk["decisions"]
+        ]
+        assert decisions
+        assert {decision["phase"] for decision in decisions} >= {"prefill", "decode"}
+        assert all(chunk["serialized_bytes"] <= 1024 * 1024 for chunk in chunks)
+        assert all(chunk["sequence"] > 0 for chunk in chunks)
+        assert all(chunk["server_instance_id"] == events_response.body["server_instance_id"] for chunk in chunks)
+        assert all(chunk["physical_peer_coverage"] in ["complete", "partial"] for chunk in chunks)
+        assert all("shared_experts" in chunk for chunk in chunks)
+        for decision in decisions:
+            assert decision["physical_step_id"] > 0
+            assert decision["physical_ubatch_index"] >= 0
+            assert decision["control_generation"] == 1
+            assert decision["kth_selected_score_status"] in [0, 1, 2, 3]
+            assert decision["highest_rejected_score_status"] in [0, 1, 2, 3]
+            assert decision["selected_experts"]
+            for selected in decision["selected_experts"]:
+                assert selected["expert_id_status"] in [0, 1, 2, 3]
+                assert selected["effective_weight_status"] in [0, 1, 2, 3]
+                if selected["effective_weight_status"] == 0:
+                    assert selected["effective_weight"] is not None
+
+        opted_out = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": "The request opts out of routing detail.",
+                "n_predict": 1,
+                "moe_routing_telemetry": False,
+            },
+            headers=auth,
+        )
+        assert opted_out.status_code == 200
+        events_response = server.make_request(
+            "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
+        )
+        assert not any(
+            event["event"] == "moe_routing_chunk" and event["trace_id"] == opted_out.body["trace_id"]
+            for event in events_response.body["events"]
+        )
+    finally:
+        server.stop()
 
 
 def test_moe_routing_states_and_bounded_histogram(monkeypatch):
