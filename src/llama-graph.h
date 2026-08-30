@@ -938,6 +938,7 @@ public:
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
     const std::vector<llm_graph_moe_routing_output> & get_moe_routing_outputs() const { return moe_routing_outputs; }
+    bool has_moe_routing_outputs() const { return !moe_routing_outputs.empty(); }
 
     void set_params(const llm_graph_params & params);
 

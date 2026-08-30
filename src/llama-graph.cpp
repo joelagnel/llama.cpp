@@ -1358,6 +1358,8 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
+    GGML_ASSERT(params.cparams.moe_routing || moe_routing_outputs.empty());
+
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
     }
@@ -1413,6 +1415,7 @@ void llm_graph_result::add_moe_routing_output(
         int32_t layer_index,
         ggml_tensor * selected_experts,
         ggml_tensor * effective_weights) {
+    GGML_ASSERT(params.cparams.moe_routing);
     GGML_ASSERT(selected_experts != nullptr);
     GGML_ASSERT(effective_weights != nullptr);
     moe_routing_outputs.push_back({ layer_index, selected_experts, effective_weights });

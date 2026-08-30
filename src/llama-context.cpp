@@ -1193,6 +1193,13 @@ void llama_context::set_moe_routing(bool value) {
 
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
+    const bool has_moe = model.hparams.n_expert > 0;
+    if (!has_moe) {
+        cparams.moe_routing = value;
+        return;
+    }
+
+    // Only a graph that retained MoE outputs can have an asynchronous capture.
     if (moe_routing_capture_count > 0) {
         synchronize();
     }
@@ -1205,6 +1212,11 @@ void llama_context::set_moe_routing(bool value) {
 
 const llama_moe_routing_entry * llama_context::get_moe_routing(size_t * count) {
     GGML_ASSERT(count != nullptr);
+
+    if (model.hparams.n_expert == 0 || !cparams.moe_routing || moe_routing_capture_count == 0) {
+        *count = 0;
+        return nullptr;
+    }
 
     synchronize();
     moe_routing_entries.clear();
@@ -1742,7 +1754,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
-    if (cparams.moe_routing) {
+    if (cparams.moe_routing && model.hparams.n_expert > 0) {
         // The previous diagnostic batch must have been consumed before its
         // reusable host buffers can be overwritten. This synchronization is
         // confined to the explicitly enabled diagnostic path.
@@ -2043,7 +2055,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
-        extract_moe_routing(res, n_tokens_prev, ubatch);
+        if (res->has_moe_routing_outputs()) {
+            extract_moe_routing(res, n_tokens_prev, ubatch);
+        }
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2329,11 +2343,10 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::extract_moe_routing(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch) {
-    if (!cparams.moe_routing) {
-        return;
-    }
+    const auto & outputs = res->get_moe_routing_outputs();
+    GGML_ASSERT(!outputs.empty());
 
-    for (const auto & output : res->get_moe_routing_outputs()) {
+    for (const auto & output : outputs) {
         ggml_tensor * tensor = output.selected_experts;
         if (tensor == nullptr || tensor->type != GGML_TYPE_I32 || tensor->ne[0] <= 0) {
             continue;
@@ -2662,6 +2675,12 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    auto cparams = this->cparams;
+
+    // A dense model never retains MoE outputs, so toggling this diagnostic
+    // must not invalidate or rebuild its graph.
+    cparams.moe_routing = cparams.moe_routing && model.hparams.n_expert > 0;
+
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
