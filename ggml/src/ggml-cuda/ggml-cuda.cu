@@ -79,6 +79,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -136,8 +137,131 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+// Some Windows unified-memory systems fail cudaMalloc only after the dedicated carveout is first touched.
+// Mapped host memory provides an opt-in fallback at lower performance.
+struct ggml_cuda_mapped_allocation {
+    void * host_ptr;
+    size_t size;
+    int device;
+    bool mapped;
+};
+
+static std::mutex ggml_cuda_mapped_allocations_mutex;
+static std::map<void *, ggml_cuda_mapped_allocation> ggml_cuda_mapped_allocations;
+static std::array<size_t, GGML_CUDA_MAX_DEVICES> ggml_cuda_device_allocated_bytes = {};
+static std::array<size_t, GGML_CUDA_MAX_DEVICES> ggml_cuda_mapped_allocated_bytes = {};
+
+static bool ggml_cuda_mapped_fallback_enabled() {
+    const char * value = getenv("GGML_CUDA_MAPPED_HOST_FALLBACK");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+static size_t ggml_cuda_mib_env(const char * name, size_t default_mib) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_mib * 1024ull * 1024ull;
+    }
+
+    char * end = nullptr;
+    const unsigned long long mib = std::strtoull(value, &end, 10);
+    if (end == value || *end != '\0') {
+        GGML_LOG_WARN("invalid %s=%s; using %zu MiB\n", name, value, default_mib);
+        return default_mib * 1024ull * 1024ull;
+    }
+    return (size_t) mib * 1024ull * 1024ull;
+}
+
+static cudaError_t ggml_cuda_device_free(void * ptr) {
+    if (!ggml_cuda_mapped_fallback_enabled()) {
+        return cudaFree(ptr);
+    }
+
+    ggml_cuda_mapped_allocation allocation = {};
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_mapped_allocations_mutex);
+        const auto it = ggml_cuda_mapped_allocations.find(ptr);
+        if (it != ggml_cuda_mapped_allocations.end()) {
+            allocation = it->second;
+            if (allocation.mapped) {
+                ggml_cuda_mapped_allocated_bytes[allocation.device] -= allocation.size;
+            } else {
+                ggml_cuda_device_allocated_bytes[allocation.device] -= allocation.size;
+            }
+            ggml_cuda_mapped_allocations.erase(it);
+            found = true;
+        }
+    }
+
+    if (!found) {
+        return cudaFree(ptr);
+    }
+
+    ggml_cuda_set_device(allocation.device);
+    return allocation.mapped ? cudaFreeHost(allocation.host_ptr) : cudaFree(ptr);
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
+
+    if (ggml_cuda_mapped_fallback_enabled()) {
+        const size_t device_budget = ggml_cuda_mib_env("GGML_CUDA_DEVICE_BUDGET_MIB", 21500);
+        const size_t mapped_budget = ggml_cuda_mib_env("GGML_CUDA_MAPPED_BUDGET_MIB", 22000);
+
+        static std::once_flag log_flag;
+        std::call_once(log_flag, [device_budget, mapped_budget]() {
+            GGML_LOG_INFO(
+                "CUDA mapped-host fallback enabled: device budget %.2f MiB, mapped budget %.2f MiB\n",
+                device_budget / 1024.0 / 1024.0,
+                mapped_budget / 1024.0 / 1024.0);
+        });
+
+        std::lock_guard<std::mutex> lock(ggml_cuda_mapped_allocations_mutex);
+        const bool fits_device = size <= device_budget - std::min(device_budget, ggml_cuda_device_allocated_bytes[device]);
+
+        if (fits_device) {
+            cudaError_t err = cudaMalloc(ptr, size);
+            if (err == cudaSuccess) {
+                ggml_cuda_mapped_allocations[*ptr] = { nullptr, size, device, false };
+                ggml_cuda_device_allocated_bytes[device] += size;
+                return cudaSuccess;
+            }
+            (void) cudaGetLastError();
+            GGML_LOG_WARN(
+                "cudaMalloc of %.2f MiB failed below the configured device budget; trying mapped shared memory\n",
+                size / 1024.0 / 1024.0);
+        }
+
+        if (size > mapped_budget - std::min(mapped_budget, ggml_cuda_mapped_allocated_bytes[device])) {
+            GGML_LOG_ERROR(
+                "mapped shared-memory allocation of %.2f MiB would exceed the configured %.2f MiB budget\n",
+                size / 1024.0 / 1024.0,
+                mapped_budget / 1024.0 / 1024.0);
+            return cudaErrorMemoryAllocation;
+        }
+
+        void * host_ptr = nullptr;
+        cudaError_t err = cudaHostAlloc(&host_ptr, size, cudaHostAllocPortable | cudaHostAllocMapped);
+        if (err != cudaSuccess) {
+            return err;
+        }
+
+        err = cudaHostGetDevicePointer(ptr, host_ptr, 0);
+        if (err != cudaSuccess) {
+            (void) cudaFreeHost(host_ptr);
+            return err;
+        }
+
+        ggml_cuda_mapped_allocations[*ptr] = { host_ptr, size, device, true };
+        ggml_cuda_mapped_allocated_bytes[device] += size;
+        GGML_LOG_INFO(
+            "CUDA mapped shared allocation: %.2f MiB (device total %.2f MiB, mapped total %.2f MiB)\n",
+            size / 1024.0 / 1024.0,
+            ggml_cuda_device_allocated_bytes[device] / 1024.0 / 1024.0,
+            ggml_cuda_mapped_allocated_bytes[device] / 1024.0 / 1024.0);
+        return cudaSuccess;
+    }
+
     cudaError_t err;
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         err = cudaMallocManaged(ptr, size);
@@ -443,7 +567,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
-                CUDA_CHECK(cudaFree(b.ptr));
+                CUDA_CHECK(ggml_cuda_device_free(b.ptr));
                 pool_size -= b.size;
                 b.ptr  = nullptr;
                 b.size = 0;
@@ -527,7 +651,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaFree(ptr));
+        CUDA_CHECK(ggml_cuda_device_free(ptr));
         pool_size -= size;
     }
 };
@@ -736,7 +860,7 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        CUDA_CHECK(ggml_cuda_device_free(dev_ptr));
     }
 };
 
