@@ -18,6 +18,7 @@ MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org/tiny-llamas/resolve/main
 MODEL_TINY_FILE_URL = "https://huggingface.co/ggml-org/test-model-stories260K/resolve/main/stories260K-f32.gguf"
 KV_PRESSURE_API_KEY = "kv-pressure-test-key"
 KV_PRESSURE_AUTH = {"Authorization": f"Bearer {KV_PRESSURE_API_KEY}"}
+TELEMETRY_API_KEY = "telemetry-test-key"
 
 KV_PRESSURE_EVENT_KINDS = {
     "utilization_sample",
@@ -39,6 +40,39 @@ def create_server():
     global server
     server = ServerPreset.tinyllama2()
     server.server_metrics = True
+    configure_telemetry_server()
+
+
+def configure_telemetry_server():
+    server.server_props = True
+    server.api_key = TELEMETRY_API_KEY
+    request = server.make_request
+
+    def authenticated_request(method, path, data=None, **kwargs):
+        headers = {"Authorization": f"Bearer {server.api_key}"}
+        headers.update(kwargs.pop("headers", None) or {})
+        return request(method, path, data=data, headers=headers, **kwargs)
+
+    server.make_request = authenticated_request
+
+
+def apply_telemetry_control(**features):
+    response = server.make_request(
+        "POST",
+        "/props",
+        data={"telemetry_control": features},
+    )
+    assert response.status_code == 200
+    assert response.body["telemetry_control"]["effective"] == {
+        "moe_routing": features.get("moe_routing", False),
+        "output_token_detail": features.get("output_token_detail", False),
+        "token_candidates": features.get("token_candidates", False),
+        "prompt_perplexity": features.get("prompt_perplexity", False),
+        "request_content": features.get("request_content", False),
+        "kv_pressure_detail": features.get("kv_pressure_detail", False),
+        "native_gpu_gpm": features.get("native_gpu_gpm", False),
+    }
+    return response.body["telemetry_control"]
 
 
 def completed_event(trace_id):
@@ -1026,8 +1060,8 @@ def test_telemetry_lifecycle_cache_and_cursor():
     assert capabilities.body["schema_version"] == 1
     assert capabilities.body["capabilities"]["request_lifecycle"]["state"] == "available"
     assert capabilities.body["capabilities"]["moe_routing"]["state"] == "not_applicable"
-    assert capabilities.body["capabilities"]["output_token_telemetry"]["state"] == "disabled"
-    assert "LLAMA_TELEMETRY_OUTPUT_TOKENS=1" in capabilities.body["capabilities"]["output_token_telemetry"]["reason"]
+    assert capabilities.body["capabilities"]["output_token_telemetry"]["state"] == "conditional"
+    assert "POST /props telemetry_control.output_token_detail=true" in capabilities.body["capabilities"]["output_token_telemetry"]["enable_with"]
 
     invalid_cursor = server.make_request("GET", "/telemetry/v1/events?cursor=-1")
     assert invalid_cursor.status_code == 400
@@ -1076,11 +1110,11 @@ def test_telemetry_lifecycle_cache_and_cursor():
     assert event["timings"]["ttft_ms"] >= event["timings"]["queue_ms"] >= 0
     assert event["timings"]["e2e_ms"] >= event["timings"]["ttft_ms"]
     token_detail = event["output_token_telemetry"]
-    assert token_detail["state"] == "disabled"
+    assert token_detail["state"] == "not_enabled_for_request"
     assert token_detail["captured_tokens"] == 0
     assert token_detail["dropped_tokens"] == token_detail["total_committed_tokens"]
-    assert token_detail["probability_state"] == "disabled"
-    assert token_detail["mtp_pass_state"] == "disabled"
+    assert token_detail["probability_state"] == "not_enabled_for_request"
+    assert token_detail["mtp_pass_state"] == "not_enabled_for_request"
     assert token_detail["mtp_pass_records"] == []
     assert token_detail["records"] == []
     assert_complete_lifecycle_clock(event)
@@ -1098,10 +1132,9 @@ def test_telemetry_lifecycle_cache_and_cursor():
 
 
 def test_output_token_telemetry_is_bounded_opt_in_with_independent_probability_and_identity(monkeypatch):
-    monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKENS", "1")
     monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKEN_LIMIT", "32")
-    monkeypatch.delenv("LLAMA_TELEMETRY_CONTENT", raising=False)
     server.start()
+    apply_telemetry_control(output_token_detail=True)
 
     capabilities = server.make_request("GET", "/telemetry/v1/capabilities")
     assert capabilities.status_code == 200
@@ -1131,7 +1164,7 @@ def test_output_token_telemetry_is_bounded_opt_in_with_independent_probability_a
         "actual_target_pass",
         "proposal_position",
     }
-    assert capability["normal_request_telemetry_unaffected"] is True
+    assert capability["normal_request_telemetry_unaffected"] is False
 
     response = server.make_request(
         "POST",
@@ -1197,7 +1230,11 @@ def test_output_token_telemetry_is_bounded_opt_in_with_independent_probability_a
     no_request_opt_in = server.make_request(
         "POST",
         "/completion",
-        data={"prompt": "No request-level diagnostic opt in", "n_predict": 1},
+        data={
+            "prompt": "Explicit request-level diagnostic opt out",
+            "n_predict": 1,
+            "output_token_telemetry": False,
+        },
     )
     assert no_request_opt_in.status_code == 200
     not_enabled = completed_event(no_request_opt_in.body["trace_id"])["output_token_telemetry"]
@@ -1229,9 +1266,9 @@ def test_output_token_telemetry_is_bounded_opt_in_with_independent_probability_a
 
 @pytest.mark.parametrize("configured_limit,expected_limit", [(8192, 8192), (8193, 8192)])
 def test_output_token_limit_accepts_8192_and_clamps_larger_values(monkeypatch, configured_limit, expected_limit):
-    monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKENS", "1")
     monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKEN_LIMIT", str(configured_limit))
     server.start()
+    apply_telemetry_control(output_token_detail=True)
 
     capability = server.make_request(
         "GET", "/telemetry/v1/capabilities"
@@ -1242,9 +1279,8 @@ def test_output_token_limit_accepts_8192_and_clamps_larger_values(monkeypatch, c
 
 
 def test_output_token_identity_follows_the_separate_content_policy(monkeypatch):
-    monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKENS", "1")
-    monkeypatch.setenv("LLAMA_TELEMETRY_CONTENT", "1")
     server.start()
+    apply_telemetry_control(output_token_detail=True, request_content=True)
 
     response = server.make_request(
         "POST",
@@ -1275,10 +1311,7 @@ def test_output_token_identity_follows_the_separate_content_policy(monkeypatch):
     assert event["response"] == response.body["content"]
 
 
-def test_all_output_token_admin_gates_enable_request_defaults(monkeypatch):
-    monkeypatch.setenv("LLAMA_TELEMETRY_CONTENT", "1")
-    monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKENS", "1")
-    monkeypatch.setenv("LLAMA_TELEMETRY_TOKEN_CANDIDATES", "1")
+def test_output_token_control_enables_request_defaults():
     model_path = os.environ.get("LLAMA_TEST_MODEL_PATH", "")
     if "qwen" in os.path.basename(model_path).lower():
         server.spec_type = "draft-mtp"
@@ -1289,13 +1322,18 @@ def test_all_output_token_admin_gates_enable_request_defaults(monkeypatch):
         server.spec_ngram_simple_size_m = 3
         server.spec_ngram_simple_min_hits = 1
     server.start()
+    apply_telemetry_control(
+        output_token_detail=True,
+        token_candidates=True,
+        request_content=True,
+    )
 
     capabilities = server.make_request("GET", "/telemetry/v1/capabilities")
     assert capabilities.status_code == 200
     output_capability = capabilities.body["capabilities"]["output_token_telemetry"]
     candidate_capability = capabilities.body["capabilities"]["output_token_candidates"]
-    assert output_capability["state"] == "available"
-    assert candidate_capability["state"] == "available"
+    assert output_capability["state"] == "conditional"
+    assert candidate_capability["state"] == "conditional"
     assert output_capability["automatic_request_defaults"] is True
     assert candidate_capability["automatic_request_defaults"] is True
     assert output_capability["normal_request_telemetry_unaffected"] is False
@@ -1307,6 +1345,7 @@ def test_all_output_token_admin_gates_enable_request_defaults(monkeypatch):
         data={
             "prompt": "repeat:",
             "n_predict": 12,
+            "n_probs": 1,
             "temperature": 0,
             "ignore_eos": True,
             "grammar": 'root ::= " a a a a a a a a a a a a"',
@@ -1641,6 +1680,7 @@ def test_response_probability_invariant():
 
 def test_prompt_perplexity_is_exact_and_opt_in():
     server.start()
+    apply_telemetry_control(prompt_perplexity=True)
     response = server.make_request(
         "POST",
         "/completion",
@@ -1680,7 +1720,7 @@ def test_prompt_perplexity_is_exact_and_opt_in():
     disabled = server.make_request(
         "POST",
         "/completion",
-        data={"prompt": "prompt perplexity disabled", "n_predict": 1},
+        data={"prompt": "prompt perplexity disabled", "n_predict": 1, "prompt_perplexity": False},
     )
     assert disabled.status_code == 200
     disabled_probability = completed_event(disabled.body["trace_id"])["prompt_probability"]
@@ -1698,10 +1738,11 @@ def test_moe_routing_states_and_bounded_histogram(monkeypatch):
     monkeypatch.delenv("LLAMA_TELEMETRY_MOE_ACTIVATION_LIMIT", raising=False)
     server = ServerPreset.stories15m_moe()
     server.server_metrics = True
+    configure_telemetry_server()
     server.start()
 
     capability = server.make_request("GET", "/telemetry/v1/capabilities").body["capabilities"]["moe_routing"]
-    assert capability["state"] == "disabled"
+    assert capability["state"] == "conditional"
     assert capability["configured_experts"] == 4
     assert capability["experts_per_token"] == 2
     assert capability["disabled_path_changes_graph"] is False
@@ -1713,23 +1754,24 @@ def test_moe_routing_states_and_bounded_histogram(monkeypatch):
     )
     assert disabled_response.status_code == 200
     disabled = completed_event(disabled_response.body["trace_id"])["moe_routing"]
-    assert disabled["state"] == "disabled"
+    assert disabled["state"] == "not_enabled_for_request"
     assert disabled["configuration_state"] == "available"
     assert disabled["configured_experts"] == 4
     assert disabled["expert_activations"] == []
-    assert disabled["token_detail_state"] == "disabled"
+    assert disabled["token_detail_state"] == "not_enabled_for_request"
     assert disabled["token_detail_reason"]
-    assert disabled["selected_expert_ids_state"] == "disabled"
-    assert disabled["routing_weights_state"] == "disabled"
-    assert disabled["router_margin_state"] == "disabled"
+    assert disabled["selected_expert_ids_state"] == "not_enabled_for_request"
+    assert disabled["routing_weights_state"] == "not_enabled_for_request"
+    assert disabled["router_margin_state"] == "not_enabled_for_request"
     assert disabled["token_decisions"] == []
     server.stop()
 
-    monkeypatch.setenv("LLAMA_TELEMETRY_MOE_ROUTING", "1")
     monkeypatch.setenv("LLAMA_TELEMETRY_MOE_ACTIVATION_LIMIT", "1024")
     server = ServerPreset.stories15m_moe()
     server.server_metrics = True
+    configure_telemetry_server()
     server.start()
+    apply_telemetry_control(moe_routing=True)
 
     capability = server.make_request("GET", "/telemetry/v1/capabilities").body["capabilities"]["moe_routing"]
     assert capability["state"] == "conditional"
@@ -1743,7 +1785,11 @@ def test_moe_routing_states_and_bounded_histogram(monkeypatch):
     plain_response = server.make_request(
         "POST",
         "/completion",
-        data={"prompt": "request without the diagnostic", "n_predict": 1},
+        data={
+            "prompt": "explicit request opt out",
+            "n_predict": 1,
+            "moe_routing_telemetry": False,
+        },
     )
     assert plain_response.status_code == 200
     plain = completed_event(plain_response.body["trace_id"])["moe_routing"]
@@ -1841,16 +1887,17 @@ def test_moe_routing_states_and_bounded_histogram(monkeypatch):
 def test_moe_exact_token_linkage_survives_speculative_verification(monkeypatch):
     global server
 
-    monkeypatch.setenv("LLAMA_TELEMETRY_MOE_ROUTING", "1")
     monkeypatch.setenv("LLAMA_TELEMETRY_MOE_ACTIVATION_LIMIT", "4096")
     server = ServerPreset.stories15m_moe()
     server.server_metrics = True
+    configure_telemetry_server()
     server.model_draft = os.environ.get("LLAMA_TEST_DRAFT_MODEL_PATH") or download_file(MODEL_DRAFT_FILE_URL)
     server.spec_type = "draft-simple"
     server.spec_draft_n_min = 1
     server.spec_draft_n_max = 4
     server.fa = "off"
     server.start()
+    apply_telemetry_control(moe_routing=True)
 
     response = server.make_request(
         "POST",
@@ -1949,7 +1996,6 @@ def test_native_gpu_gpm_capability_and_bounded_endpoint():
 
 
 def test_speculative_invariants_and_ttft(monkeypatch):
-    monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKENS", "1")
     model_path = os.environ.get("LLAMA_TEST_MODEL_PATH", "")
     use_embedded_mtp = "qwen" in os.path.basename(model_path).lower()
     if use_embedded_mtp:
@@ -1964,6 +2010,7 @@ def test_speculative_invariants_and_ttft(monkeypatch):
         server.spec_ngram_simple_size_m = 3
         server.spec_ngram_simple_min_hits = 1
     server.start()
+    apply_telemetry_control(output_token_detail=True)
     content_enabled = (
         server.make_request("GET", "/telemetry/v1/capabilities")
         .body["capabilities"]["content_events"]["state"]
@@ -2156,10 +2203,7 @@ def test_speculative_invariants_and_ttft(monkeypatch):
 
 
 def test_mtp_target_candidate_detail_is_lazy_bounded_and_independently_stateful(monkeypatch):
-    monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKENS", "1")
-    monkeypatch.setenv("LLAMA_TELEMETRY_TOKEN_CANDIDATES", "1")
     monkeypatch.setenv("LLAMA_TELEMETRY_TOKEN_CANDIDATE_MAX_BYTES", "32768")
-    monkeypatch.delenv("LLAMA_TELEMETRY_CONTENT", raising=False)
     model_path = os.environ.get("LLAMA_TEST_MODEL_PATH", "")
     if "qwen" in os.path.basename(model_path).lower():
         server.spec_type = "draft-mtp"
@@ -2170,6 +2214,7 @@ def test_mtp_target_candidate_detail_is_lazy_bounded_and_independently_stateful(
         server.spec_ngram_simple_size_m = 3
         server.spec_ngram_simple_min_hits = 1
     server.start()
+    apply_telemetry_control(output_token_detail=True, token_candidates=True)
 
     capability = server.make_request("GET", "/telemetry/v1/capabilities")
     assert capability.status_code == 200
@@ -2271,6 +2316,7 @@ def test_mtp_target_candidate_detail_is_lazy_bounded_and_independently_stateful(
             "prompt": "repeat:",
             "n_predict": 8,
             "output_token_telemetry": True,
+            "output_token_candidate_telemetry": False,
             "temperature": 0,
             "grammar": 'root ::= " a a a a a a a a"',
         },
@@ -2293,9 +2339,6 @@ def test_mtp_target_candidate_detail_is_lazy_bounded_and_independently_stateful(
 
 
 def test_mtp_target_candidate_content_identity_and_accepted_position_gate(monkeypatch):
-    monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKENS", "1")
-    monkeypatch.setenv("LLAMA_TELEMETRY_TOKEN_CANDIDATES", "1")
-    monkeypatch.setenv("LLAMA_TELEMETRY_CONTENT", "1")
     model_path = os.environ.get("LLAMA_TEST_MODEL_PATH", "")
     if "qwen" in os.path.basename(model_path).lower():
         server.spec_type = "draft-mtp"
@@ -2306,6 +2349,11 @@ def test_mtp_target_candidate_content_identity_and_accepted_position_gate(monkey
         server.spec_ngram_simple_size_m = 3
         server.spec_ngram_simple_min_hits = 1
     server.start()
+    apply_telemetry_control(
+        output_token_detail=True,
+        token_candidates=True,
+        request_content=True,
+    )
 
     response = server.make_request(
         "POST",
@@ -2353,13 +2401,12 @@ def test_mtp_target_candidate_content_identity_and_accepted_position_gate(monkey
 
 
 def test_token_candidate_bounded_ring_reports_expired_trace(monkeypatch):
-    monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKENS", "1")
-    monkeypatch.setenv("LLAMA_TELEMETRY_TOKEN_CANDIDATES", "1")
     server.spec_type = "ngram-simple"
     server.spec_ngram_simple_size_n = 2
     server.spec_ngram_simple_size_m = 3
     server.spec_ngram_simple_min_hits = 1
     server.start()
+    apply_telemetry_control(output_token_detail=True, token_candidates=True)
 
     first_trace_id = None
     latest_trace_id = None
@@ -2399,9 +2446,7 @@ def test_token_candidate_bounded_ring_reports_expired_trace(monkeypatch):
     assert latest.body["state"] in ["no_data", "available", "truncated"]
 
 
-def test_mtp_target_candidate_admin_gate_keeps_disabled_state_visible(monkeypatch):
-    monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKENS", "1")
-    monkeypatch.delenv("LLAMA_TELEMETRY_TOKEN_CANDIDATES", raising=False)
+def test_mtp_target_candidate_requires_global_control():
     model_path = os.environ.get("LLAMA_TEST_MODEL_PATH", "")
     if "qwen" in os.path.basename(model_path).lower():
         server.spec_type = "draft-mtp"
@@ -2412,11 +2457,12 @@ def test_mtp_target_candidate_admin_gate_keeps_disabled_state_visible(monkeypatc
         server.spec_ngram_simple_size_m = 3
         server.spec_ngram_simple_min_hits = 1
     server.start()
+    apply_telemetry_control(output_token_detail=True)
 
     capability = server.make_request("GET", "/telemetry/v1/capabilities")
     candidate_capability = capability.body["capabilities"]["output_token_candidates"]
-    assert candidate_capability["state"] == "disabled"
-    assert "LLAMA_TELEMETRY_TOKEN_CANDIDATES=1" in candidate_capability["reason"]
+    assert candidate_capability["state"] == "conditional"
+    assert "telemetry_control.token_candidates=true" in candidate_capability["enable_with"]
 
     response = server.make_request(
         "POST",
@@ -2433,15 +2479,15 @@ def test_mtp_target_candidate_admin_gate_keeps_disabled_state_visible(monkeypatc
     assert response.status_code == 200
     trace_id = response.body["trace_id"]
     summary = completed_event(trace_id)["output_token_telemetry"]
-    assert summary["candidate_detail_state"] == "disabled"
-    assert "LLAMA_TELEMETRY_TOKEN_CANDIDATES=1" in summary["candidate_detail_reason"]
+    assert summary["candidate_detail_state"] == "not_enabled_for_request"
+    assert "output_token_candidate_telemetry=true" in summary["candidate_detail_reason"]
     detail = server.make_request(
         "GET",
         f"/telemetry/v1/token-candidates?trace_id={trace_id}",
     )
     assert detail.status_code == 200
     assert detail.body["schema_version"] == 2
-    assert detail.body["state"] == "disabled"
-    assert detail.body["token_identity_state"] == "disabled"
-    assert detail.body["token_piece_state"] == "disabled"
+    assert detail.body["state"] == "not_captured"
+    assert detail.body["token_identity_state"] == "not_captured"
+    assert detail.body["token_piece_state"] == "not_captured"
     assert detail.body["decisions"] == []
