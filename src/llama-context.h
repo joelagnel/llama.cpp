@@ -118,6 +118,11 @@ struct llama_context {
     void set_moe_routing(bool value);
     const llama_moe_routing_entry * get_moe_routing(size_t * count);
     const llama_moe_routing_readback * get_moe_routing_readback();
+
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+    void reset_moe_routing_test_observer();
+    llama_moe_routing_test_observer get_moe_routing_test_observer() const;
+#endif
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -364,6 +369,10 @@ private:
     llama_moe_routing_readback moe_routing_readback;
     uint64_t moe_routing_capture_generation = 0;
     bool moe_routing_readback_ready = false;
+
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+    llama_moe_routing_test_observer moe_routing_test_observer;
+#endif
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

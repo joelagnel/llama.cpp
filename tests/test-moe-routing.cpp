@@ -28,6 +28,36 @@ static bool decode_many(llama_context * ctx, llama_token token, llama_pos pos, i
     return ok;
 }
 
+static bool expect_empty_moe_routing_observer(llama_context * ctx, const char * phase) {
+    const auto observer = llama_moe_routing_test_observer_get(ctx);
+    if (observer.enabled || observer.reserve_pending || observer.graph_reserve_invalidations != 0 ||
+            observer.graph_reserves != 0 || observer.graph_output_extractions != 0 ||
+            observer.readback_allocations != 0 || observer.readback_copies != 0 ||
+            observer.synchronizations != 0 || observer.batch_peer_reads != 0) {
+        fprintf(stderr, "%s: unexpected MoE work in %s\n", __func__, phase);
+        return false;
+    }
+#ifdef LLAMA_MOE_ROUTING_TEST_CUDA
+    if (observer.device_to_host_copies != 0) {
+        fprintf(stderr, "%s: unexpected CUDA readback in %s\n", __func__, phase);
+        return false;
+    }
+#endif
+    return true;
+}
+
+static bool expect_enabled_moe_routing_observer(llama_context * ctx) {
+    const auto observer = llama_moe_routing_test_observer_get(ctx);
+    if (!observer.enabled || observer.reserve_pending || observer.graph_reserves == 0 ||
+            observer.graph_output_extractions == 0 || observer.readback_allocations == 0 ||
+            observer.readback_copies == 0 || observer.synchronizations == 0 ||
+            observer.batch_peer_reads == 0) {
+        fprintf(stderr, "%s: missing enabled MoE work\n", __func__);
+        return false;
+    }
+    return true;
+}
+
 static bool expect_no_moe_routing(llama_context * ctx) {
     size_t count = 1;
     const llama_moe_routing_entry * entries = llama_get_moe_routing(ctx, &count);
@@ -162,7 +192,14 @@ static bool test_dense_model(llama_model * model, const common_params & params) 
     }
 
     llama_set_moe_routing(ctx_off.get(), false);
+    llama_moe_routing_test_observer_reset(ctx_off.get());
+    llama_moe_routing_test_observer_reset(ctx_dense.get());
     llama_set_moe_routing(ctx_dense.get(), true);
+
+    if (!expect_empty_moe_routing_observer(ctx_off.get(), "dense disabled setup") ||
+            !expect_empty_moe_routing_observer(ctx_dense.get(), "dense enabled setup")) {
+        return false;
+    }
 
     for (llama_pos pos = 0; pos < 3; ++pos) {
         const llama_token token = (llama_token) (pos + 1);
@@ -173,6 +210,10 @@ static bool test_dense_model(llama_model * model, const common_params & params) 
             return false;
         }
         if (!expect_no_moe_routing(ctx_off.get()) || !expect_no_moe_routing(ctx_dense.get())) {
+            return false;
+        }
+        if (!expect_empty_moe_routing_observer(ctx_off.get(), "dense disabled decode") ||
+                !expect_empty_moe_routing_observer(ctx_dense.get(), "dense enabled decode")) {
             return false;
         }
     }
@@ -198,8 +239,10 @@ static bool test_moe_model(llama_model * model, const common_params & params) {
     }
 
     llama_set_moe_routing(ctx.get(), false);
+    llama_moe_routing_test_observer_reset(ctx.get());
     if (!decode_one(ctx_plain.get(), 1, 0) || !decode_one(ctx.get(), 1, 0) ||
-            !expect_no_moe_routing(ctx.get())) {
+            !expect_no_moe_routing(ctx.get()) ||
+            !expect_empty_moe_routing_observer(ctx.get(), "MoE disabled decode")) {
         return false;
     }
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -208,7 +251,18 @@ static bool test_moe_model(llama_model * model, const common_params & params) {
     }
 
     llama_set_moe_routing(ctx.get(), true);
+    {
+        const auto observer = llama_moe_routing_test_observer_get(ctx.get());
+        if (!observer.enabled || !observer.reserve_pending || observer.graph_reserve_invalidations != 1) {
+            fprintf(stderr, "%s: enabling MoE routing did not invalidate the graph once\n", __func__);
+            return false;
+        }
+    }
+    llama_moe_routing_test_observer_reset(ctx.get());
     if (!decode_many(ctx.get(), 2, 1, 3) || !expect_moe_routing(ctx.get(), n_expert, n_expert_used, 3)) {
+        return false;
+    }
+    if (!expect_enabled_moe_routing_observer(ctx.get())) {
         return false;
     }
 
@@ -217,8 +271,14 @@ static bool test_moe_model(llama_model * model, const common_params & params) {
         return false;
     }
 
+    llama_moe_routing_test_observer_reset(ctx.get());
+    if (!decode_one(ctx.get(), 6, 5) || !expect_no_moe_routing(ctx.get()) ||
+            !expect_empty_moe_routing_observer(ctx.get(), "MoE disabled steady state")) {
+        return false;
+    }
+
     llama_set_moe_routing(ctx.get(), true);
-    if (!decode_one(ctx.get(), 6, 5) || !expect_moe_routing(ctx.get(), n_expert, n_expert_used, 1)) {
+    if (!decode_one(ctx.get(), 7, 6) || !expect_moe_routing(ctx.get(), n_expert, n_expert_used, 1)) {
         return false;
     }
 

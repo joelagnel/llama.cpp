@@ -198,6 +198,27 @@ struct llama_moe_routing_readback {
 LLAMA_API const llama_moe_routing_readback * llama_get_moe_routing_readback(
         struct llama_context * ctx);
 
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+// Test-only counters for proving that inactive routing diagnostics do not
+// affect graph execution or readback work.
+struct llama_moe_routing_test_observer {
+    bool enabled = false;
+    bool reserve_pending = false;
+    uint64_t graph_reserve_invalidations = 0;
+    uint64_t graph_reserves = 0;
+    uint64_t graph_output_extractions = 0;
+    uint64_t readback_allocations = 0;
+    uint64_t readback_copies = 0;
+    uint64_t device_to_host_copies = 0;
+    uint64_t synchronizations = 0;
+    uint64_t batch_peer_reads = 0;
+};
+
+LLAMA_API void llama_moe_routing_test_observer_reset(struct llama_context * ctx);
+LLAMA_API llama_moe_routing_test_observer llama_moe_routing_test_observer_get(
+        const struct llama_context * ctx);
+#endif
+
 struct llama_memory_churn_data {
     uint64_t entries_allocated = 0;
     uint64_t entries_released = 0;

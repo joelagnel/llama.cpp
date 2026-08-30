@@ -57,6 +57,10 @@ target_compile_definitions(llama PRIVATE
     LLAMA_COMMIT="${LLAMA_BUILD_COMMIT}"
 )
 
+if (LLAMA_BUILD_TESTS)
+    target_compile_definitions(llama PRIVATE LLAMA_MOE_ROUTING_TEST_HOOKS)
+endif()
+
 target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump

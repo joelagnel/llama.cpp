@@ -586,6 +586,10 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+    ++moe_routing_test_observer.graph_reserves;
+#endif
+
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
@@ -1187,26 +1191,30 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 }
 
 void llama_context::set_moe_routing(bool value) {
+    if (model.hparams.n_expert == 0) {
+        return;
+    }
+
     if (cparams.moe_routing == value) {
         return;
     }
 
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
-    const bool has_moe = model.hparams.n_expert > 0;
-    if (!has_moe) {
-        cparams.moe_routing = value;
-        return;
-    }
-
     // Only a graph that retained MoE outputs can have an asynchronous capture.
     if (moe_routing_capture_count > 0) {
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+        ++moe_routing_test_observer.synchronizations;
+#endif
         synchronize();
     }
 
     cparams.moe_routing = value;
     clear_moe_routing_readback();
     sched_need_reserve = true;
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+    ++moe_routing_test_observer.graph_reserve_invalidations;
+#endif
 }
 
 void llama_context::clear_moe_routing_readback() {
@@ -1229,6 +1237,9 @@ void llama_context::materialize_moe_routing_readback() {
         return;
     }
 
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+    ++moe_routing_test_observer.synchronizations;
+#endif
     synchronize();
     moe_routing_entries.clear();
     moe_routing_readback_rows.clear();
@@ -1239,7 +1250,15 @@ void llama_context::materialize_moe_routing_readback() {
     for (size_t i = 0; i < moe_routing_capture_count; ++i) {
         total_rows += moe_routing_captures[i].token_count;
     }
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+    const size_t row_capacity = moe_routing_readback_rows.capacity();
+#endif
     moe_routing_readback_rows.reserve(total_rows);
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+    if (moe_routing_readback_rows.capacity() > row_capacity) {
+        ++moe_routing_test_observer.readback_allocations;
+    }
+#endif
 
     auto read_element = [](const moe_routing_tensor_capture & capture, size_t element, auto * value) {
         if (capture.status != LLAMA_MOE_ROUTING_VALUE_STATUS_VALID) {
@@ -1303,7 +1322,15 @@ void llama_context::materialize_moe_routing_readback() {
                 row.row_identity_status = identity.status;
             }
 
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+            const size_t expert_capacity = materialized.selected_experts.capacity();
+#endif
             materialized.selected_experts.resize(capture.experts_per_token);
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+            if (materialized.selected_experts.capacity() > expert_capacity) {
+                ++moe_routing_test_observer.readback_allocations;
+            }
+#endif
             for (size_t expert = 0; expert < capture.experts_per_token; ++expert) {
                 auto & selected = materialized.selected_experts[expert];
                 selected.expert_index_status = capture.selected_experts.status;
@@ -1359,7 +1386,15 @@ void llama_context::materialize_moe_routing_readback() {
         }
     }
 
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+    const size_t view_capacity = moe_routing_readback_rows_view.capacity();
+#endif
     moe_routing_readback_rows_view.reserve(moe_routing_readback_rows.size());
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+    if (moe_routing_readback_rows_view.capacity() > view_capacity) {
+        ++moe_routing_test_observer.readback_allocations;
+    }
+#endif
     for (auto & materialized : moe_routing_readback_rows) {
         materialized.row.selected_experts = materialized.selected_experts.empty()
             ? nullptr
@@ -1393,6 +1428,19 @@ const llama_moe_routing_readback * llama_context::get_moe_routing_readback() {
     }
     return &moe_routing_readback;
 }
+
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+void llama_context::reset_moe_routing_test_observer() {
+    moe_routing_test_observer = {};
+}
+
+llama_moe_routing_test_observer llama_context::get_moe_routing_test_observer() const {
+    auto result = moe_routing_test_observer;
+    result.enabled = cparams.moe_routing;
+    result.reserve_pending = sched_need_reserve;
+    return result;
+}
+#endif
 
 const llama_moe_routing_entry * llama_context::get_moe_routing(size_t * count) {
     GGML_ASSERT(count != nullptr);
@@ -1909,6 +1957,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // reusable host buffers can be overwritten. This synchronization is
         // confined to the explicitly enabled diagnostic path.
         if (moe_routing_capture_count > 0) {
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+            ++moe_routing_test_observer.synchronizations;
+#endif
             synchronize();
         }
         ++moe_routing_capture_generation;
@@ -2207,6 +2258,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
         if (res->has_moe_routing_outputs()) {
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+            ++moe_routing_test_observer.graph_output_extractions;
+#endif
             extract_moe_routing(res, n_tokens_prev, physical_ubatch_index, ubatch);
         }
 
@@ -2517,7 +2571,15 @@ void llama_context::extract_moe_routing(
             capture.ne[dim] = tensor->ne[dim];
             capture.nb[dim] = tensor->nb[dim];
         }
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+        const size_t data_capacity = capture.data.capacity();
+#endif
         capture.data.resize(ggml_nbytes(tensor));
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+        if (capture.data.capacity() > data_capacity) {
+            ++moe_routing_test_observer.readback_allocations;
+        }
+#endif
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
         if (backend == nullptr) {
@@ -2527,6 +2589,12 @@ void llama_context::extract_moe_routing(
         }
 
         ggml_backend_tensor_get_async(backend, tensor, capture.data.data(), 0, capture.data.size());
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+        ++moe_routing_test_observer.readback_copies;
+        if (backend != backend_cpu) {
+            ++moe_routing_test_observer.device_to_host_copies;
+        }
+#endif
         capture.status = LLAMA_MOE_ROUTING_VALUE_STATUS_VALID;
     };
 
@@ -2560,10 +2628,21 @@ void llama_context::extract_moe_routing(
         capture.experts_per_token = (size_t) selected_experts->ne[0];
         capture.token_count = (size_t) ggml_nelements(selected_experts)/capture.experts_per_token;
         capture.has_row_shape = true;
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+        const size_t identity_capacity = capture.row_identities.capacity();
+#endif
         capture.row_identities.resize(capture.token_count);
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+        if (capture.row_identities.capacity() > identity_capacity) {
+            ++moe_routing_test_observer.readback_allocations;
+        }
+#endif
         capture_tensor(selected_experts, GGML_TYPE_I32, capture.selected_experts);
 
         if (capture.token_count == ubatch.n_tokens) {
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+            moe_routing_test_observer.batch_peer_reads += capture.token_count;
+#endif
             for (size_t token = 0; token < capture.token_count; ++token) {
                 capture.row_identities[token] = {
                     (int32_t) token,
@@ -2575,6 +2654,9 @@ void llama_context::extract_moe_routing(
             }
         } else if (ubatch.output != nullptr) {
             size_t row = 0;
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+            moe_routing_test_observer.batch_peer_reads += ubatch.n_tokens;
+#endif
             for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
                 if (ubatch.output[token]) {
                     if (row == capture.token_count) {
@@ -4235,6 +4317,16 @@ const llama_moe_routing_entry * llama_get_moe_routing(llama_context * ctx, size_
 const llama_moe_routing_readback * llama_get_moe_routing_readback(llama_context * ctx) {
     return ctx->get_moe_routing_readback();
 }
+
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+void llama_moe_routing_test_observer_reset(llama_context * ctx) {
+    ctx->reset_moe_routing_test_observer();
+}
+
+llama_moe_routing_test_observer llama_moe_routing_test_observer_get(const llama_context * ctx) {
+    return ctx->get_moe_routing_test_observer();
+}
+#endif
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
