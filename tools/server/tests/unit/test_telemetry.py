@@ -525,37 +525,56 @@ def test_kv_pressure_identity_stays_waiting_across_multiple_retry_slices():
     server.kv_unified = True
     server.no_cache_idle_slots = True
     server.enable_ctx_shift = False
+    server.server_slots = True
     server.start()
 
     token = one_token_without_special_tokens()
-    background = server.make_stream_request(
-        "POST",
-        "/completion",
-        data={
-            "prompt": [token] * 482,
-            "n_predict": 25,
-            "ignore_eos": True,
-            "temperature": 0,
-            "cache_prompt": True,
-            "stream": True,
-        },
-    )
-    next(background)
-    response = server.make_request(
-        "POST",
-        "/completion",
-        data={
-            "prompt": [[token] * 12, [token] * 20],
-            "n_predict": 1,
-            "ignore_eos": True,
-            "temperature": 0,
-            "cache_prompt": True,
-        },
-    )
+    background_data = {
+        "prompt": [token] * 482,
+        "n_predict": 25,
+        "ignore_eos": True,
+        "temperature": 0,
+        "cache_prompt": True,
+    }
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        background = executor.submit(
+            server.make_request, "POST", "/completion", background_data
+        )
+        deadline = time.monotonic() + 10
+        background_prompt_tokens = 0
+        while time.monotonic() < deadline and not background.done():
+            slots = requests.get(
+                f"http://{server.server_host}:{server.server_port}/slots", timeout=1
+            )
+            assert slots.status_code == 200
+            active_slots = [slot for slot in slots.json() if slot["is_processing"]]
+            if active_slots:
+                background_prompt_tokens = max(
+                    slot.get("n_prompt_tokens_processed", 0) for slot in active_slots
+                )
+                if background_prompt_tokens >= 462:
+                    break
+            time.sleep(0.001)
+        assert background_prompt_tokens >= 462, (
+            "background request did not reach the final prompt slice"
+        )
+        response = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": [[token] * 12, [token] * 20],
+                "n_predict": 1,
+                "ignore_eos": True,
+                "temperature": 0,
+                "cache_prompt": True,
+            },
+        )
+        background_response = background.result()
+    assert background_response.status_code == 200
     assert response.status_code == 200
     assert isinstance(response.body, list)
     assert len(response.body) == 2
-    list(background)
 
     short_trace = min(response.body, key=lambda result: result["tokens_evaluated"])["trace_id"]
     long_trace = max(response.body, key=lambda result: result["tokens_evaluated"])["trace_id"]
