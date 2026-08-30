@@ -11,6 +11,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <bitset>
 
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1) {
@@ -122,7 +123,8 @@ llama_memory_primary_occupancy llama_memory_primary_occupancy_collect(const llam
 static llama_memory_component_diagnostics kv_component_diagnostics(
         const llama_kv_cache & kv,
         std::string name,
-        bool logical_primary) {
+        bool logical_primary,
+        bool collect_shared_prefix_entries) {
     llama_memory_component_diagnostics result;
     result.name = std::move(name);
     result.kind = "kv_cache";
@@ -133,6 +135,7 @@ static llama_memory_component_diagnostics kv_component_diagnostics(
     result.capacity_entries = (uint64_t) kv.get_size() * kv.get_n_stream();
     result.allocated_bytes = memory_breakdown_total(kv.memory_breakdown());
     result.churn = kv.get_churn();
+    result.shared_prefix_entries_available = collect_shared_prefix_entries && logical_primary && kv.get_n_stream() == 1;
 
     std::bitset<LLAMA_MAX_SEQ> represented;
     std::bitset<LLAMA_MAX_SEQ> sharing;
@@ -149,13 +152,23 @@ static llama_memory_component_diagnostics kv_component_diagnostics(
             result.used_entries++;
             const uint64_t fanout = cells.seq_count(i);
             result.max_fanout = std::max(result.max_fanout, fanout);
+            llama_memory_component_diagnostics::shared_prefix_entry shared_prefix_entry;
+            if (result.shared_prefix_entries_available) {
+                shared_prefix_entry.position = cells.pos_get(i);
+            }
             for (llama_seq_id seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
                 if (cells.seq_has(i, seq_id)) {
                     represented.set(seq_id);
+                    if (result.shared_prefix_entries_available) {
+                        shared_prefix_entry.sequence_ids.push_back(seq_id);
+                    }
                     if (fanout > 1) {
                         sharing.set(seq_id);
                     }
                 }
+            }
+            if (result.shared_prefix_entries_available) {
+                result.shared_prefix_entries.push_back(std::move(shared_prefix_entry));
             }
 
             if (fanout > 1) {
@@ -235,47 +248,51 @@ static void collect_memory_components(
         const llama_memory_i * memory,
         const std::string & prefix,
         bool logical_primary,
+        bool collect_shared_prefix_entries,
         std::vector<llama_memory_component_diagnostics> & output) {
     if (!memory) {
         return;
     }
     if (const auto * kv = dynamic_cast<const llama_kv_cache *>(memory)) {
-        output.push_back(kv_component_diagnostics(*kv, prefix.empty() ? "kv" : prefix, logical_primary));
+        output.push_back(kv_component_diagnostics(
+            *kv, prefix.empty() ? "kv" : prefix, logical_primary, collect_shared_prefix_entries));
     } else if (const auto * recurrent = dynamic_cast<const llama_memory_recurrent *>(memory)) {
         output.push_back(recurrent_component_diagnostics(*recurrent, prefix.empty() ? "recurrent" : prefix, logical_primary));
     } else if (const auto * iswa = dynamic_cast<const llama_kv_cache_iswa *>(memory)) {
-        collect_memory_components(iswa->get_base(), prefix + "base", logical_primary, output);
-        collect_memory_components(iswa->get_swa(),  prefix + "swa",  false, output);
+        collect_memory_components(iswa->get_base(), prefix + "base", logical_primary, collect_shared_prefix_entries, output);
+        collect_memory_components(iswa->get_swa(),  prefix + "swa",  false, collect_shared_prefix_entries, output);
     } else if (const auto * hybrid_idx = dynamic_cast<const llama_memory_hybrid_idx *>(memory)) {
-        collect_memory_components(hybrid_idx->get_mem_attn(), prefix + "attention", logical_primary, output);
-        collect_memory_components(hybrid_idx->get_mem_recr(), prefix + "recurrent", false, output);
-        collect_memory_components(hybrid_idx->get_mem_idx(),  prefix + "indexer",   false, output);
+        collect_memory_components(hybrid_idx->get_mem_attn(), prefix + "attention", logical_primary, collect_shared_prefix_entries, output);
+        collect_memory_components(hybrid_idx->get_mem_recr(), prefix + "recurrent", false, collect_shared_prefix_entries, output);
+        collect_memory_components(hybrid_idx->get_mem_idx(),  prefix + "indexer",   false, collect_shared_prefix_entries, output);
     } else if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory)) {
-        collect_memory_components(hybrid->get_mem_attn(), prefix + "attention", logical_primary, output);
-        collect_memory_components(hybrid->get_mem_recr(), prefix + "recurrent", false, output);
+        collect_memory_components(hybrid->get_mem_attn(), prefix + "attention", logical_primary, collect_shared_prefix_entries, output);
+        collect_memory_components(hybrid->get_mem_recr(), prefix + "recurrent", false, collect_shared_prefix_entries, output);
     } else if (const auto * hybrid_iswa = dynamic_cast<const llama_memory_hybrid_iswa *>(memory)) {
-        collect_memory_components(hybrid_iswa->get_mem_attn(), prefix + "attention_", logical_primary, output);
-        collect_memory_components(hybrid_iswa->get_mem_recr(), prefix + "recurrent", false, output);
+        collect_memory_components(hybrid_iswa->get_mem_attn(), prefix + "attention_", logical_primary, collect_shared_prefix_entries, output);
+        collect_memory_components(hybrid_iswa->get_mem_recr(), prefix + "recurrent", false, collect_shared_prefix_entries, output);
     } else if (const auto * dsa = dynamic_cast<const llama_kv_cache_dsa *>(memory)) {
-        collect_memory_components(dsa->get_mla(), prefix + "mla", logical_primary, output);
-        collect_memory_components(dsa->get_lid(), prefix + "lightning_index", false, output);
+        collect_memory_components(dsa->get_mla(), prefix + "mla", logical_primary, collect_shared_prefix_entries, output);
+        collect_memory_components(dsa->get_lid(), prefix + "lightning_index", false, collect_shared_prefix_entries, output);
     } else if (const auto * dsa_iswa = dynamic_cast<const llama_kv_cache_dsa_iswa *>(memory)) {
-        collect_memory_components(dsa_iswa->get_dsa(), prefix + "dsa_", logical_primary, output);
-        collect_memory_components(dsa_iswa->get_swa(), prefix + "swa", false, output);
+        collect_memory_components(dsa_iswa->get_dsa(), prefix + "dsa_", logical_primary, collect_shared_prefix_entries, output);
+        collect_memory_components(dsa_iswa->get_swa(), prefix + "swa", false, collect_shared_prefix_entries, output);
     } else if (const auto * msa = dynamic_cast<const llama_kv_cache_msa *>(memory)) {
-        collect_memory_components(msa->get_base(), prefix + "base", logical_primary, output);
-        collect_memory_components(msa->get_idx(), prefix + "index", false, output);
+        collect_memory_components(msa->get_base(), prefix + "base", logical_primary, collect_shared_prefix_entries, output);
+        collect_memory_components(msa->get_idx(), prefix + "index", false, collect_shared_prefix_entries, output);
     } else if (const auto * dsv4 = dynamic_cast<const llama_kv_cache_dsv4 *>(memory)) {
-        collect_memory_components(dsv4->get_raw(), prefix + "raw_", logical_primary, output);
-        collect_memory_components(dsv4->get_csa(), prefix + "compressed_csa", false, output);
-        collect_memory_components(dsv4->get_hca(), prefix + "compressed_hca", false, output);
-        collect_memory_components(dsv4->get_lid(), prefix + "lightning_index", false, output);
+        collect_memory_components(dsv4->get_raw(), prefix + "raw_", logical_primary, collect_shared_prefix_entries, output);
+        collect_memory_components(dsv4->get_csa(), prefix + "compressed_csa", false, collect_shared_prefix_entries, output);
+        collect_memory_components(dsv4->get_hca(), prefix + "compressed_hca", false, collect_shared_prefix_entries, output);
+        collect_memory_components(dsv4->get_lid(), prefix + "lightning_index", false, collect_shared_prefix_entries, output);
     }
 }
 
-llama_memory_diagnostics llama_memory_diagnostics_collect(const llama_memory_i * memory) {
+static llama_memory_diagnostics memory_diagnostics_collect(
+        const llama_memory_i * memory,
+        bool collect_shared_prefix_entries) {
     llama_memory_diagnostics result;
-    collect_memory_components(memory, "", true, result.components);
+    collect_memory_components(memory, "", true, collect_shared_prefix_entries, result.components);
     if (!result.components.empty()) {
         result.state = "available";
         for (const auto & component : result.components) {
@@ -283,6 +300,75 @@ llama_memory_diagnostics llama_memory_diagnostics_collect(const llama_memory_i *
         }
     }
     return result;
+}
+
+llama_memory_diagnostics llama_memory_diagnostics_collect(const llama_memory_i * memory) {
+    return memory_diagnostics_collect(memory, false);
+}
+
+llama_memory_snapshot llama_memory_snapshot_collect(const llama_memory_i * memory, bool include_diagnostics) {
+    llama_memory_snapshot result;
+    if (!include_diagnostics) {
+        result.primary_occupancy = llama_memory_primary_occupancy_collect(memory);
+        return result;
+    }
+
+    result.diagnostics = memory_diagnostics_collect(memory, true);
+    result.diagnostics_collected = true;
+    for (const auto & component : result.diagnostics.components) {
+        if (!component.logical_primary) {
+            continue;
+        }
+        result.primary_occupancy = {
+            true,
+            component.capacity_entries,
+            component.used_entries,
+        };
+        break;
+    }
+    return result;
+}
+
+uint64_t llama_memory_shared_prefix_length(
+        const llama_memory_diagnostics & diagnostics,
+        const llama_seq_id * sequence_ids,
+        size_t sequence_count,
+        uint64_t maximum_prefix_tokens) {
+    if (!sequence_ids || sequence_count < 2 || maximum_prefix_tokens == 0) {
+        return 0;
+    }
+
+    const llama_memory_component_diagnostics * primary = nullptr;
+    for (const auto & component : diagnostics.components) {
+        if (component.logical_primary && component.shared_prefix_entries_available) {
+            primary = &component;
+            break;
+        }
+    }
+    if (primary == nullptr) {
+        return 0;
+    }
+
+    std::vector<bool> shared(maximum_prefix_tokens, false);
+    for (const auto & entry : primary->shared_prefix_entries) {
+        if (entry.position < 0 || (uint64_t) entry.position >= maximum_prefix_tokens) {
+            continue;
+        }
+        bool has_all = true;
+        for (size_t s = 0; s < sequence_count; ++s) {
+            if (sequence_ids[s] < 0 || sequence_ids[s] >= LLAMA_MAX_SEQ ||
+                    std::find(entry.sequence_ids.begin(), entry.sequence_ids.end(), sequence_ids[s]) == entry.sequence_ids.end()) {
+                has_all = false;
+                break;
+            }
+        }
+        shared[(size_t) entry.position] = has_all;
+    }
+    uint64_t length = 0;
+    while (length < maximum_prefix_tokens && shared[(size_t) length]) {
+        ++length;
+    }
+    return length;
 }
 
 uint64_t llama_memory_shared_prefix_length(

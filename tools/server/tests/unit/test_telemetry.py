@@ -238,7 +238,13 @@ def test_kv_pressure_reports_exact_global_primary_occupancy_after_decode():
     samples = [event for event in batch["events"] if event["kind"] == "utilization_sample"]
     assert samples
     sample = samples[-1]
-    kv = server.make_request("GET", "/telemetry/v1/kv")
+    shallow_kv = server.make_request("GET", "/telemetry/v1/kv")
+    assert shallow_kv.status_code == 200
+    assert shallow_kv.body["components"] == []
+    assert shallow_kv.body["physical_prefix_sharing"]["state"] == "not_collected"
+    assert shallow_kv.body["duplicate_prefix_opportunities"]["state"] == "not_collected"
+
+    kv = server.make_request("GET", "/telemetry/v1/kv?detail=deep")
     assert kv.status_code == 200
     primary = next(component for component in kv.body["components"] if component["logical_primary"])
 
@@ -1441,14 +1447,14 @@ def test_structured_forward_and_kv_diagnostics_are_measured():
     live = snapshot.body["kv"]["live_occupancy"]
     assert live["state"] == "available"
     assert live["reason"]
-    assert live["resident_tokens_state"] in ("available", "not_applicable")
+    assert live["resident_tokens_state"] == "not_collected"
     assert live["resident_tokens_reason"]
     assert live["capacity_entries"] >= live["used_entries"] > 0
     assert live["free_entries"] == live["capacity_entries"] - live["used_entries"]
-    assert snapshot.body["kv"]["physical_prefix_sharing"]["state"] == "available"
-    assert snapshot.body["kv"]["churn"]["defragmentation"]["state"] == "not_applicable"
+    assert snapshot.body["kv"]["physical_prefix_sharing"]["state"] == "not_collected"
+    assert snapshot.body["kv"]["churn"]["state"] == "not_collected"
 
-    kv = server.make_request("GET", "/telemetry/v1/kv")
+    kv = server.make_request("GET", "/telemetry/v1/kv?detail=deep")
     assert kv.status_code == 200
     assert kv.body["allocated"]["state"] == "available"
     assert kv.body["allocated"]["reason"]

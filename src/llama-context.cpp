@@ -3575,6 +3575,10 @@ llama_memory_diagnostics llama_context::memory_diagnostics() const {
     return llama_memory_diagnostics_collect(memory.get());
 }
 
+llama_memory_snapshot llama_context::memory_snapshot(bool include_diagnostics) const {
+    return llama_memory_snapshot_collect(memory.get(), include_diagnostics);
+}
+
 //
 // training
 //
@@ -4515,6 +4519,12 @@ llama_memory_primary_occupancy llama_get_memory_primary_occupancy(const struct l
 
 llama_memory_diagnostics llama_get_memory_diagnostics(const struct llama_context * ctx) {
     return ctx ? ctx->memory_diagnostics() : llama_memory_diagnostics {};
+}
+
+llama_memory_snapshot llama_get_memory_snapshot(
+        const struct llama_context * ctx,
+        bool include_diagnostics) {
+    return ctx ? ctx->memory_snapshot(include_diagnostics) : llama_memory_snapshot {};
 }
 
 uint64_t llama_get_memory_shared_prefix_length(

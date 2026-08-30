@@ -188,6 +188,15 @@ struct llama_memory_component_diagnostics {
     uint64_t allocated_bytes = 0;
     uint64_t occupied_bytes_estimate = 0;
     llama_memory_churn_data churn;
+
+    // Deep snapshots retain these memberships for in-process prefix analysis.
+    // Telemetry endpoints never expose sequence identifiers.
+    struct shared_prefix_entry {
+        llama_pos position = -1;
+        std::vector<llama_seq_id> sequence_ids;
+    };
+    bool shared_prefix_entries_available = false;
+    std::vector<shared_prefix_entry> shared_prefix_entries;
 };
 
 struct llama_memory_diagnostics {
@@ -202,8 +211,19 @@ struct llama_memory_primary_occupancy {
     uint64_t used_entries = 0;
 };
 
+// A copy of memory data collected at one context boundary. A shallow snapshot
+// has only primary occupancy. Set include_diagnostics for a deep snapshot.
+struct llama_memory_snapshot {
+    llama_memory_primary_occupancy primary_occupancy;
+    llama_memory_diagnostics diagnostics;
+    bool diagnostics_collected = false;
+};
+
 LLAMA_API llama_memory_primary_occupancy llama_get_memory_primary_occupancy(const struct llama_context * ctx);
 LLAMA_API llama_memory_diagnostics llama_get_memory_diagnostics(const struct llama_context * ctx);
+LLAMA_API llama_memory_snapshot llama_get_memory_snapshot(
+        const struct llama_context * ctx,
+        bool include_diagnostics);
 
 // Returns the number of leading token positions represented by one physical
 // memory entry shared by every supplied sequence. Sequence identifiers are

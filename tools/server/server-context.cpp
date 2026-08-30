@@ -1411,6 +1411,21 @@ private:
         uint64_t released_entries = 0;
         uint64_t memberships_removed = 0;
     };
+    struct telemetry_kv_slot_snapshot {
+        int32_t id = -1;
+        std::vector<llama_token> tokens;
+        std::string compatibility;
+    };
+    struct telemetry_kv_boundary_snapshot {
+        llama_memory_snapshot memory;
+        llama_memory_breakdown breakdown;
+        int64_t monotonic_us = 0;
+        uint64_t resident_slot_tokens = 0;
+        size_t represented_slots = 0;
+        size_t multimodal_sequences_skipped = 0;
+        std::vector<telemetry_kv_slot_snapshot> slots;
+        bool available = false;
+    };
     std::deque<telemetry_event_entry> telemetry_events;
     std::deque<telemetry_event_entry> telemetry_kv_pressure_events;
     std::deque<telemetry_kv_request_window> telemetry_kv_request_windows;
@@ -1436,6 +1451,7 @@ private:
     std::string telemetry_kv_primary_memory_kind;
     std::string telemetry_kv_primary_entry_semantics;
     bool telemetry_kv_primary_occupancy_available = false;
+    telemetry_kv_boundary_snapshot telemetry_kv_boundary;
     telemetry_kv_wait_episode telemetry_kv_wait;
     std::vector<uint64_t> telemetry_slot_marks;
     uint64_t telemetry_slot_epoch = 0;
@@ -2026,6 +2042,7 @@ private:
                 1,
                 std::min((int) TELEMETRY_KV_REQUEST_WINDOW_MAX_CAPACITY, atoi(telemetry_kv_request_window_env)));
         }
+        telemetry_kv_snapshot_capture(false);
         telemetry_kv_pressure_initialize();
         telemetry_kv_pressure_sample(ggml_time_us(), true);
 
@@ -3186,7 +3203,7 @@ private:
                     } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_EVENTS) {
                         res->data = telemetry_events_json(task.telemetry_cursor, task.telemetry_limit);
                     } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_KV) {
-                        res->data = telemetry_kv_json();
+                        res->data = telemetry_kv_json(task.telemetry_deep_detail);
                     } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_KV_PRESSURE) {
                         res->data = telemetry_kv_pressure_events_json(
                             task.telemetry_cursor,
@@ -5099,6 +5116,42 @@ private:
     static int64_t telemetry_wall_unix_ms() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    void telemetry_kv_snapshot_capture(bool include_diagnostics) {
+        telemetry_kv_boundary_snapshot snapshot;
+        snapshot.memory = llama_get_memory_snapshot(ctx_tgt, include_diagnostics);
+        snapshot.breakdown = llama_get_memory_breakdown(ctx_tgt);
+        snapshot.monotonic_us = ggml_time_us();
+        snapshot.available = true;
+
+        for (const auto & slot : slots) {
+            snapshot.resident_slot_tokens += slot.prompt.n_tokens();
+            snapshot.represented_slots += slot.prompt.n_tokens() > 0 ? 1 : 0;
+            if (!include_diagnostics) {
+                continue;
+            }
+
+            const auto & tokens = slot.prompt.tokens.get_tokens();
+            if (tokens.empty()) {
+                continue;
+            }
+            if (std::find(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL) != tokens.end()) {
+                snapshot.multimodal_sequences_skipped++;
+                continue;
+            }
+            std::ostringstream compatibility;
+            compatibility << slot.n_ctx;
+            for (const auto & adapter : slot.lora) {
+                uint32_t scale_bits = 0;
+                static_assert(sizeof(scale_bits) == sizeof(adapter.scale));
+                std::memcpy(&scale_bits, &adapter.scale, sizeof(scale_bits));
+                compatibility << ':' << reinterpret_cast<uintptr_t>(adapter.ptr) << ':' << scale_bits;
+            }
+            snapshot.slots.push_back({slot.id, tokens, compatibility.str()});
+        }
+
+        telemetry_kv_boundary = std::move(snapshot);
     }
 
     void telemetry_kv_pressure_initialize() {
@@ -7331,6 +7384,41 @@ private:
         };
     }
 
+    static json telemetry_memory_snapshot_json(const llama_memory_snapshot & snapshot) {
+        if (snapshot.diagnostics_collected) {
+            return telemetry_memory_diagnostics_json(snapshot.diagnostics);
+        }
+
+        const llama_memory_primary_occupancy & occupancy = snapshot.primary_occupancy;
+        const bool valid = occupancy.available && occupancy.capacity_entries > 0 &&
+            occupancy.used_entries <= occupancy.capacity_entries;
+        return {
+            {"state", valid ? "available" : occupancy.available ? "no_data" : "unsupported"},
+            {"live_occupancy", {
+                {"state", valid ? "available" : occupancy.available ? "no_data" : "unsupported"},
+                {"reason", valid
+                    ? "immutable primary memory occupancy captured at the latest decode boundary"
+                    : "the latest decode boundary did not expose usable primary occupancy"},
+                {"capacity_entries", valid ? json(occupancy.capacity_entries) : json(nullptr)},
+                {"used_entries", valid ? json(occupancy.used_entries) : json(nullptr)},
+                {"free_entries", valid ? json(occupancy.capacity_entries - occupancy.used_entries) : json(nullptr)},
+                {"utilization", valid ? json((double) occupancy.used_entries / occupancy.capacity_entries) : json(nullptr)},
+                {"resident_tokens", nullptr},
+                {"resident_tokens_state", "not_collected"},
+                {"resident_tokens_reason", "deep diagnostics were not requested"},
+            }},
+            {"physical_prefix_sharing", {
+                {"state", "not_collected"},
+                {"reason", "deep diagnostics were not requested"},
+            }},
+            {"components", json::array()},
+            {"churn", {
+                {"state", "not_collected"},
+                {"reason", "deep diagnostics were not requested"},
+            }},
+        };
+    }
+
     json telemetry_snapshot_json() {
         int active_slots = 0;
         uint64_t resident_slot_tokens = 0;
@@ -7344,7 +7432,9 @@ private:
         const json step_hit_rate = metrics.n_draft_verif_steps > 0 ? json((double) metrics.n_draft_hit_steps / metrics.n_draft_verif_steps) : json(nullptr);
         const llama_ubatch_stats ubatch_target = llama_get_ubatch_stats(ctx_tgt);
         const llama_ubatch_stats ubatch_draft = ctx_dft ? llama_get_ubatch_stats(ctx_dft) : llama_ubatch_stats {};
-        const json memory_diagnostics = telemetry_memory_diagnostics_json(llama_get_memory_diagnostics(ctx_tgt));
+        const json memory_diagnostics = telemetry_kv_boundary.available
+            ? telemetry_memory_snapshot_json(telemetry_kv_boundary.memory)
+            : telemetry_memory_snapshot_json({});
         const auto histogram_summary = [](const server_histogram & histogram) {
             auto quantile_upper_bound = [&](double q) -> json {
                 if (histogram.count == 0) {
@@ -7485,8 +7575,12 @@ private:
                 {"rate_state", metrics.n_draft_verif_steps > 0 ? "available" : "no_data"},
             }},
             {"kv", {
-                {"resident_slot_tokens_upper_bound", resident_slot_tokens},
-                {"represented_slots", std::count_if(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.prompt.n_tokens() > 0; })},
+                {"resident_slot_tokens_upper_bound", telemetry_kv_boundary.available
+                    ? telemetry_kv_boundary.resident_slot_tokens
+                    : resident_slot_tokens},
+                {"represented_slots", telemetry_kv_boundary.available
+                    ? telemetry_kv_boundary.represented_slots
+                    : std::count_if(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.prompt.n_tokens() > 0; })},
                 {"live_occupancy", memory_diagnostics.value("live_occupancy", json {
                     {"state", memory_diagnostics.value("state", "unsupported")},
                     {"reason", memory_diagnostics.value("reason", "the active memory backend did not expose live occupancy")},
@@ -7503,32 +7597,19 @@ private:
         };
     }
 
-    json telemetry_duplicate_prefix_json(const llama_memory_diagnostics & diagnostics) const {
+    json telemetry_duplicate_prefix_json(
+            const llama_memory_diagnostics & diagnostics,
+            const telemetry_kv_boundary_snapshot & snapshot) const {
         struct candidate {
-            const server_slot * slot;
-            const llama_tokens * tokens;
+            const telemetry_kv_slot_snapshot * slot;
+            const std::vector<llama_token> * tokens;
             std::string compatibility;
         };
 
         std::vector<candidate> candidates;
-        candidates.reserve(slots.size());
-        for (const auto & slot : slots) {
-            const auto & tokens = slot.prompt.tokens.get_tokens();
-            if (tokens.empty() || std::find(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL) != tokens.end()) {
-                continue;
-            }
-
-            // All server-global model/tokenizer/RoPE configuration is already
-            // identical. Add the per-slot compatibility state which can differ.
-            std::ostringstream compatibility;
-            compatibility << slot.n_ctx;
-            for (const auto & adapter : slot.lora) {
-                uint32_t scale_bits = 0;
-                static_assert(sizeof(scale_bits) == sizeof(adapter.scale));
-                std::memcpy(&scale_bits, &adapter.scale, sizeof(scale_bits));
-                compatibility << ':' << reinterpret_cast<uintptr_t>(adapter.ptr) << ':' << scale_bits;
-            }
-            candidates.push_back({&slot, &tokens, compatibility.str()});
+        candidates.reserve(snapshot.slots.size());
+        for (const auto & slot : snapshot.slots) {
+            candidates.push_back({&slot, &slot.tokens, slot.compatibility});
         }
 
         std::sort(candidates.begin(), candidates.end(), [](const candidate & left, const candidate & right) {
@@ -7539,7 +7620,7 @@ private:
                 left.tokens->begin(), left.tokens->end(), right.tokens->begin(), right.tokens->end());
         });
 
-        const auto common_prefix = [](const llama_tokens & left, const llama_tokens & right) {
+        const auto common_prefix = [](const std::vector<llama_token> & left, const std::vector<llama_token> & right) {
             const size_t limit = std::min(left.size(), right.size());
             size_t length = 0;
             while (length < limit && left[length] == right[length]) {
@@ -7588,8 +7669,8 @@ private:
                 for (size_t i = begin; i < end; ++i) {
                     sequence_ids.push_back(candidates[i].slot->id);
                 }
-                const uint64_t physically_shared = llama_get_memory_shared_prefix_length(
-                    ctx_tgt, sequence_ids.data(), sequence_ids.size(), depth);
+                const uint64_t physically_shared = llama_memory_shared_prefix_length(
+                    diagnostics, sequence_ids.data(), sequence_ids.size(), depth);
                 const size_t unshared_start = std::max(parent_depth, (size_t) std::min<uint64_t>(physically_shared, depth));
                 const uint64_t redundant_increment = (depth - unshared_start) * (end - begin - 1);
                 if (redundant_increment > 0) {
@@ -7648,17 +7729,18 @@ private:
             {"longest_duplicate_prefix_tokens", longest_prefix},
             {"estimated_potential_reclaim_ratio", reclaim_ratio},
             {"groups", std::move(groups)},
-            {"multimodal_sequences_skipped", std::count_if(slots.begin(), slots.end(), [](const server_slot & slot) {
-                const auto & tokens = slot.prompt.tokens.get_tokens();
-                return !tokens.empty() && std::find(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL) != tokens.end();
-            })},
+            {"multimodal_sequences_skipped", snapshot.multimodal_sequences_skipped},
         };
     }
 
-    json telemetry_kv_json() const {
+    json telemetry_kv_json(bool include_diagnostics) {
+        if (include_diagnostics) {
+            telemetry_kv_snapshot_capture(true);
+        }
+        const telemetry_kv_boundary_snapshot & snapshot = telemetry_kv_boundary;
         llama_memory_breakdown_data total;
         json devices = json::array();
-        const auto breakdown = llama_get_memory_breakdown(ctx_tgt);
+        const auto & breakdown = snapshot.breakdown;
         for (const auto & item : breakdown) {
             total.model += item.second.model;
             total.context += item.second.context;
@@ -7683,15 +7765,13 @@ private:
             }
             devices.push_back(std::move(allocation));
         }
-        uint64_t resident_slot_tokens = 0;
-        size_t represented_slots = 0;
-        for (const auto & slot : slots) {
-            resident_slot_tokens += slot.prompt.n_tokens();
-            represented_slots += slot.prompt.n_tokens() > 0 ? 1 : 0;
-        }
-        const llama_memory_diagnostics memory_diagnostics = llama_get_memory_diagnostics(ctx_tgt);
-        json diagnostics = telemetry_memory_diagnostics_json(memory_diagnostics);
-        json duplicate_prefixes = telemetry_duplicate_prefix_json(memory_diagnostics);
+        const json diagnostics = telemetry_memory_snapshot_json(snapshot.memory);
+        const json duplicate_prefixes = snapshot.memory.diagnostics_collected
+            ? telemetry_duplicate_prefix_json(snapshot.memory.diagnostics, snapshot)
+            : json {
+                {"state", "not_collected"},
+                {"reason", "request detail=deep to collect bounded duplicate-prefix diagnostics"},
+            };
         return {
             {"schema_version", 1},
             {"server_instance_id", telemetry_server_instance_id},
@@ -7707,8 +7787,8 @@ private:
             {"slot_metadata", {
                 {"state", "available"},
                 {"reason", "bounded server-slot metadata; resident token count is explicitly an upper bound"},
-                {"resident_tokens_upper_bound", resident_slot_tokens},
-                {"represented_slots", represented_slots},
+                {"resident_tokens_upper_bound", snapshot.resident_slot_tokens},
+                {"represented_slots", snapshot.represented_slots},
             }},
             {"live_occupancy", diagnostics.value("live_occupancy", json {
                 {"state", diagnostics.value("state", "unsupported")},
@@ -7837,6 +7917,7 @@ private:
                 slot.stats.t_prefill_last = t_now;
             }
         }
+        telemetry_kv_snapshot_capture(false);
     }
 
     // flush any queued prompt metrics if all slots are now idle
@@ -8462,13 +8543,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_telemetry(
         server_task_type type,
         uint64_t cursor,
         size_t limit,
-        const std::string & trace_id) {
+        const std::string & trace_id,
+        bool deep_detail) {
     auto res = create_response();
     server_task task(type);
     task.id = res->rd.get_new_id();
     task.telemetry_cursor = cursor;
     task.telemetry_limit = limit;
     task.telemetry_trace_id = trace_id;
+    task.telemetry_deep_detail = deep_detail;
     res->rd.post_task(std::move(task), true);
 
     auto result = res->rd.next(req.should_stop);
@@ -8666,7 +8749,13 @@ void server_routes::init_routes() {
     };
 
     this->get_telemetry_kv = [this](const server_http_req & req) {
-        return handle_telemetry(req, SERVER_TASK_TYPE_TELEMETRY_KV);
+        const std::string detail = req.get_param("detail");
+        if (!detail.empty() && detail != "deep") {
+            auto res = create_response(true);
+            res->error(format_error_response("detail must be deep when specified", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        return handle_telemetry(req, SERVER_TASK_TYPE_TELEMETRY_KV, 0, 100, {}, detail == "deep");
     };
 
     this->get_telemetry_kv_pressure = [this](const server_http_req & req) {

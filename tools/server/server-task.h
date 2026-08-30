@@ -200,6 +200,7 @@ struct server_task {
     uint64_t telemetry_cursor = 0;
     size_t telemetry_limit = 100;
     std::string telemetry_trace_id;
+    bool telemetry_deep_detail = false;
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale

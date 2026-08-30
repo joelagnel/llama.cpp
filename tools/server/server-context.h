@@ -182,7 +182,8 @@ private:
             server_task_type type,
             uint64_t cursor = 0,
             size_t limit = 100,
-            const std::string & trace_id = {});
+            const std::string & trace_id = {},
+            bool deep_detail = false);
 
     // using unique_ptr to allow late initialization of const
     std::unique_ptr<const server_context_meta> meta;

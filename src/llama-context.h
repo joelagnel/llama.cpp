@@ -194,6 +194,7 @@ struct llama_context {
     llama_memory_breakdown memory_breakdown() const;
     llama_memory_primary_occupancy memory_primary_occupancy() const;
     llama_memory_diagnostics memory_diagnostics() const;
+    llama_memory_snapshot memory_snapshot(bool include_diagnostics) const;
 
     //
     // training

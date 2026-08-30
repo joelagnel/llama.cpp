@@ -131,8 +131,14 @@ using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
 
 llama_memory_primary_occupancy llama_memory_primary_occupancy_collect(const llama_memory_i * memory);
 llama_memory_diagnostics llama_memory_diagnostics_collect(const llama_memory_i * memory);
+llama_memory_snapshot llama_memory_snapshot_collect(const llama_memory_i * memory, bool include_diagnostics);
 uint64_t llama_memory_shared_prefix_length(
         const llama_memory_i * memory,
+        const llama_seq_id * sequence_ids,
+        size_t sequence_count,
+        uint64_t maximum_prefix_tokens);
+uint64_t llama_memory_shared_prefix_length(
+        const llama_memory_diagnostics & diagnostics,
         const llama_seq_id * sequence_ids,
         size_t sequence_count,
         uint64_t maximum_prefix_tokens);

@@ -18,9 +18,9 @@ Use `-SpecType` with `-SpecModelPath` for a draft backend, or `-MtpModelPath` to
 ## Endpoints
 
 - `GET /telemetry/v1/capabilities` reports schema version, server instance, build, configured batching, content policy, clock semantics, and supported, conditional, or unsupported measurements.
-- `GET /telemetry/v1/snapshot` reports coherent cumulative counters and current server state.
+- `GET /telemetry/v1/snapshot` reports coherent cumulative counters and current server state. KV occupancy is the immutable shallow snapshot captured at the latest decode boundary.
 - `GET /telemetry/v1/events?cursor=N&limit=N` returns retained request events after a cursor. `limit` is clamped to 1 through 512.
-- `GET /telemetry/v1/kv` reports model, context, and compute allocation by backend buffer type, typed memory components, authoritative entry occupancy where the active memory backend provides it, physical prefix sharing, bounded duplicate-prefix opportunities, and cache churn. Dense occupied bytes remain explicitly labeled as an estimate.
+- `GET /telemetry/v1/kv` reports model, context, and compute allocation by backend buffer type and the immutable shallow KV snapshot captured at the latest decode boundary. Add `?detail=deep` to collect typed memory components, physical prefix sharing, bounded duplicate-prefix opportunities, and cache churn from one immutable boundary. Dense occupied bytes remain explicitly labeled as an estimate.
 - `GET /telemetry/v1/gpu?cursor=N&limit=N&trace_id=ID` reports bounded llama-server-owned asynchronous NVML GPM intervals and correlated prefill, normal-decode, MTP-draft, and MTP-verify operation spans. SM ID 2, Tensor ID 5, and DRAM-bandwidth ID 10 retain independent state, reason, and nullable value fields. Stable source descriptors also retain state/reason when no interval exists, so unsupported and disabled hosts still export all three counters.
 
 The model router proxies these routes to a selected model in the same way as the existing monitoring routes. Normal server API-key policy applies. Responses include `schema_version` and `server_instance_id`; consumers must reset their cursor when the instance changes.
