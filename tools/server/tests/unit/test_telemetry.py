@@ -61,6 +61,59 @@ def trace_events(trace_id):
     return [event for event in response.body["events"] if event["trace_id"] == trace_id]
 
 
+def test_event_ring_reuses_serialized_payload_bytes_for_retention_and_response():
+    api_key = "serialized-event-test-key"
+    auth = {"Authorization": f"Bearer {api_key}"}
+    server.server_props = True
+    server.api_key = api_key
+    server.extra_env = {"LLAMA_TELEMETRY_EVENT_BUFFER_MIB": "1"}
+    server.start()
+
+    control = server.make_request(
+        "POST",
+        "/props",
+        data={"telemetry_control": {"request_content": True}},
+        headers=auth,
+    )
+    assert control.status_code == 200
+
+    for ordinal in range(2):
+        completion = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": "serialized event payload",
+                "n_predict": 1,
+                "unused_payload": str(ordinal) + "x" * 600_000,
+            },
+            headers=auth,
+        )
+        assert completion.status_code == 200
+
+    capabilities = server.make_request("GET", "/telemetry/v1/capabilities", headers=auth)
+    assert capabilities.status_code == 200
+    byte_cap = capabilities.body["content_policy"]["serialized_event_capacity_bytes"]
+
+    response = requests.get(
+        f"http://{server.server_host}:{server.server_port}/telemetry/v1/events?cursor=0&limit=100",
+        headers=auth,
+        timeout=60,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["events"]
+
+    serialized_events = [
+        json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        for event in body["events"]
+    ]
+    assert body["retained_serialized_bytes"] == sum(map(len, serialized_events))
+    assert body["retained_serialized_bytes"] <= byte_cap
+    assert body["dropped_events"] > 0
+    assert body["gap"] is True
+    assert b'"events":[' + b",".join(serialized_events) + b"]" in response.content
+
+
 def kv_pressure_batch(cursor=0, limit=4096, trace_id=None, headers=None):
     path = f"/telemetry/v1/kv-pressure?cursor={cursor}&limit={limit}"
     if trace_id is not None:

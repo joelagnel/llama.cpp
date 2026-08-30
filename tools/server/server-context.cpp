@@ -241,6 +241,15 @@ struct telemetry_token_candidate_block_entry {
     size_t bytes = 0;
 };
 
+static std::string telemetry_response_with_serialized_events(json response, const std::string & events) {
+    const std::string marker = "\"events\":[]";
+    std::string serialized = safe_json_to_str(response);
+    const size_t offset = serialized.find(marker);
+    GGML_ASSERT(offset != std::string::npos);
+    serialized.replace(offset + marker.size() - 2, 2, events);
+    return serialized;
+}
+
 struct telemetry_control_state {
     bool moe_routing = false;
     bool output_token_detail = false;
@@ -1373,8 +1382,18 @@ private:
     std::vector<int64_t> gpu_verify_proposal_positions;
 
     struct telemetry_event_entry {
-        json data;
-        size_t bytes;
+        uint64_t sequence = 0;
+        std::string serialized;
+        size_t bytes = 0;
+    };
+    struct telemetry_kv_pressure_event_entry {
+        uint64_t sequence = 0;
+        std::string serialized;
+        size_t bytes = 0;
+        std::string kind;
+        std::string trace_id;
+        std::string victim_trace_id;
+        int64_t monotonic_us = 0;
     };
     struct telemetry_kv_request_window {
         std::string trace_id;
@@ -1430,7 +1449,7 @@ private:
         bool available = false;
     };
     std::deque<telemetry_event_entry> telemetry_events;
-    std::deque<telemetry_event_entry> telemetry_kv_pressure_events;
+    std::deque<telemetry_kv_pressure_event_entry> telemetry_kv_pressure_events;
     std::deque<telemetry_kv_request_window> telemetry_kv_request_windows;
     std::deque<telemetry_token_candidate_block_entry> telemetry_token_candidate_blocks;
     std::deque<std::string> telemetry_token_candidate_expired_trace_ids;
@@ -3245,14 +3264,16 @@ private:
                     if (task.type == SERVER_TASK_TYPE_TELEMETRY_SNAPSHOT) {
                         res->data = telemetry_snapshot_json();
                     } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_EVENTS) {
-                        res->data = telemetry_events_json(task.telemetry_cursor, task.telemetry_limit);
+                        res->serialized_data = telemetry_events_json(task.telemetry_cursor, task.telemetry_limit);
+                        res->has_serialized_data = true;
                     } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_KV) {
                         res->data = telemetry_kv_json(task.telemetry_deep_detail);
                     } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_KV_PRESSURE) {
-                        res->data = telemetry_kv_pressure_events_json(
+                        res->serialized_data = telemetry_kv_pressure_events_json(
                             task.telemetry_cursor,
                             task.telemetry_limit,
                             task.telemetry_trace_id);
+                        res->has_serialized_data = true;
                     } else if (task.type == SERVER_TASK_TYPE_TELEMETRY_TOKEN_CANDIDATES) {
                         res->data = telemetry_token_candidates_json(task.telemetry_trace_id);
                     } else {
@@ -5168,17 +5189,21 @@ private:
         event["schema_version"] = 1;
         event["server_instance_id"] = telemetry_server_instance_id;
         event["sequence"] = telemetry_next_sequence++;
-        const size_t bytes = event.dump().size();
+        telemetry_event_entry entry;
+        entry.sequence = event.at("sequence").get<uint64_t>();
+        entry.serialized = event.dump();
+        entry.bytes = entry.serialized.size();
+        const size_t bytes = entry.bytes;
         if (bytes > telemetry_event_max_bytes) {
             telemetry_dropped_events++;
-            telemetry_last_dropped_sequence = event.at("sequence").get<uint64_t>();
+            telemetry_last_dropped_sequence = entry.sequence;
             return;
         }
         telemetry_event_bytes += bytes;
-        telemetry_events.push_back({std::move(event), bytes});
+        telemetry_events.push_back(std::move(entry));
         while (telemetry_events.size() > TELEMETRY_EVENT_CAPACITY || telemetry_event_bytes > telemetry_event_max_bytes) {
             telemetry_event_bytes -= telemetry_events.front().bytes;
-            telemetry_last_dropped_sequence = telemetry_events.front().data.at("sequence").get<uint64_t>();
+            telemetry_last_dropped_sequence = telemetry_events.front().sequence;
             telemetry_events.pop_front();
             telemetry_dropped_events++;
         }
@@ -5254,18 +5279,30 @@ private:
         event["schema_version"] = 1;
         event["server_instance_id"] = telemetry_server_instance_id;
         event["sequence"] = telemetry_kv_pressure_next_sequence++;
-        const size_t bytes = event.dump().size();
+        telemetry_kv_pressure_event_entry entry;
+        entry.sequence = event.at("sequence").get<uint64_t>();
+        entry.kind = event.at("kind").get<std::string>();
+        const auto string_field = [&](const char * name) {
+            return event.contains(name) && event.at(name).is_string()
+                ? event.at(name).get<std::string>() : std::string();
+        };
+        entry.trace_id = string_field("trace_id");
+        entry.victim_trace_id = string_field("victim_trace_id");
+        entry.monotonic_us = event.at("monotonic_us").get<int64_t>();
+        entry.serialized = event.dump();
+        entry.bytes = entry.serialized.size();
+        const size_t bytes = entry.bytes;
         if (bytes > telemetry_kv_pressure_event_max_bytes) {
             telemetry_kv_pressure_dropped_events++;
-            telemetry_kv_pressure_last_dropped_sequence = event.at("sequence").get<uint64_t>();
+            telemetry_kv_pressure_last_dropped_sequence = entry.sequence;
             return;
         }
         telemetry_kv_pressure_event_bytes += bytes;
-        telemetry_kv_pressure_events.push_back({std::move(event), bytes});
+        telemetry_kv_pressure_events.push_back(std::move(entry));
         while (telemetry_kv_pressure_events.size() > TELEMETRY_KV_PRESSURE_EVENT_CAPACITY ||
                 telemetry_kv_pressure_event_bytes > telemetry_kv_pressure_event_max_bytes) {
             telemetry_kv_pressure_event_bytes -= telemetry_kv_pressure_events.front().bytes;
-            telemetry_kv_pressure_last_dropped_sequence = telemetry_kv_pressure_events.front().data.at("sequence").get<uint64_t>();
+            telemetry_kv_pressure_last_dropped_sequence = telemetry_kv_pressure_events.front().sequence;
             telemetry_kv_pressure_events.pop_front();
             telemetry_kv_pressure_dropped_events++;
         }
@@ -7224,26 +7261,30 @@ private:
         slot.telemetry_pending_completion_event = json();
     }
 
-    json telemetry_events_json(uint64_t cursor, size_t limit) const {
-        json events = json::array();
-        const uint64_t oldest = telemetry_events.empty() ? telemetry_next_sequence : telemetry_events.front().data.at("sequence").get<uint64_t>();
+    std::string telemetry_events_json(uint64_t cursor, size_t limit) const {
+        std::string events = "[";
+        const uint64_t oldest = telemetry_events.empty() ? telemetry_next_sequence : telemetry_events.front().sequence;
+        size_t event_count = 0;
         uint64_t next_cursor = cursor;
         for (const auto & entry : telemetry_events) {
-            const auto & event = entry.data;
-            const uint64_t sequence = event.at("sequence").get<uint64_t>();
+            const uint64_t sequence = entry.sequence;
             if (sequence <= cursor) {
                 continue;
             }
-            events.push_back(event);
+            if (event_count++ > 0) {
+                events += ',';
+            }
+            events += entry.serialized;
             next_cursor = sequence;
-            if (events.size() >= limit) {
+            if (event_count >= limit) {
                 break;
             }
         }
-        return {
+        events += ']';
+        return telemetry_response_with_serialized_events({
             {"schema_version", 1},
             {"server_instance_id", telemetry_server_instance_id},
-            {"events", std::move(events)},
+            {"events", json::array()},
             {"cursor", next_cursor},
             {"oldest_sequence", oldest},
             {"next_sequence", telemetry_next_sequence},
@@ -7252,16 +7293,16 @@ private:
             {"last_dropped_sequence", telemetry_last_dropped_sequence},
             {"retained_serialized_bytes", telemetry_event_bytes},
             {"content_logging", telemetry_control_current().request_content},
-        };
+        }, events);
     }
 
-    json telemetry_kv_pressure_events_json(
+    std::string telemetry_kv_pressure_events_json(
             uint64_t cursor,
             size_t limit,
             const std::string & trace_id) const {
         const uint64_t oldest = telemetry_kv_pressure_events.empty()
             ? telemetry_kv_pressure_next_sequence
-            : telemetry_kv_pressure_events.front().data.at("sequence").get<uint64_t>();
+            : telemetry_kv_pressure_events.front().sequence;
         const uint64_t latest = telemetry_kv_pressure_next_sequence - 1;
         const bool future_cursor = cursor > latest;
         const uint64_t effective_cursor = future_cursor ? latest : cursor;
@@ -7279,51 +7320,46 @@ private:
             }
         }
 
-        auto matches_explicit_trace = [&](const json & event) {
-            if (event.contains("trace_id") && event.at("trace_id").is_string() &&
-                    event.at("trace_id").get<std::string>() == trace_id) {
-                return true;
-            }
-            if (event.contains("victim_trace_id") && event.at("victim_trace_id").is_string() &&
-                    event.at("victim_trace_id").get<std::string>() == trace_id) {
-                return true;
-            }
-            return false;
+        auto matches_explicit_trace = [&](const telemetry_kv_pressure_event_entry & entry) {
+            return entry.trace_id == trace_id || entry.victim_trace_id == trace_id;
         };
         const bool retained_explicit_trace = !trace_id.empty() && std::any_of(
             telemetry_kv_pressure_events.begin(),
             telemetry_kv_pressure_events.end(),
-            [&](const auto & entry) { return matches_explicit_trace(entry.data); });
+            matches_explicit_trace);
 
-        auto matches_trace = [&](const json & event) {
-            if (trace_id.empty() || matches_explicit_trace(event)) {
+        auto matches_trace = [&](const telemetry_kv_pressure_event_entry & entry) {
+            if (trace_id.empty() || matches_explicit_trace(entry)) {
                 return true;
             }
-            if (request_window && event.at("kind") == "utilization_sample") {
-                const int64_t monotonic_us = event.at("monotonic_us").get<int64_t>();
-                return monotonic_us >= request_window->start_monotonic_us &&
-                    (request_window->end_monotonic_us == 0 || monotonic_us <= request_window->end_monotonic_us);
+            if (request_window && entry.kind == "utilization_sample") {
+                return entry.monotonic_us >= request_window->start_monotonic_us &&
+                    (request_window->end_monotonic_us == 0 || entry.monotonic_us <= request_window->end_monotonic_us);
             }
             return false;
         };
 
-        json events = json::array();
+        std::string events = "[";
+        size_t event_count = 0;
         uint64_t next_cursor = effective_cursor;
         for (const auto & entry : telemetry_kv_pressure_events) {
-            const json & event = entry.data;
-            const uint64_t sequence = event.at("sequence").get<uint64_t>();
+            const uint64_t sequence = entry.sequence;
             if (sequence <= effective_cursor) {
                 continue;
             }
             next_cursor = sequence;
-            if (!matches_trace(event)) {
+            if (!matches_trace(entry)) {
                 continue;
             }
-            events.push_back(event);
-            if (events.size() >= limit) {
+            if (event_count++ > 0) {
+                events += ',';
+            }
+            events += entry.serialized;
+            if (event_count >= limit) {
                 break;
             }
         }
+        events += ']';
 
         const llama_memory_primary_occupancy & occupancy = telemetry_kv_boundary.memory.primary_occupancy;
         const bool occupancy_available = telemetry_kv_boundary.available && occupancy.available &&
@@ -7349,7 +7385,7 @@ private:
             reason = "causal events are available, but primary occupancy is unavailable";
         }
 
-        return {
+        return telemetry_response_with_serialized_events({
             {"schema_version", 1},
             {"state", state},
             {"reason", reason},
@@ -7359,7 +7395,7 @@ private:
                 ? json(request_window->start_monotonic_us) : json(nullptr)},
             {"request_end_monotonic_us", request_window && request_window->end_monotonic_us > 0
                 ? json(request_window->end_monotonic_us) : json(nullptr)},
-            {"events", std::move(events)},
+            {"events", json::array()},
             {"cursor", next_cursor},
             {"oldest_sequence", oldest},
             {"next_sequence", telemetry_kv_pressure_next_sequence},
@@ -7367,7 +7403,7 @@ private:
             {"dropped_events", telemetry_kv_pressure_dropped_events},
             {"last_dropped_sequence", telemetry_kv_pressure_last_dropped_sequence},
             {"retained_serialized_bytes", telemetry_kv_pressure_event_bytes},
-        };
+        }, events);
     }
 
     static json telemetry_churn_json(const llama_memory_churn_data & churn) {
@@ -8147,6 +8183,10 @@ struct server_res_generator : server_res_spipe {
         status = 200;
         data = safe_json_to_str(response_data);
     }
+    void ok_serialized(std::string response_data) {
+        status = 200;
+        data = std::move(response_data);
+    }
     void error(const json & error_data) {
         status = json_value(error_data, "code", 500);
         data = safe_json_to_str({{ "error", error_data }});
@@ -8668,7 +8708,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_telemetry(
     auto * telemetry = dynamic_cast<server_task_result_telemetry *>(result.get());
     GGML_ASSERT(telemetry != nullptr);
     res->headers["Cache-Control"] = "no-store";
-    res->ok(telemetry->to_json());
+    if (telemetry->has_serialized_data) {
+        res->ok_serialized(std::move(telemetry->serialized_data));
+    } else {
+        res->ok(telemetry->to_json());
+    }
     return res;
 }
 

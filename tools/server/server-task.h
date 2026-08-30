@@ -553,6 +553,8 @@ struct server_task_result_metrics : server_task_result {
 
 struct server_task_result_telemetry : server_task_result {
     json data;
+    std::string serialized_data;
+    bool has_serialized_data = false;
 
     virtual json to_json() override {
         return data;
