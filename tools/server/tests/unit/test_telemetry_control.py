@@ -116,6 +116,73 @@ def test_request_and_environment_values_cannot_enable_global_control():
     assert detail["state"] == "not_enabled_for_request"
 
 
+def test_output_token_telemetry_preserves_requested_probability_mode():
+    server = _controlled_server()
+    server.start()
+
+    globally_disabled = server.make_request(
+        "POST",
+        "/completion",
+        data={
+            "prompt": "globally disabled telemetry probability mode",
+            "n_predict": 1,
+            "ignore_eos": True,
+            "output_token_telemetry": True,
+        },
+        headers=AUTH,
+    )
+    assert globally_disabled.status_code == 200
+    assert "completion_probabilities" not in globally_disabled.body
+    disabled_event = _completed_event(server, globally_disabled.body["trace_id"])
+    assert disabled_event["response_probability"]["state"] == "disabled"
+    assert disabled_event["output_token_telemetry"]["state"] == "not_enabled_for_request"
+
+    enabled = server.make_request(
+        "POST",
+        "/props",
+        data={"telemetry_control": {"output_token_detail": True}},
+        headers=AUTH,
+    )
+    assert enabled.status_code == 200
+
+    without_n_probs = server.make_request(
+        "POST",
+        "/completion",
+        data={
+            "prompt": "enabled telemetry without probabilities",
+            "n_predict": 1,
+            "ignore_eos": True,
+            "output_token_telemetry": True,
+        },
+        headers=AUTH,
+    )
+    assert without_n_probs.status_code == 200
+    assert "completion_probabilities" not in without_n_probs.body
+    without_n_probs_event = _completed_event(server, without_n_probs.body["trace_id"])
+    assert without_n_probs_event["response_probability"]["state"] == "disabled"
+    assert without_n_probs_event["output_token_telemetry"]["state"] == "available"
+    assert without_n_probs_event["output_token_telemetry"]["probability_state"] == "not_enabled_for_request"
+
+    requested = server.make_request(
+        "POST",
+        "/completion",
+        data={
+            "prompt": "explicitly requested probabilities",
+            "n_predict": 1,
+            "n_probs": 2,
+            "ignore_eos": True,
+            "output_token_telemetry": True,
+        },
+        headers=AUTH,
+    )
+    assert requested.status_code == 200
+    assert len(requested.body["completion_probabilities"]) == 1
+    assert len(requested.body["completion_probabilities"][0]["top_logprobs"]) == 2
+    requested_event = _completed_event(server, requested.body["trace_id"])
+    assert requested_event["response_probability"]["state"] == "available"
+    assert requested_event["output_token_telemetry"]["probability_state"] == "available"
+
+
 def test_props_requires_auth_props_api_key_and_loopback_listener():
     server = ServerPreset.router()
     server.server_props = True

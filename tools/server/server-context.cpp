@@ -2606,8 +2606,17 @@ private:
         return slot.has_next_token; // continue
     }
 
-    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+    bool populate_token_probs(
+            const server_slot & slot,
+            completion_token_output & result,
+            bool post_sampling,
+            bool special,
+            int idx,
+            double & raw_selected_logprob,
+            std::string & raw_unavailable_reason) const {
         const size_t n_probs_request = slot.task->params.sampling.n_probs;
+        raw_selected_logprob = std::numeric_limits<double>::quiet_NaN();
+        raw_unavailable_reason.clear();
 
         if (post_sampling) {
             const auto * cur_p = common_sampler_get_candidates(slot.smpl.get(), true);
@@ -2638,16 +2647,32 @@ private:
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+            std::vector<llama_token_data> cur;
+            const bool raw_available = raw_target_token_probabilities(
+                ctx_tgt,
+                idx,
+                result.tok,
+                0,
+                raw_selected_logprob,
+                nullptr,
+                &cur,
+                n_probs_request,
+                raw_unavailable_reason);
+            if (!raw_available) {
+                cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+            }
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
             // set probability for sampled token
-            for (size_t i = 0; i < max_probs; i++) {
-                // set probability for sampled token
-                if (cur[i].id == result.tok) {
-                    result.prob = cur[i].p;
-                    break;
+            if (raw_available) {
+                result.prob = (float) std::exp(raw_selected_logprob);
+            } else {
+                for (size_t i = 0; i < max_probs; i++) {
+                    if (cur[i].id == result.tok) {
+                        result.prob = cur[i].p;
+                        break;
+                    }
                 }
             }
 
@@ -2660,7 +2685,11 @@ private:
                     cur[i].p
                 });
             }
+
+            return raw_available;
         }
+
+        return false;
     }
 
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
@@ -4729,16 +4758,29 @@ private:
             double selected_log_probability_ln = std::numeric_limits<double>::quiet_NaN();
 
             if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+                std::string reason;
+                const bool raw_distribution_available = populate_token_probs(
+                    slot,
+                    result,
+                    slot.task->params.post_sampling_probs,
+                    params_base.special,
+                    tok_idx,
+                    selected_log_probability_ln,
+                    reason);
 
                 if (slot.response_probability.unavailable_reason.empty()) {
-                    double logprob = 0.0;
-                    std::string reason;
-                    if (selected_token_log_probability(ctx_tgt, tok_idx, id, logprob, reason)) {
-                        slot.response_probability.observe(logprob);
-                        selected_log_probability_ln = logprob;
-                    } else {
+                    if (raw_distribution_available) {
+                        slot.response_probability.observe(selected_log_probability_ln);
+                    } else if (!slot.task->params.post_sampling_probs) {
                         slot.response_probability.unavailable_reason = std::move(reason);
+                    } else {
+                        double logprob = 0.0;
+                        if (selected_token_log_probability(ctx_tgt, tok_idx, id, logprob, reason)) {
+                            slot.response_probability.observe(logprob);
+                            selected_log_probability_ln = logprob;
+                        } else {
+                            slot.response_probability.unavailable_reason = std::move(reason);
+                        }
                     }
                 }
             }
@@ -4919,6 +4961,8 @@ private:
                         top_k,
                         logprob,
                         candidate_enabled ? &candidates : nullptr,
+                        nullptr,
+                        0,
                         reason);
                     if (available) {
                         if (response_probability_enabled) {
@@ -5515,6 +5559,8 @@ private:
             size_t top_k,
             double & logprob,
             std::vector<telemetry_token_candidate_value> * candidates,
+            std::vector<llama_token_data> * top_probabilities,
+            size_t n_top_probabilities,
             std::string & unavailable_reason) const {
         const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
         if (selected < 0 || selected >= n_vocab) {
@@ -5538,6 +5584,10 @@ private:
         double max_logit = -std::numeric_limits<double>::infinity();
         std::vector<std::pair<double, llama_token>> top_logits;
         top_logits.reserve(std::min<size_t>(top_k, (size_t) n_vocab));
+        if (top_probabilities != nullptr) {
+            top_probabilities->clear();
+            top_probabilities->reserve(n_vocab);
+        }
         for (int32_t i = 0; i < n_vocab; ++i) {
             if (std::isnan(logits[i])) {
                 unavailable_reason = "target_logits_contain_nan";
@@ -5560,6 +5610,9 @@ private:
                     }
                 }
             }
+            if (top_probabilities != nullptr) {
+                top_probabilities->push_back({(llama_token) i, logits[i], 0.0f});
+            }
         }
         if (!std::isfinite(max_logit) || !std::isfinite(logits[selected])) {
             unavailable_reason = "selected_or_max_target_logit_not_finite";
@@ -5575,10 +5628,27 @@ private:
             return false;
         }
 
-        logprob = (double) logits[selected] - max_logit - std::log(sum_exp);
+        const double log_sum_exp = std::log(sum_exp);
+        logprob = (double) logits[selected] - max_logit - log_sum_exp;
         if (!std::isfinite(logprob)) {
             unavailable_reason = "selected_token_log_probability_not_finite";
             return false;
+        }
+        if (top_probabilities != nullptr) {
+            n_top_probabilities = std::min(n_top_probabilities, top_probabilities->size());
+            if (n_top_probabilities > 0) {
+                std::partial_sort(
+                    top_probabilities->begin(),
+                    top_probabilities->begin() + n_top_probabilities,
+                    top_probabilities->end(),
+                    [](const llama_token_data & lhs, const llama_token_data & rhs) {
+                        return lhs.logit > rhs.logit;
+                    });
+            }
+            top_probabilities->resize(n_top_probabilities);
+            for (auto & probability : *top_probabilities) {
+                probability.p = (float) std::exp((double) probability.logit - max_logit - log_sum_exp);
+            }
         }
         if (candidates != nullptr) {
             candidates->clear();
@@ -5586,7 +5656,7 @@ private:
             for (const auto & item : top_logits) {
                 telemetry_token_candidate_value candidate;
                 candidate.token_id = item.second;
-                candidate.log_probability_ln = item.first - max_logit - std::log(sum_exp);
+                candidate.log_probability_ln = item.first - max_logit - log_sum_exp;
                 candidate.target_selected = item.second == selected;
                 candidates->push_back(candidate);
             }
@@ -5607,6 +5677,8 @@ private:
             0,
             logprob,
             nullptr,
+            nullptr,
+            0,
             unavailable_reason);
     }
 
