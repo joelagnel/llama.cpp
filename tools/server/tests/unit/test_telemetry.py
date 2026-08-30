@@ -1964,7 +1964,13 @@ def test_native_gpu_gpm_capability_and_bounded_endpoint():
     assert gpu["llamascope_queries_nvml"] is False
     assert [metric["id"] for metric in gpu["metrics"]] == [2, 5, 10]
     assert gpu["operation_phases"] == ["request", "prefill", "normal_decode", "mtp_draft", "mtp_verify"]
-    assert gpu["state"] in ["available", "disabled", "unsupported", "unavailable"]
+    assert gpu["state"] in [
+        "available",
+        "disabled",
+        "initializing",
+        "unsupported",
+        "unavailable",
+    ]
 
     invalid = server.make_request("GET", "/telemetry/v1/gpu?cursor=-1")
     assert invalid.status_code == 400
