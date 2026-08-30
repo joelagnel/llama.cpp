@@ -124,6 +124,35 @@ def test_request_and_environment_values_cannot_enable_global_control():
     assert detail["state"] == "not_enabled_for_request"
 
 
+def test_dense_model_never_emits_moe_routing_chunks():
+    server = _controlled_server()
+    server.start()
+    try:
+        control = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"moe_routing": True}},
+            headers=AUTH,
+        )
+        assert control.status_code == 200
+        assert control.body["telemetry_control"]["applicability"]["moe_routing"]["applicable"] is False
+
+        completion = server.make_request(
+            "POST",
+            "/completion",
+            data={"prompt": "dense telemetry remains available", "n_predict": 1},
+            headers=AUTH,
+        )
+        assert completion.status_code == 200
+        events = server.make_request(
+            "GET", "/telemetry/v1/events?cursor=0&limit=100", headers=AUTH
+        )
+        assert events.status_code == 200
+        assert not any(event["event"] == "moe_routing_chunk" for event in events.body["events"])
+    finally:
+        server.stop()
+
+
 def test_output_token_telemetry_preserves_requested_probability_mode():
     server = _controlled_server()
     server.start()

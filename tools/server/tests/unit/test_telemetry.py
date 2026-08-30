@@ -1741,7 +1741,7 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
     server.server_metrics = True
     server.server_props = True
     server.api_key = api_key
-    server.n_batch = 16
+    server.n_batch = 4
     server.n_ubatch = 2
     server.start()
 
@@ -1777,20 +1777,32 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == trace_id
         ]
         assert chunks
+        assert all(chunk["moe_routing_schema_version"] == 2 for chunk in chunks)
         assert [chunk["trace_chunk_sequence"] for chunk in chunks] == list(range(1, len(chunks) + 1))
         assert chunks[-1]["final"] is True
         assert chunks[-1]["decisions"] == []
+        assert chunks[-1]["producer_coverage"]["state"] == "complete"
 
         decisions = [
             decision for chunk in chunks if not chunk["final"] for decision in chunk["decisions"]
         ]
         assert decisions
+        assert [decision["trace_decision_sequence"] for decision in decisions] == list(
+            range(1, len(decisions) + 1)
+        )
         assert {decision["phase"] for decision in decisions} >= {"prefill", "decode"}
         assert all(chunk["serialized_bytes"] <= 1024 * 1024 for chunk in chunks)
+        assert all(
+            chunk["serialized_bytes"] == len(
+                json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            )
+            for chunk in chunks
+        )
         assert all(chunk["sequence"] > 0 for chunk in chunks)
         assert all(chunk["server_instance_id"] == events_response.body["server_instance_id"] for chunk in chunks)
         assert all(chunk["physical_peer_coverage"] in ["complete", "partial"] for chunk in chunks)
         assert all("shared_experts" in chunk for chunk in chunks)
+        assert len({decision["physical_ubatch_index"] for decision in decisions}) >= 2
         for decision in decisions:
             assert decision["physical_step_id"] > 0
             assert decision["physical_ubatch_index"] >= 0
@@ -1821,6 +1833,87 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         assert not any(
             event["event"] == "moe_routing_chunk" and event["trace_id"] == opted_out.body["trace_id"]
             for event in events_response.body["events"]
+        )
+    finally:
+        server.stop()
+
+
+def test_moe_routing_chunks_mark_on_off_on_intervals_partial():
+    global server
+
+    api_key = "moe-routing-toggle-test-key"
+    auth = {"Authorization": f"Bearer {api_key}"}
+    server = ServerPreset.stories15m_moe()
+    server.server_props = True
+    server.api_key = api_key
+    # Keep this request in flight across multiple physical microbatches so the
+    # control boundaries are observed by the decode-side capture path.
+    server.n_batch = 4
+    server.n_ubatch = 2
+    server.n_threads = 1
+    server.start()
+
+    try:
+        enabled = server.make_request(
+            "POST", "/props", data={"telemetry_control": {"moe_routing": True}}, headers=auth
+        )
+        assert enabled.status_code == 200
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            completion = executor.submit(
+                server.make_request,
+                "POST",
+                "/completion",
+                {
+                    "prompt": "routing interval " * 96,
+                    "n_predict": 24,
+                    "ignore_eos": True,
+                    "temperature": 0,
+                },
+                auth,
+            )
+            toggled = False
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and not completion.done():
+                events = server.make_request(
+                    "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
+                )
+                if any(event["event"] == "moe_routing_chunk" for event in events.body["events"]):
+                    disabled = server.make_request(
+                        "POST", "/props", data={"telemetry_control": {}}, headers=auth
+                    )
+                    assert disabled.status_code == 200
+                    assert disabled.body["telemetry_control"]["generation"] == 2
+                    time.sleep(0.05)
+                    reenabled = server.make_request(
+                        "POST", "/props", data={"telemetry_control": {"moe_routing": True}}, headers=auth
+                    )
+                    assert reenabled.status_code == 200
+                    assert reenabled.body["telemetry_control"]["generation"] == 3
+                    toggled = True
+                    break
+                time.sleep(0.01)
+            assert toggled
+            response = completion.result(timeout=60)
+            assert response.status_code == 200
+
+        events = server.make_request(
+            "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
+        )
+        chunks = [
+            event for event in events.body["events"]
+            if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
+        ]
+        assert chunks[-1]["final"] is True
+        assert chunks[-1]["producer_coverage"]["state"] == "partial"
+        assert chunks[-1]["capture_interruption_reason"] == "telemetry_control_disabled"
+        assert any(
+            decision["control_generation"] == 1
+            for chunk in chunks if not chunk["final"] for decision in chunk["decisions"]
+        )
+        assert any(
+            decision["control_generation"] == 3
+            for chunk in chunks if not chunk["final"] for decision in chunk["decisions"]
         )
     finally:
         server.stop()
