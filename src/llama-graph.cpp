@@ -1408,17 +1408,36 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         if (output.effective_weights != nullptr) {
             ggml_set_output(output.effective_weights);
         }
+        if (output.selected_score != nullptr) {
+            ggml_set_output(output.selected_score);
+        }
+        if (output.rejected_score != nullptr) {
+            ggml_set_output(output.rejected_score);
+        }
     }
 }
 
 void llm_graph_result::add_moe_routing_output(
         int32_t layer_index,
         ggml_tensor * selected_experts,
-        ggml_tensor * effective_weights) {
+        ggml_tensor * effective_weights,
+        ggml_tensor * selected_score,
+        ggml_tensor * rejected_score,
+        uint32_t shared_expert_count,
+        uint32_t shared_expert_ffn_size) {
     GGML_ASSERT(params.cparams.moe_routing);
     GGML_ASSERT(selected_experts != nullptr);
     GGML_ASSERT(effective_weights != nullptr);
-    moe_routing_outputs.push_back({ layer_index, selected_experts, effective_weights });
+    moe_routing_outputs.push_back({
+        layer_index,
+        params.gtype,
+        selected_experts,
+        effective_weights,
+        selected_score,
+        rejected_score,
+        shared_expert_count,
+        shared_expert_ffn_size,
+    });
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -2077,6 +2096,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
+    ggml_tensor * selected_score = nullptr;
+    ggml_tensor * rejected_score = nullptr;
+    if (cparams.moe_routing && n_expert_used > 0) {
+        ggml_tensor * selection_probs_readback = ggml_reshape_3d(ctx0, selection_probs, 1, n_expert, n_tokens);
+        ggml_tensor * selected_expert_tail = ggml_view_2d(
+                ctx0, selected_experts, 1, n_tokens, selected_experts->nb[1], (n_expert_used - 1)*selected_experts->nb[0]);
+        selected_score = ggml_get_rows(ctx0, selection_probs_readback, selected_expert_tail);
+        cb(selected_score, "ffn_moe_routing_selected_score", il);
+
+        if (n_expert_used < n_expert) {
+            ggml_tensor * rejected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used + 1);
+            ggml_tensor * rejected_expert_head = ggml_view_2d(
+                    ctx0, rejected_experts, 1, n_tokens, rejected_experts->nb[1], n_expert_used*rejected_experts->nb[0]);
+            rejected_score = ggml_get_rows(ctx0, selection_probs_readback, rejected_expert_head);
+            cb(rejected_score, "ffn_moe_routing_rejected_score", il);
+        }
+
+        ggml_build_forward_expand(gf, selected_score);
+        if (rejected_score != nullptr) {
+            ggml_build_forward_expand(gf, rejected_score);
+        }
+    }
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -2123,7 +2165,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // the diagnostic path only performs bounded asynchronous host copies.
         cb(selected_experts, "ffn_moe_routing_ids", il);
         cb(weights, "ffn_moe_routing_weights", il);
-        res->add_moe_routing_output(il, selected_experts, weights);
+        const uint32_t shared_expert_count = hparams.n_expert_shared;
+        const uint32_t shared_expert_ffn_size = hparams.n_ff_shexp
+            ? hparams.n_ff_shexp
+            : hparams.n_ff_exp*shared_expert_count;
+        res->add_moe_routing_output(
+                il,
+                selected_experts,
+                weights,
+                selected_score,
+                rejected_score,
+                shared_expert_count,
+                shared_expert_ffn_size);
     }
 
     //call early so that topk-moe can be used

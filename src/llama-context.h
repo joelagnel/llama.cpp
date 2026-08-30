@@ -117,6 +117,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_moe_routing(bool value);
     const llama_moe_routing_entry * get_moe_routing(size_t * count);
+    const llama_moe_routing_readback * get_moe_routing_readback();
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -240,7 +241,13 @@ private:
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
-    void extract_moe_routing(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch);
+    void extract_moe_routing(
+            const llm_graph_result * res,
+            size_t token_offset,
+            uint32_t physical_ubatch_index,
+            const llama_ubatch & ubatch);
+    void clear_moe_routing_readback();
+    void materialize_moe_routing_readback();
 
     //
     // graph
@@ -312,29 +319,51 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
 
+    struct moe_routing_tensor_capture {
+        std::array<int64_t, GGML_MAX_DIMS> ne {};
+        std::array<size_t, GGML_MAX_DIMS> nb {};
+        std::vector<uint8_t> data;
+        llama_moe_routing_value_status status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    };
+
+    struct moe_routing_row_identity {
+        int32_t ubatch_token_index = -1;
+        int32_t token_index = -1;
+        llama_token token = -1;
+        llama_pos position = -1;
+        llama_moe_routing_value_status status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    };
+
     struct moe_routing_capture {
         int32_t layer_index = -1;
+        uint32_t graph_type = 0;
+        uint32_t physical_ubatch_index = 0;
+        uint32_t shared_expert_count = 0;
+        uint32_t shared_expert_ffn_size = 0;
         size_t token_count = 0;
         size_t experts_per_token = 0;
-        size_t expert_stride = 0;
-        size_t token_dim_1 = 0;
-        size_t token_dim_2 = 0;
-        size_t token_stride_1 = 0;
-        size_t token_stride_2 = 0;
-        size_t token_stride_3 = 0;
-        size_t weight_expert_stride = 0;
-        size_t weight_token_dim_1 = 0;
-        size_t weight_token_dim_2 = 0;
-        size_t weight_token_stride_1 = 0;
-        size_t weight_token_stride_2 = 0;
-        std::vector<int32_t> token_indices;
-        std::vector<uint8_t> data;
-        std::vector<uint8_t> weight_data;
+        bool has_row_shape = false;
+        moe_routing_tensor_capture selected_experts;
+        moe_routing_tensor_capture effective_weights;
+        moe_routing_tensor_capture selected_score;
+        moe_routing_tensor_capture rejected_score;
+        std::vector<moe_routing_row_identity> row_identities;
+    };
+
+    struct moe_routing_readback_row {
+        llama_moe_routing_row row;
+        std::vector<llama_moe_routing_expert> selected_experts;
     };
 
     std::vector<moe_routing_capture> moe_routing_captures;
     size_t moe_routing_capture_count = 0;
     std::vector<llama_moe_routing_entry> moe_routing_entries;
+    std::vector<moe_routing_readback_row> moe_routing_readback_rows;
+    std::vector<llama_moe_routing_row> moe_routing_readback_rows_view;
+    std::vector<llama_moe_shared_expert_metadata> moe_routing_shared_experts;
+    llama_moe_routing_readback moe_routing_readback;
+    uint64_t moe_routing_capture_generation = 0;
+    bool moe_routing_readback_ready = false;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

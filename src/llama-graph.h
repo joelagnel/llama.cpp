@@ -892,8 +892,13 @@ struct llm_graph_fused_node {
 
 struct llm_graph_moe_routing_output {
     int32_t layer_index = -1;
+    llm_graph_type graph_type = LLM_GRAPH_TYPE_DEFAULT;
     ggml_tensor * selected_experts = nullptr; // I32 [experts_per_token, tokens]
     ggml_tensor * effective_weights = nullptr; // F32 [1, experts_per_token, tokens]
+    ggml_tensor * selected_score = nullptr; // F32 [1, 1, tokens], after bias/group masking
+    ggml_tensor * rejected_score = nullptr; // F32 [1, 1, tokens], after bias/group masking
+    uint32_t shared_expert_count = 0;
+    uint32_t shared_expert_ffn_size = 0;
 };
 
 class llm_graph_result {
@@ -934,7 +939,11 @@ public:
     void add_moe_routing_output(
             int32_t layer_index,
             ggml_tensor * selected_experts,
-            ggml_tensor * effective_weights);
+            ggml_tensor * effective_weights,
+            ggml_tensor * selected_score,
+            ggml_tensor * rejected_score,
+            uint32_t shared_expert_count,
+            uint32_t shared_expert_ffn_size);
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
     const std::vector<llm_graph_moe_routing_output> & get_moe_routing_outputs() const { return moe_routing_outputs; }

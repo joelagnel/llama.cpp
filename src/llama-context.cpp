@@ -1205,68 +1205,218 @@ void llama_context::set_moe_routing(bool value) {
     }
 
     cparams.moe_routing = value;
+    clear_moe_routing_readback();
+    sched_need_reserve = true;
+}
+
+void llama_context::clear_moe_routing_readback() {
     moe_routing_capture_count = 0;
     moe_routing_entries.clear();
-    sched_need_reserve = true;
+    moe_routing_readback_rows.clear();
+    moe_routing_readback_rows_view.clear();
+    moe_routing_shared_experts.clear();
+    moe_routing_readback = {};
+    moe_routing_readback.version = LLAMA_MOE_ROUTING_READBACK_VERSION;
+    moe_routing_readback.struct_size = sizeof(moe_routing_readback);
+    moe_routing_readback_ready = false;
+}
+
+void llama_context::materialize_moe_routing_readback() {
+    GGML_ASSERT(cparams.moe_routing);
+    GGML_ASSERT(model.hparams.n_expert > 0);
+
+    if (moe_routing_readback_ready) {
+        return;
+    }
+
+    synchronize();
+    moe_routing_entries.clear();
+    moe_routing_readback_rows.clear();
+    moe_routing_readback_rows_view.clear();
+    moe_routing_shared_experts.clear();
+
+    size_t total_rows = 0;
+    for (size_t i = 0; i < moe_routing_capture_count; ++i) {
+        total_rows += moe_routing_captures[i].token_count;
+    }
+    moe_routing_readback_rows.reserve(total_rows);
+
+    auto read_element = [](const moe_routing_tensor_capture & capture, size_t element, auto * value) {
+        if (capture.status != LLAMA_MOE_ROUTING_VALUE_STATUS_VALID) {
+            return false;
+        }
+
+        size_t offset = 0;
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            if (capture.ne[dim] <= 0) {
+                return false;
+            }
+            const size_t index = element % (size_t) capture.ne[dim];
+            element /= (size_t) capture.ne[dim];
+            offset += index*capture.nb[dim];
+        }
+        if (element != 0 || offset + sizeof(*value) > capture.data.size()) {
+            return false;
+        }
+
+        memcpy(value, capture.data.data() + offset, sizeof(*value));
+        return true;
+    };
+
+    for (size_t capture_index = 0; capture_index < moe_routing_capture_count; ++capture_index) {
+        const auto & capture = moe_routing_captures[capture_index];
+
+        bool has_shared_expert_metadata = false;
+        for (const auto & metadata : moe_routing_shared_experts) {
+            if (metadata.layer_index == capture.layer_index && metadata.graph_type == capture.graph_type) {
+                has_shared_expert_metadata = true;
+                break;
+            }
+        }
+        if (!has_shared_expert_metadata) {
+            moe_routing_shared_experts.push_back({
+                capture.layer_index,
+                capture.graph_type,
+                capture.shared_expert_count > 0 || capture.shared_expert_ffn_size > 0,
+                capture.shared_expert_count,
+                capture.shared_expert_ffn_size,
+            });
+        }
+
+        for (size_t token = 0; token < capture.token_count; ++token) {
+            moe_routing_readback_rows.emplace_back();
+            auto & materialized = moe_routing_readback_rows.back();
+            auto & row = materialized.row;
+
+            row.layer_index = capture.layer_index;
+            row.graph_type = capture.graph_type;
+            row.physical_ubatch_index = capture.physical_ubatch_index;
+            row.row_index = capture.has_row_shape ? (int32_t) token : -1;
+            row.selected_experts_status = capture.selected_experts.status;
+
+            if (token < capture.row_identities.size()) {
+                const auto & identity = capture.row_identities[token];
+                row.ubatch_token_index = identity.ubatch_token_index;
+                row.token_index = identity.token_index;
+                row.token = identity.token;
+                row.position = identity.position;
+                row.row_identity_status = identity.status;
+            }
+
+            materialized.selected_experts.resize(capture.experts_per_token);
+            for (size_t expert = 0; expert < capture.experts_per_token; ++expert) {
+                auto & selected = materialized.selected_experts[expert];
+                selected.expert_index_status = capture.selected_experts.status;
+                selected.effective_weight_status = capture.effective_weights.status;
+
+                int32_t expert_index = -1;
+                if (read_element(capture.selected_experts, expert + capture.experts_per_token*token, &expert_index)) {
+                    selected.expert_index = expert_index;
+                    selected.expert_index_status = expert_index >= 0 && expert_index < (int32_t) model.hparams.n_expert
+                        ? LLAMA_MOE_ROUTING_VALUE_STATUS_VALID
+                        : LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
+                    if (selected.expert_index_status != LLAMA_MOE_ROUTING_VALUE_STATUS_VALID) {
+                        row.selected_experts_status = LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
+                    }
+                } else if (selected.expert_index_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID) {
+                    selected.expert_index_status = LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
+                    row.selected_experts_status = LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
+                }
+
+                float effective_weight = std::numeric_limits<float>::quiet_NaN();
+                if (read_element(capture.effective_weights, expert + capture.experts_per_token*token, &effective_weight)) {
+                    selected.effective_weight = effective_weight;
+                    selected.effective_weight_status = std::isfinite(effective_weight)
+                        ? LLAMA_MOE_ROUTING_VALUE_STATUS_VALID
+                        : LLAMA_MOE_ROUTING_VALUE_STATUS_NONFINITE;
+                } else if (selected.effective_weight_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID) {
+                    selected.effective_weight_status = LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
+                }
+            }
+            row.selected_expert_count = materialized.selected_experts.size();
+
+            float selected_score = std::numeric_limits<float>::quiet_NaN();
+            row.selected_score_status = capture.selected_score.status;
+            if (read_element(capture.selected_score, token, &selected_score)) {
+                row.selected_score = selected_score;
+                row.selected_score_status = std::isfinite(selected_score)
+                    ? LLAMA_MOE_ROUTING_VALUE_STATUS_VALID
+                    : LLAMA_MOE_ROUTING_VALUE_STATUS_NONFINITE;
+            } else if (row.selected_score_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID) {
+                row.selected_score_status = LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
+            }
+
+            float rejected_score = std::numeric_limits<float>::quiet_NaN();
+            row.rejected_score_status = capture.rejected_score.status;
+            if (read_element(capture.rejected_score, token, &rejected_score)) {
+                row.rejected_score = rejected_score;
+                row.rejected_score_status = std::isfinite(rejected_score)
+                    ? LLAMA_MOE_ROUTING_VALUE_STATUS_VALID
+                    : LLAMA_MOE_ROUTING_VALUE_STATUS_NONFINITE;
+            } else if (row.rejected_score_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID) {
+                row.rejected_score_status = LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
+            }
+        }
+    }
+
+    moe_routing_readback_rows_view.reserve(moe_routing_readback_rows.size());
+    for (auto & materialized : moe_routing_readback_rows) {
+        materialized.row.selected_experts = materialized.selected_experts.empty()
+            ? nullptr
+            : materialized.selected_experts.data();
+        moe_routing_readback_rows_view.push_back(materialized.row);
+    }
+
+    moe_routing_readback.version = LLAMA_MOE_ROUTING_READBACK_VERSION;
+    moe_routing_readback.struct_size = sizeof(moe_routing_readback);
+    moe_routing_readback.capture_generation = moe_routing_capture_generation;
+    moe_routing_readback.row_count = moe_routing_readback_rows_view.size();
+    moe_routing_readback.rows = moe_routing_readback_rows_view.empty() ? nullptr : moe_routing_readback_rows_view.data();
+    moe_routing_readback.shared_expert_count = moe_routing_shared_experts.size();
+    moe_routing_readback.shared_experts = moe_routing_shared_experts.empty() ? nullptr : moe_routing_shared_experts.data();
+    moe_routing_readback_ready = true;
+
+    // Host materialization owns the data now. The reusable async-copy slots can
+    // be used by the next enabled decode without another synchronization.
+    moe_routing_capture_count = 0;
+}
+
+const llama_moe_routing_readback * llama_context::get_moe_routing_readback() {
+    if (model.hparams.n_expert == 0 || !cparams.moe_routing) {
+        return nullptr;
+    }
+    if (!moe_routing_readback_ready) {
+        if (moe_routing_capture_count == 0) {
+            return nullptr;
+        }
+        materialize_moe_routing_readback();
+    }
+    return &moe_routing_readback;
 }
 
 const llama_moe_routing_entry * llama_context::get_moe_routing(size_t * count) {
     GGML_ASSERT(count != nullptr);
 
-    if (model.hparams.n_expert == 0 || !cparams.moe_routing || moe_routing_capture_count == 0) {
+    const auto * readback = get_moe_routing_readback();
+    if (readback == nullptr) {
         *count = 0;
         return nullptr;
     }
 
-    synchronize();
     moe_routing_entries.clear();
-
-    size_t total = 0;
-    for (size_t i = 0; i < moe_routing_capture_count; ++i) {
-        total += moe_routing_captures[i].token_count*moe_routing_captures[i].experts_per_token;
-    }
-    moe_routing_entries.reserve(total);
-
-    for (size_t i = 0; i < moe_routing_capture_count; ++i) {
-        const auto & capture = moe_routing_captures[i];
-        for (size_t token = 0; token < capture.token_count; ++token) {
-            const size_t token_1 = token % capture.token_dim_1;
-            const size_t token_2 = (token / capture.token_dim_1) % capture.token_dim_2;
-            const size_t token_3 = token / (capture.token_dim_1*capture.token_dim_2);
-            for (size_t expert = 0; expert < capture.experts_per_token; ++expert) {
-                int32_t expert_id = -1;
-                const size_t offset = expert*capture.expert_stride
-                    + token_1*capture.token_stride_1
-                    + token_2*capture.token_stride_2
-                    + token_3*capture.token_stride_3;
-                GGML_ASSERT(offset + sizeof(expert_id) <= capture.data.size());
-                memcpy(&expert_id, capture.data.data() + offset, sizeof(expert_id));
-
-                float effective_weight = std::numeric_limits<float>::quiet_NaN();
-                if (!capture.weight_data.empty()) {
-                    const size_t weight_token_1 = token % capture.weight_token_dim_1;
-                    const size_t weight_token_2 = token / capture.weight_token_dim_1;
-                    GGML_ASSERT(weight_token_2 < capture.weight_token_dim_2);
-                    const size_t weight_offset = expert*capture.weight_expert_stride
-                        + weight_token_1*capture.weight_token_stride_1
-                        + weight_token_2*capture.weight_token_stride_2;
-                    GGML_ASSERT(weight_offset + sizeof(effective_weight) <= capture.weight_data.size());
-                    memcpy(&effective_weight, capture.weight_data.data() + weight_offset, sizeof(effective_weight));
-                }
-                moe_routing_entries.push_back({
-                    capture.layer_index,
-                    capture.token_indices[token],
-                    expert_id,
-                    effective_weight,
-                });
-            }
+    for (size_t row_index = 0; row_index < readback->row_count; ++row_index) {
+        const auto & row = readback->rows[row_index];
+        for (size_t expert_index = 0; expert_index < row.selected_expert_count; ++expert_index) {
+            const auto & selected = row.selected_experts[expert_index];
+            moe_routing_entries.push_back({
+                row.layer_index,
+                row.token_index,
+                selected.expert_index,
+                selected.effective_weight,
+            });
         }
     }
 
-    // The asynchronous copies are synchronized and materialized above, so the
-    // reusable capture slots can be overwritten by the next diagnostic batch
-    // without forcing a second synchronization.
-    moe_routing_capture_count = 0;
     *count = moe_routing_entries.size();
     return moe_routing_entries.empty() ? nullptr : moe_routing_entries.data();
 }
@@ -1761,8 +1911,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (moe_routing_capture_count > 0) {
             synchronize();
         }
-        moe_routing_capture_count = 0;
-        moe_routing_entries.clear();
+        ++moe_routing_capture_generation;
+        clear_moe_routing_readback();
     }
 
     // embedding contexts output every token even when batch.logits is not set
@@ -1896,6 +2046,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    uint32_t physical_ubatch_index = 0;
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -2056,7 +2207,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
         if (res->has_moe_routing_outputs()) {
-            extract_moe_routing(res, n_tokens_prev, ubatch);
+            extract_moe_routing(res, n_tokens_prev, physical_ubatch_index, ubatch);
         }
 
         // extract nextn embeddings before
@@ -2090,6 +2241,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        ++physical_ubatch_index;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -2342,97 +2494,135 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
     }
 }
 
-void llama_context::extract_moe_routing(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch) {
+void llama_context::extract_moe_routing(
+        const llm_graph_result * res,
+        size_t token_offset,
+        uint32_t physical_ubatch_index,
+        const llama_ubatch & ubatch) {
     const auto & outputs = res->get_moe_routing_outputs();
     GGML_ASSERT(!outputs.empty());
 
+    auto capture_tensor = [&](ggml_tensor * tensor, ggml_type type, moe_routing_tensor_capture & capture) {
+        capture = {};
+        if (tensor == nullptr) {
+            capture.status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+            return;
+        }
+        if (tensor->type != type) {
+            capture.status = LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
+            return;
+        }
+
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            capture.ne[dim] = tensor->ne[dim];
+            capture.nb[dim] = tensor->nb[dim];
+        }
+        capture.data.resize(ggml_nbytes(tensor));
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
+        if (backend == nullptr) {
+            capture.data.clear();
+            capture.status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+            return;
+        }
+
+        ggml_backend_tensor_get_async(backend, tensor, capture.data.data(), 0, capture.data.size());
+        capture.status = LLAMA_MOE_ROUTING_VALUE_STATUS_VALID;
+    };
+
     for (const auto & output : outputs) {
-        ggml_tensor * tensor = output.selected_experts;
-        if (tensor == nullptr || tensor->type != GGML_TYPE_I32 || tensor->ne[0] <= 0) {
-            continue;
-        }
-
-        const size_t tensor_tokens = (size_t) ggml_nelements(tensor)/(size_t) tensor->ne[0];
-        if (tensor_tokens == 0) {
-            continue;
-        }
-
-        std::vector<int32_t> token_indices;
-        token_indices.reserve(tensor_tokens);
-        if (tensor_tokens == ubatch.n_tokens) {
-            for (size_t token = 0; token < tensor_tokens; ++token) {
-                token_indices.push_back((int32_t) (token_offset + token));
-            }
-        } else if (ubatch.output != nullptr) {
-            for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
-                if (ubatch.output[token]) {
-                    token_indices.push_back((int32_t) (token_offset + token));
-                }
-            }
-        }
-        if (token_indices.size() != tensor_tokens) {
-            LLAMA_LOG_WARN("%s: cannot map %zu MoE layer %d rows to %u batch tokens\n",
-                    __func__, tensor_tokens, output.layer_index, ubatch.n_tokens);
-            continue;
-        }
-
         if (moe_routing_capture_count == moe_routing_captures.size()) {
             moe_routing_captures.emplace_back();
         }
 
         auto & capture = moe_routing_captures[moe_routing_capture_count++];
+        capture = {};
         capture.layer_index = output.layer_index;
-        capture.token_count = tensor_tokens;
-        capture.experts_per_token = (size_t) tensor->ne[0];
-        capture.expert_stride = tensor->nb[0];
-        capture.token_dim_1 = (size_t) tensor->ne[1];
-        capture.token_dim_2 = (size_t) tensor->ne[2];
-        capture.token_stride_1 = tensor->nb[1];
-        capture.token_stride_2 = tensor->nb[2];
-        capture.token_stride_3 = tensor->nb[3];
-        capture.token_indices = std::move(token_indices);
-        capture.data.resize(ggml_nbytes(tensor));
-        capture.weight_data.clear();
+        capture.graph_type = (uint32_t) output.graph_type;
+        capture.physical_ubatch_index = physical_ubatch_index;
+        capture.shared_expert_count = output.shared_expert_count;
+        capture.shared_expert_ffn_size = output.shared_expert_ffn_size;
 
-        GGML_ASSERT(capture.expert_stride == sizeof(int32_t));
-        GGML_ASSERT(capture.token_stride_1 >= capture.experts_per_token*capture.expert_stride);
+        ggml_tensor * selected_experts = output.selected_experts;
+        const bool selected_experts_usable = selected_experts != nullptr
+            && selected_experts->type == GGML_TYPE_I32
+            && selected_experts->ne[0] > 0
+            && ggml_nelements(selected_experts) % selected_experts->ne[0] == 0;
+        if (!selected_experts_usable) {
+            capture.token_count = 1;
+            capture.row_identities.resize(1);
+            capture.selected_experts.status = selected_experts == nullptr
+                ? LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE
+                : LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
+            continue;
+        }
 
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
-        GGML_ASSERT(backend != nullptr);
-        ggml_backend_tensor_get_async(backend, tensor, capture.data.data(), 0, capture.data.size());
+        capture.experts_per_token = (size_t) selected_experts->ne[0];
+        capture.token_count = (size_t) ggml_nelements(selected_experts)/capture.experts_per_token;
+        capture.has_row_shape = true;
+        capture.row_identities.resize(capture.token_count);
+        capture_tensor(selected_experts, GGML_TYPE_I32, capture.selected_experts);
+
+        if (capture.token_count == ubatch.n_tokens) {
+            for (size_t token = 0; token < capture.token_count; ++token) {
+                capture.row_identities[token] = {
+                    (int32_t) token,
+                    (int32_t) (token_offset + token),
+                    ubatch.token ? ubatch.token[token] : -1,
+                    ubatch.pos ? ubatch.pos[token*ubatch.n_pos] : -1,
+                    LLAMA_MOE_ROUTING_VALUE_STATUS_VALID,
+                };
+            }
+        } else if (ubatch.output != nullptr) {
+            size_t row = 0;
+            for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
+                if (ubatch.output[token]) {
+                    if (row == capture.token_count) {
+                        break;
+                    }
+                    capture.row_identities[row++] = {
+                        (int32_t) token,
+                        (int32_t) (token_offset + token),
+                        ubatch.token ? ubatch.token[token] : -1,
+                        ubatch.pos ? ubatch.pos[token*ubatch.n_pos] : -1,
+                        LLAMA_MOE_ROUTING_VALUE_STATUS_VALID,
+                    };
+                }
+            }
+            if (row != capture.token_count) {
+                LLAMA_LOG_WARN("%s: cannot map %zu MoE layer %d rows to %u batch tokens\n",
+                        __func__, capture.token_count, output.layer_index, ubatch.n_tokens);
+            }
+        }
 
         ggml_tensor * weights = output.effective_weights;
         const bool weights_usable = weights != nullptr
             && weights->type == GGML_TYPE_F32
             && weights->ne[0] == 1
             && weights->ne[1] == (int64_t) capture.experts_per_token
-            && (size_t) ggml_nelements(weights)/(size_t) (weights->ne[0]*weights->ne[1]) == tensor_tokens;
-        if (!weights_usable) {
-            LLAMA_LOG_WARN("%s: cannot retain MoE layer %d effective weights with the selected expert IDs\n",
-                    __func__, output.layer_index);
-            continue;
+            && (size_t) ggml_nelements(weights)/(size_t) (weights->ne[0]*weights->ne[1]) == capture.token_count;
+        if (weights_usable) {
+            capture_tensor(weights, GGML_TYPE_F32, capture.effective_weights);
+        } else {
+            capture.effective_weights.status = weights == nullptr
+                ? LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE
+                : LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
         }
 
-        capture.weight_expert_stride = weights->nb[1];
-        capture.weight_token_dim_1 = (size_t) weights->ne[2];
-        capture.weight_token_dim_2 = (size_t) weights->ne[3];
-        capture.weight_token_stride_1 = weights->nb[2];
-        capture.weight_token_stride_2 = weights->nb[3];
-        capture.weight_data.resize(ggml_nbytes(weights));
-
-        GGML_ASSERT(weights->nb[0] == sizeof(float));
-        GGML_ASSERT(capture.weight_token_dim_1*capture.weight_token_dim_2 == tensor_tokens);
-        GGML_ASSERT(capture.weight_expert_stride >= sizeof(float));
-        GGML_ASSERT(capture.weight_token_stride_1 >= capture.experts_per_token*capture.weight_expert_stride);
-
-        ggml_backend_t weights_backend = ggml_backend_sched_get_tensor_backend(sched.get(), weights);
-        GGML_ASSERT(weights_backend != nullptr);
-        ggml_backend_tensor_get_async(
-            weights_backend,
-            weights,
-            capture.weight_data.data(),
-            0,
-            capture.weight_data.size());
+        auto capture_score = [&](ggml_tensor * score, moe_routing_tensor_capture & score_capture) {
+            const bool score_usable = score != nullptr
+                && score->type == GGML_TYPE_F32
+                && (size_t) ggml_nelements(score) == capture.token_count;
+            if (score_usable) {
+                capture_tensor(score, GGML_TYPE_F32, score_capture);
+            } else {
+                score_capture.status = score == nullptr
+                    ? LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE
+                    : LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID;
+            }
+        };
+        capture_score(output.selected_score, capture.selected_score);
+        capture_score(output.rejected_score, capture.rejected_score);
     }
 }
 
@@ -4040,6 +4230,10 @@ void llama_set_moe_routing(llama_context * ctx, bool enabled) {
 
 const llama_moe_routing_entry * llama_get_moe_routing(llama_context * ctx, size_t * count) {
     return ctx->get_moe_routing(count);
+}
+
+const llama_moe_routing_readback * llama_get_moe_routing_readback(llama_context * ctx) {
+    return ctx->get_moe_routing_readback();
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

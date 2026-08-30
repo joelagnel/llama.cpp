@@ -132,6 +132,72 @@ LLAMA_API const llama_moe_routing_entry * llama_get_moe_routing(
         struct llama_context * ctx,
         size_t * count);
 
+// Versioned readback for routed MoE rows. The result and every pointer it
+// contains remain valid until the next llama_decode(), llama_set_moe_routing(),
+// or llama_context destruction. The caller must copy the result before it
+// starts another decode on the same context.
+constexpr uint32_t LLAMA_MOE_ROUTING_READBACK_VERSION = 1;
+
+enum llama_moe_routing_value_status : uint8_t {
+    LLAMA_MOE_ROUTING_VALUE_STATUS_VALID = 0,
+    LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE,
+    LLAMA_MOE_ROUTING_VALUE_STATUS_INVALID,
+    LLAMA_MOE_ROUTING_VALUE_STATUS_NONFINITE,
+};
+
+struct llama_moe_routing_expert {
+    int32_t expert_index = -1;
+    float effective_weight = std::numeric_limits<float>::quiet_NaN();
+    llama_moe_routing_value_status expert_index_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    llama_moe_routing_value_status effective_weight_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+};
+
+struct llama_moe_routing_row {
+    int32_t layer_index = -1;
+    uint32_t graph_type = 0;
+    uint32_t physical_ubatch_index = 0;
+    int32_t row_index = -1;
+    int32_t ubatch_token_index = -1;
+    int32_t token_index = -1; // zero-based position in the logical llama_decode() batch
+    llama_token token = -1;
+    llama_pos position = -1;
+
+    size_t selected_expert_count = 0;
+    const llama_moe_routing_expert * selected_experts = nullptr;
+    llama_moe_routing_value_status row_identity_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    llama_moe_routing_value_status selected_experts_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+
+    // Scores are from the selection source after selection bias and group
+    // masking. A missing K+1 candidate is source-unavailable, not truncation.
+    float selected_score = std::numeric_limits<float>::quiet_NaN();
+    float rejected_score = std::numeric_limits<float>::quiet_NaN();
+    llama_moe_routing_value_status selected_score_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    llama_moe_routing_value_status rejected_score_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+};
+
+// Shared experts are not members of selected_experts. There is at most one
+// record for each captured layer and graph type pair.
+struct llama_moe_shared_expert_metadata {
+    int32_t layer_index = -1;
+    uint32_t graph_type = 0;
+    bool present = false;
+    uint32_t configured_count = 0;
+    uint32_t ffn_size = 0;
+};
+
+struct llama_moe_routing_readback {
+    uint32_t version = LLAMA_MOE_ROUTING_READBACK_VERSION;
+    uint32_t struct_size = 0;
+    uint64_t capture_generation = 0;
+    size_t row_count = 0;
+    const llama_moe_routing_row * rows = nullptr;
+    size_t shared_expert_count = 0;
+    const llama_moe_shared_expert_metadata * shared_experts = nullptr;
+};
+
+LLAMA_API const llama_moe_routing_readback * llama_get_moe_routing_readback(
+        struct llama_context * ctx);
+
 struct llama_memory_churn_data {
     uint64_t entries_allocated = 0;
     uint64_t entries_released = 0;
