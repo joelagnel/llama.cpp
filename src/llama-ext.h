@@ -233,6 +233,11 @@ LLAMA_API uint64_t llama_get_memory_shared_prefix_length(
         const llama_seq_id * sequence_ids,
         size_t sequence_count,
         uint64_t maximum_prefix_tokens);
+LLAMA_API uint64_t llama_get_memory_shared_prefix_length(
+        const llama_memory_diagnostics & diagnostics,
+        const llama_seq_id * sequence_ids,
+        size_t sequence_count,
+        uint64_t maximum_prefix_tokens);
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0

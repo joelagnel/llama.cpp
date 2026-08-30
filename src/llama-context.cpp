@@ -4536,6 +4536,15 @@ uint64_t llama_get_memory_shared_prefix_length(
         ctx->get_memory(), sequence_ids, sequence_count, maximum_prefix_tokens) : 0;
 }
 
+uint64_t llama_get_memory_shared_prefix_length(
+        const llama_memory_diagnostics & diagnostics,
+        const llama_seq_id * sequence_ids,
+        size_t sequence_count,
+        uint64_t maximum_prefix_tokens) {
+    return llama_memory_shared_prefix_length(
+        diagnostics, sequence_ids, sequence_count, maximum_prefix_tokens);
+}
+
 const std::array<uint32_t, LLAMA_UBATCH_HISTOGRAM_BUCKET_COUNT> & llama_ubatch_histogram_bounds() {
     static const std::array<uint32_t, LLAMA_UBATCH_HISTOGRAM_BUCKET_COUNT> bounds {
         1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,

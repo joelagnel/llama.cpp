@@ -16,6 +16,7 @@ server = ServerPreset.tinyllama2()
 
 MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org/tiny-llamas/resolve/main/stories15M-q4_0.gguf"
 MODEL_TINY_FILE_URL = "https://huggingface.co/ggml-org/test-model-stories260K/resolve/main/stories260K-f32.gguf"
+TELEMETRY_CONTROL_API_KEY = "telemetry-control-test-key"
 
 KV_PRESSURE_EVENT_KINDS = {
     "utilization_sample",
@@ -59,11 +60,11 @@ def trace_events(trace_id):
     return [event for event in response.body["events"] if event["trace_id"] == trace_id]
 
 
-def kv_pressure_batch(cursor=0, limit=4096, trace_id=None):
+def kv_pressure_batch(cursor=0, limit=4096, trace_id=None, headers=None):
     path = f"/telemetry/v1/kv-pressure?cursor={cursor}&limit={limit}"
     if trace_id is not None:
         path += f"&trace_id={quote(trace_id, safe='')}"
-    response = server.make_request("GET", path)
+    response = server.make_request("GET", path, headers=headers)
     assert response.status_code == 200
     assert response.body["schema_version"] == 1
     return response.body
@@ -226,25 +227,37 @@ def test_kv_pressure_future_cursor_resets_to_high_water_mark():
 
 
 def test_kv_pressure_reports_exact_global_primary_occupancy_after_decode():
+    auth = {"Authorization": f"Bearer {TELEMETRY_CONTROL_API_KEY}"}
+    server.server_props = True
+    server.api_key = TELEMETRY_CONTROL_API_KEY
     server.start()
+
+    control = server.make_request(
+        "POST",
+        "/props",
+        data={"telemetry_control": {"kv_pressure_detail": True}},
+        headers=auth,
+    )
+    assert control.status_code == 200
 
     response = server.make_request(
         "POST",
         "/completion",
         data={"prompt": "Measure occupied KV entries", "n_predict": 4, "ignore_eos": True},
+        headers=auth,
     )
     assert response.status_code == 200
-    batch = kv_pressure_batch()
+    batch = kv_pressure_batch(headers=auth)
     samples = [event for event in batch["events"] if event["kind"] == "utilization_sample"]
     assert samples
     sample = samples[-1]
-    shallow_kv = server.make_request("GET", "/telemetry/v1/kv")
+    shallow_kv = server.make_request("GET", "/telemetry/v1/kv", headers=auth)
     assert shallow_kv.status_code == 200
     assert shallow_kv.body["components"] == []
     assert shallow_kv.body["physical_prefix_sharing"]["state"] == "not_collected"
     assert shallow_kv.body["duplicate_prefix_opportunities"]["state"] == "not_collected"
 
-    kv = server.make_request("GET", "/telemetry/v1/kv?detail=deep")
+    kv = server.make_request("GET", "/telemetry/v1/kv?detail=deep", headers=auth)
     assert kv.status_code == 200
     primary = next(component for component in kv.body["components"] if component["logical_primary"])
 

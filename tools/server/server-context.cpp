@@ -7669,7 +7669,7 @@ private:
                 for (size_t i = begin; i < end; ++i) {
                     sequence_ids.push_back(candidates[i].slot->id);
                 }
-                const uint64_t physically_shared = llama_memory_shared_prefix_length(
+                const uint64_t physically_shared = llama_get_memory_shared_prefix_length(
                     diagnostics, sequence_ids.data(), sequence_ids.size(), depth);
                 const size_t unshared_start = std::max(parent_depth, (size_t) std::min<uint64_t>(physically_shared, depth));
                 const uint64_t redundant_increment = (depth - unshared_start) * (end - begin - 1);
