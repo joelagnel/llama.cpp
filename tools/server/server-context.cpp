@@ -3,6 +3,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-moe-routing.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -475,13 +476,12 @@ struct server_slot {
     std::set<int32_t> telemetry_moe_layers;
     uint64_t telemetry_moe_routed_tokens = 0;
     uint64_t telemetry_moe_routed_token_layers = 0;
-    uint64_t telemetry_moe_activations_total = 0;
-    uint64_t telemetry_moe_activations_captured = 0;
+    server_moe_routing_capture_counts telemetry_moe_histogram_counts;
     uint64_t telemetry_moe_token_decisions_total = 0;
     uint64_t telemetry_moe_token_decisions_captured = 0;
-    uint64_t telemetry_moe_token_activations_total = 0;
-    uint64_t telemetry_moe_token_activations_captured = 0;
-    uint64_t telemetry_moe_token_activations_invalid = 0;
+    uint64_t telemetry_moe_token_decisions_invalid = 0;
+    uint64_t telemetry_moe_token_decisions_cap_dropped = 0;
+    server_moe_routing_capture_counts telemetry_moe_token_detail_counts;
 
     bool has_next_token = true;
     bool has_new_line   = false;
@@ -615,13 +615,12 @@ struct server_slot {
         telemetry_moe_layers.clear();
         telemetry_moe_routed_tokens = 0;
         telemetry_moe_routed_token_layers = 0;
-        telemetry_moe_activations_total = 0;
-        telemetry_moe_activations_captured = 0;
+        telemetry_moe_histogram_counts = {};
         telemetry_moe_token_decisions_total = 0;
         telemetry_moe_token_decisions_captured = 0;
-        telemetry_moe_token_activations_total = 0;
-        telemetry_moe_token_activations_captured = 0;
-        telemetry_moe_token_activations_invalid = 0;
+        telemetry_moe_token_decisions_invalid = 0;
+        telemetry_moe_token_decisions_cap_dropped = 0;
+        telemetry_moe_token_detail_counts = {};
         json_schema = json();
 
         task_prev = std::move(task);
@@ -5798,7 +5797,9 @@ private:
                 continue;
             }
 
-            if (entry.layer_index != previous_layer || entry.token_index != previous_token) {
+            const bool valid_assignment = server_moe_routing_assignment_is_valid(
+                entry.layer_index, entry.expert_index, model_layers, configured_experts);
+            if (valid_assignment && (entry.layer_index != previous_layer || entry.token_index != previous_token)) {
                 slot.telemetry_moe_routed_token_layers++;
                 slot.telemetry_moe_layers.insert(entry.layer_index);
                 if (!routed_tokens[(size_t) entry.token_index]) {
@@ -5809,10 +5810,12 @@ private:
                 previous_token = entry.token_index;
             }
 
-            slot.telemetry_moe_activations_total++;
-            if (entry.layer_index < 0 || entry.layer_index >= model_layers
-                    || entry.expert_index < 0 || entry.expert_index >= configured_experts
-                    || slot.telemetry_moe_activations_captured >= telemetry_moe_activation_limit) {
+            const server_moe_routing_capture_result capture = server_moe_routing_capture(
+                slot.telemetry_moe_histogram_counts,
+                valid_assignment,
+                1,
+                telemetry_moe_activation_limit);
+            if (capture != SERVER_MOE_ROUTING_CAPTURED) {
                 continue;
             }
 
@@ -5823,7 +5826,6 @@ private:
             const size_t histogram_index = (size_t) entry.layer_index*(size_t) configured_experts
                 + (size_t) entry.expert_index;
             slot.telemetry_moe_expert_activations[histogram_index]++;
-            slot.telemetry_moe_activations_captured++;
         }
 
         bool has_mtp_verify = false;
@@ -5875,19 +5877,25 @@ private:
 
             const size_t activation_count = group_end - group_start;
             slot.telemetry_moe_token_decisions_total++;
-            slot.telemetry_moe_token_activations_total += activation_count;
 
             bool valid = layer_index >= 0 && layer_index < model_layers
                 && activation_count == (size_t) llama_model_n_expert_used(model_tgt);
             for (size_t i = group_start; valid && i < group_end; ++i) {
-                valid = entries[i].expert_index >= 0 && entries[i].expert_index < configured_experts;
+                valid = server_moe_routing_assignment_is_valid(
+                    layer_index, entries[i].expert_index, model_layers, configured_experts);
             }
-            if (!valid) {
-                slot.telemetry_moe_token_activations_invalid += activation_count;
+            const server_moe_routing_capture_result capture = server_moe_routing_capture(
+                slot.telemetry_moe_token_detail_counts,
+                valid,
+                activation_count,
+                telemetry_moe_activation_limit);
+            if (capture == SERVER_MOE_ROUTING_INVALID) {
+                slot.telemetry_moe_token_decisions_invalid++;
                 group_start = group_end;
                 continue;
             }
-            if (slot.telemetry_moe_token_activations_captured + activation_count > telemetry_moe_activation_limit) {
+            if (capture == SERVER_MOE_ROUTING_CAP_DROPPED) {
+                slot.telemetry_moe_token_decisions_cap_dropped++;
                 group_start = group_end;
                 continue;
             }
@@ -5910,7 +5918,6 @@ private:
                 slot.telemetry_moe_token_activations.push_back(record);
             }
             slot.telemetry_moe_token_decisions_captured++;
-            slot.telemetry_moe_token_activations_captured += activation_count;
             group_start = group_end;
         }
     }
@@ -6688,6 +6695,8 @@ private:
                 {"expert_activations_captured", 0},
                 {"maximum_captured_activations", telemetry_moe_activation_limit},
                 {"dropped_activations", nullptr},
+                {"invalid_activations", 0},
+                {"cap_dropped_activations", 0},
                 {"population", "target_model_routed_token_layer_decisions"},
                 {"expert_activations", json::array()},
                 {"token_detail_state", routed_model ? "unavailable" : "not_applicable"},
@@ -6698,10 +6707,13 @@ private:
                 {"token_detail_decisions_total", nullptr},
                 {"token_detail_decisions_captured", 0},
                 {"token_detail_decisions_dropped", nullptr},
+                {"token_detail_invalid_decisions", 0},
+                {"token_detail_cap_dropped_decisions", 0},
                 {"token_detail_activations_total", nullptr},
                 {"token_detail_activations_captured", 0},
                 {"token_detail_activations_dropped", nullptr},
                 {"token_detail_invalid_activations", 0},
+                {"token_detail_cap_dropped_activations", 0},
                 {"maximum_captured_token_detail_activations", telemetry_moe_activation_limit},
                 {"selected_expert_ids_state", routed_model ? "unavailable" : "not_applicable"},
                 {"selected_expert_ids_reason", routed_model
@@ -6755,7 +6767,7 @@ private:
             set_weight_state(result, "not_enabled_for_request", "request_did_not_set_moe_routing_telemetry=true");
             return result;
         }
-        if (slot.telemetry_moe_activations_total == 0) {
+        if (slot.telemetry_moe_histogram_counts.total == 0) {
             json result = base();
             result["state"] = "no_data";
             result["reason"] = "The opted-in request completed without a retained routed-expert decision.";
@@ -6773,7 +6785,8 @@ private:
             return result;
         }
 
-        const bool truncated = slot.telemetry_moe_activations_captured < slot.telemetry_moe_activations_total;
+        const bool truncated = server_moe_routing_was_truncated(slot.telemetry_moe_histogram_counts);
+        const bool invalid = slot.telemetry_moe_histogram_counts.invalid > 0;
         json activations = json::array();
         std::vector<uint64_t> layer_totals((size_t) llama_model_n_layer(model_tgt), 0);
         for (size_t index = 0; index < slot.telemetry_moe_expert_activations.size(); ++index) {
@@ -6790,8 +6803,8 @@ private:
                 {"layer_index", layer},
                 {"expert_index", expert},
                 {"activation_count", count},
-                {"share_percent", slot.telemetry_moe_activations_captured > 0
-                    ? json(100.0*count/slot.telemetry_moe_activations_captured)
+                {"share_percent", slot.telemetry_moe_histogram_counts.captured > 0
+                    ? json(100.0*count/slot.telemetry_moe_histogram_counts.captured)
                     : json(nullptr)},
                 {"layer_share_percent", layer_totals[layer] > 0
                     ? json(100.0*count/layer_totals[layer])
@@ -6800,29 +6813,36 @@ private:
         }
 
         json result = base();
-        result["state"] = truncated ? "truncated" : "available";
-        result["reason"] = truncated
+        result["state"] = server_moe_routing_capture_state(slot.telemetry_moe_histogram_counts, true);
+        result["reason"] = truncated && invalid
+            ? "The per-request routed-expert activation cap was reached, and malformed records were excluded separately; the histogram covers only valid retained-prefix records."
+            : truncated
             ? "The per-request routed-expert activation cap was reached; the histogram covers only the retained prefix."
+            : invalid
+                ? "One or more routed-expert activation records were malformed and were excluded from the histogram; no valid activation was omitted because of the cap."
             : "All selected routed-expert IDs produced for this request were retained.";
         result["moe_layers"] = slot.telemetry_moe_layers.size();
         result["routed_tokens"] = slot.telemetry_moe_routed_tokens;
         result["routed_token_layer_decisions"] = slot.telemetry_moe_routed_token_layers;
-        result["expert_activations_total"] = slot.telemetry_moe_activations_total;
-        result["expert_activations_captured"] = slot.telemetry_moe_activations_captured;
-        result["dropped_activations"] = slot.telemetry_moe_activations_total - slot.telemetry_moe_activations_captured;
+        result["expert_activations_total"] = slot.telemetry_moe_histogram_counts.total;
+        result["expert_activations_captured"] = slot.telemetry_moe_histogram_counts.captured;
+        result["dropped_activations"] = slot.telemetry_moe_histogram_counts.total - slot.telemetry_moe_histogram_counts.captured;
+        result["invalid_activations"] = slot.telemetry_moe_histogram_counts.invalid;
+        result["cap_dropped_activations"] = slot.telemetry_moe_histogram_counts.cap_dropped;
         result["expert_activations"] = std::move(activations);
 
-        const uint64_t token_activations_dropped = slot.telemetry_moe_token_activations_total
-            - slot.telemetry_moe_token_activations_captured;
-        const bool token_detail_truncated = token_activations_dropped > slot.telemetry_moe_token_activations_invalid;
-        const bool token_detail_partial = slot.telemetry_moe_token_activations_invalid > 0;
-        const char * token_detail_state = token_detail_truncated
-            ? "truncated"
-            : token_detail_partial ? "partial"
-            : slot.telemetry_moe_token_decisions_total > 0 ? "available" : "no_data";
-        const std::string token_detail_reason = token_detail_truncated
+        const uint64_t token_activations_dropped = slot.telemetry_moe_token_detail_counts.total
+            - slot.telemetry_moe_token_detail_counts.captured;
+        const bool token_detail_truncated = server_moe_routing_was_truncated(slot.telemetry_moe_token_detail_counts);
+        const bool token_detail_invalid = slot.telemetry_moe_token_detail_counts.invalid > 0;
+        const char * token_detail_state = server_moe_routing_capture_state(
+            slot.telemetry_moe_token_detail_counts,
+            slot.telemetry_moe_token_decisions_total > 0);
+        const std::string token_detail_reason = token_detail_truncated && token_detail_invalid
+            ? "The exact-token routed-expert activation cap was reached, and malformed output rows were excluded separately; only complete valid retained-prefix decisions are present."
+            : token_detail_truncated
             ? "The exact-token routed-expert activation cap was reached; only complete retained-prefix decisions are present."
-            : token_detail_partial
+            : token_detail_invalid
                 ? "One or more routed-expert output rows were malformed and were excluded from exact-token detail."
                 : slot.telemetry_moe_token_decisions_total > 0
                     ? "All selected expert IDs for retained target-model output rows were captured."
@@ -6832,10 +6852,13 @@ private:
         result["token_detail_decisions_captured"] = slot.telemetry_moe_token_decisions_captured;
         result["token_detail_decisions_dropped"] = slot.telemetry_moe_token_decisions_total
             - slot.telemetry_moe_token_decisions_captured;
-        result["token_detail_activations_total"] = slot.telemetry_moe_token_activations_total;
-        result["token_detail_activations_captured"] = slot.telemetry_moe_token_activations_captured;
+        result["token_detail_invalid_decisions"] = slot.telemetry_moe_token_decisions_invalid;
+        result["token_detail_cap_dropped_decisions"] = slot.telemetry_moe_token_decisions_cap_dropped;
+        result["token_detail_activations_total"] = slot.telemetry_moe_token_detail_counts.total;
+        result["token_detail_activations_captured"] = slot.telemetry_moe_token_detail_counts.captured;
         result["token_detail_activations_dropped"] = token_activations_dropped;
-        result["token_detail_invalid_activations"] = slot.telemetry_moe_token_activations_invalid;
+        result["token_detail_invalid_activations"] = slot.telemetry_moe_token_detail_counts.invalid;
+        result["token_detail_cap_dropped_activations"] = slot.telemetry_moe_token_detail_counts.cap_dropped;
 
         json token_decisions = json::array();
         uint64_t decisions_with_weights = 0;
@@ -6865,7 +6888,7 @@ private:
             for (size_t i = decision_start; i < decision_end; ++i) {
                 const auto & activation = slot.telemetry_moe_token_activations[i];
                 selected_expert_ids.push_back(activation.expert_index);
-                if (std::isfinite(activation.effective_weight) && activation.effective_weight >= 0.0f) {
+                if (server_moe_routing_weight_is_usable(activation.effective_weight)) {
                     effective_expert_weights.push_back(activation.effective_weight);
                     effective_weight_sum += activation.effective_weight;
                 } else {

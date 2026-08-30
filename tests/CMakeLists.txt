@@ -272,6 +272,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 endif()
 
+llama_build_and_test(test-moe-routing-telemetry.cpp)
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
