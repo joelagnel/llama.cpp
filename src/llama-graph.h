@@ -874,6 +874,7 @@ struct llm_graph_params {
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.moe_routing             == other.cparams.moe_routing             &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
@@ -887,6 +888,12 @@ struct llm_graph_fused_node {
     llm_fused_op op;
     ggml_tensor * tensor;
     int il;
+};
+
+struct llm_graph_moe_routing_output {
+    int32_t layer_index = -1;
+    ggml_tensor * selected_experts = nullptr; // I32 [experts_per_token, tokens]
+    ggml_tensor * effective_weights = nullptr; // F32 [1, experts_per_token, tokens]
 };
 
 class llm_graph_result {
@@ -924,7 +931,13 @@ public:
 
     void add_fused_node(llm_graph_fused_node result);
 
+    void add_moe_routing_output(
+            int32_t layer_index,
+            ggml_tensor * selected_experts,
+            ggml_tensor * effective_weights);
+
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
+    const std::vector<llm_graph_moe_routing_output> & get_moe_routing_outputs() const { return moe_routing_outputs; }
 
     void set_params(const llm_graph_params & params);
 
@@ -945,6 +958,7 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<llm_graph_moe_routing_output> moe_routing_outputs;
 
     ggml_context_ptr ctx_compute;
 

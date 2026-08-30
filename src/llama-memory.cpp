@@ -78,6 +78,46 @@ static uint64_t memory_breakdown_total(const std::map<ggml_backend_buffer_type_t
     return total;
 }
 
+llama_memory_primary_occupancy llama_memory_primary_occupancy_collect(const llama_memory_i * memory) {
+    if (!memory) {
+        return {};
+    }
+    if (const auto * kv = dynamic_cast<const llama_kv_cache *>(memory)) {
+        llama_memory_primary_occupancy result;
+        result.available = true;
+        result.capacity_entries = (uint64_t) kv->get_size() * kv->get_n_stream();
+        for (uint32_t stream = 0; stream < kv->get_n_stream(); ++stream) {
+            result.used_entries += kv->get_cells_by_stream(stream).get_used();
+        }
+        return result;
+    }
+    if (const auto * recurrent = dynamic_cast<const llama_memory_recurrent *>(memory)) {
+        return { true, recurrent->size, recurrent->used };
+    }
+    if (const auto * iswa = dynamic_cast<const llama_kv_cache_iswa *>(memory)) {
+        return llama_memory_primary_occupancy_collect(iswa->get_base());
+    }
+    if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory)) {
+        return llama_memory_primary_occupancy_collect(hybrid->get_mem_attn());
+    }
+    if (const auto * hybrid_iswa = dynamic_cast<const llama_memory_hybrid_iswa *>(memory)) {
+        return llama_memory_primary_occupancy_collect(hybrid_iswa->get_mem_attn());
+    }
+    if (const auto * dsa = dynamic_cast<const llama_kv_cache_dsa *>(memory)) {
+        return llama_memory_primary_occupancy_collect(dsa->get_mla());
+    }
+    if (const auto * dsa_iswa = dynamic_cast<const llama_kv_cache_dsa_iswa *>(memory)) {
+        return llama_memory_primary_occupancy_collect(dsa_iswa->get_dsa());
+    }
+    if (const auto * msa = dynamic_cast<const llama_kv_cache_msa *>(memory)) {
+        return llama_memory_primary_occupancy_collect(msa->get_base());
+    }
+    if (const auto * dsv4 = dynamic_cast<const llama_kv_cache_dsv4 *>(memory)) {
+        return llama_memory_primary_occupancy_collect(dsv4->get_raw());
+    }
+    return {};
+}
+
 static llama_memory_component_diagnostics kv_component_diagnostics(
         const llama_kv_cache & kv,
         std::string name,

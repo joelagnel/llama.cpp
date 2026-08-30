@@ -129,6 +129,7 @@ struct llama_memory_i {
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
 
+llama_memory_primary_occupancy llama_memory_primary_occupancy_collect(const llama_memory_i * memory);
 llama_memory_diagnostics llama_memory_diagnostics_collect(const llama_memory_i * memory);
 uint64_t llama_memory_shared_prefix_length(
         const llama_memory_i * memory,

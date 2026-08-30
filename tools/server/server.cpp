@@ -200,7 +200,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.get_telemetry_capabilities  = models_routes->proxy_get;
         routes.get_telemetry_snapshot      = models_routes->proxy_get;
         routes.get_telemetry_events        = models_routes->proxy_get;
+        routes.get_telemetry_token_candidates = models_routes->proxy_get;
         routes.get_telemetry_kv            = models_routes->proxy_get;
+        routes.get_telemetry_kv_pressure   = models_routes->proxy_get;
+        routes.get_telemetry_gpu           = models_routes->proxy_get;
         routes.post_props                  = models_routes->proxy_post;
         routes.post_completions            = models_routes->proxy_post;
         routes.post_completions_oai        = models_routes->proxy_post;
@@ -242,6 +245,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/telemetry/v1/snapshot",     ex_wrapper(routes.get_telemetry_snapshot));
     ctx_http.get ("/telemetry/v1/events",       ex_wrapper(routes.get_telemetry_events));
     ctx_http.get ("/telemetry/v1/kv",           ex_wrapper(routes.get_telemetry_kv));
+    ctx_http.get ("/telemetry/v1/kv-pressure",  ex_wrapper(routes.get_telemetry_kv_pressure));
+    ctx_http.get ("/telemetry/v1/gpu",          ex_wrapper(routes.get_telemetry_gpu));
+    ctx_http.get ("/telemetry/v1/token-candidates", ex_wrapper(routes.get_telemetry_token_candidates));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models));

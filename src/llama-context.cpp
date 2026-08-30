@@ -119,6 +119,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
+    cparams.moe_routing             = false;
     cparams.warmup                  = false;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
@@ -1177,6 +1178,79 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_moe_routing(bool value) {
+    if (cparams.moe_routing == value) {
+        return;
+    }
+
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    if (moe_routing_capture_count > 0) {
+        synchronize();
+    }
+
+    cparams.moe_routing = value;
+    moe_routing_capture_count = 0;
+    moe_routing_entries.clear();
+    sched_need_reserve = true;
+}
+
+const llama_moe_routing_entry * llama_context::get_moe_routing(size_t * count) {
+    GGML_ASSERT(count != nullptr);
+
+    synchronize();
+    moe_routing_entries.clear();
+
+    size_t total = 0;
+    for (size_t i = 0; i < moe_routing_capture_count; ++i) {
+        total += moe_routing_captures[i].token_count*moe_routing_captures[i].experts_per_token;
+    }
+    moe_routing_entries.reserve(total);
+
+    for (size_t i = 0; i < moe_routing_capture_count; ++i) {
+        const auto & capture = moe_routing_captures[i];
+        for (size_t token = 0; token < capture.token_count; ++token) {
+            const size_t token_1 = token % capture.token_dim_1;
+            const size_t token_2 = (token / capture.token_dim_1) % capture.token_dim_2;
+            const size_t token_3 = token / (capture.token_dim_1*capture.token_dim_2);
+            for (size_t expert = 0; expert < capture.experts_per_token; ++expert) {
+                int32_t expert_id = -1;
+                const size_t offset = expert*capture.expert_stride
+                    + token_1*capture.token_stride_1
+                    + token_2*capture.token_stride_2
+                    + token_3*capture.token_stride_3;
+                GGML_ASSERT(offset + sizeof(expert_id) <= capture.data.size());
+                memcpy(&expert_id, capture.data.data() + offset, sizeof(expert_id));
+
+                float effective_weight = std::numeric_limits<float>::quiet_NaN();
+                if (!capture.weight_data.empty()) {
+                    const size_t weight_token_1 = token % capture.weight_token_dim_1;
+                    const size_t weight_token_2 = token / capture.weight_token_dim_1;
+                    GGML_ASSERT(weight_token_2 < capture.weight_token_dim_2);
+                    const size_t weight_offset = expert*capture.weight_expert_stride
+                        + weight_token_1*capture.weight_token_stride_1
+                        + weight_token_2*capture.weight_token_stride_2;
+                    GGML_ASSERT(weight_offset + sizeof(effective_weight) <= capture.weight_data.size());
+                    memcpy(&effective_weight, capture.weight_data.data() + weight_offset, sizeof(effective_weight));
+                }
+                moe_routing_entries.push_back({
+                    capture.layer_index,
+                    capture.token_indices[token],
+                    expert_id,
+                    effective_weight,
+                });
+            }
+        }
+    }
+
+    // The asynchronous copies are synchronized and materialized above, so the
+    // reusable capture slots can be overwritten by the next diagnostic batch
+    // without forcing a second synchronization.
+    moe_routing_capture_count = 0;
+    *count = moe_routing_entries.size();
+    return moe_routing_entries.empty() ? nullptr : moe_routing_entries.data();
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -1660,6 +1734,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
+    if (cparams.moe_routing) {
+        // The previous diagnostic batch must have been consumed before its
+        // reusable host buffers can be overwritten. This synchronization is
+        // confined to the explicitly enabled diagnostic path.
+        if (moe_routing_capture_count > 0) {
+            synchronize();
+        }
+        moe_routing_capture_count = 0;
+        moe_routing_entries.clear();
+    }
+
     // embedding contexts output every token even when batch.logits is not set
     if (has_samplers && (output_all || batch_inp.logits)) {
         std::vector<int32_t> seq_output_count(n_seq_max, 0);
@@ -1950,6 +2035,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        extract_moe_routing(res, n_tokens_prev, ubatch);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2231,6 +2317,101 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+    }
+}
+
+void llama_context::extract_moe_routing(const llm_graph_result * res, size_t token_offset, const llama_ubatch & ubatch) {
+    if (!cparams.moe_routing) {
+        return;
+    }
+
+    for (const auto & output : res->get_moe_routing_outputs()) {
+        ggml_tensor * tensor = output.selected_experts;
+        if (tensor == nullptr || tensor->type != GGML_TYPE_I32 || tensor->ne[0] <= 0) {
+            continue;
+        }
+
+        const size_t tensor_tokens = (size_t) ggml_nelements(tensor)/(size_t) tensor->ne[0];
+        if (tensor_tokens == 0) {
+            continue;
+        }
+
+        std::vector<int32_t> token_indices;
+        token_indices.reserve(tensor_tokens);
+        if (tensor_tokens == ubatch.n_tokens) {
+            for (size_t token = 0; token < tensor_tokens; ++token) {
+                token_indices.push_back((int32_t) (token_offset + token));
+            }
+        } else if (ubatch.output != nullptr) {
+            for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
+                if (ubatch.output[token]) {
+                    token_indices.push_back((int32_t) (token_offset + token));
+                }
+            }
+        }
+        if (token_indices.size() != tensor_tokens) {
+            LLAMA_LOG_WARN("%s: cannot map %zu MoE layer %d rows to %u batch tokens\n",
+                    __func__, tensor_tokens, output.layer_index, ubatch.n_tokens);
+            continue;
+        }
+
+        if (moe_routing_capture_count == moe_routing_captures.size()) {
+            moe_routing_captures.emplace_back();
+        }
+
+        auto & capture = moe_routing_captures[moe_routing_capture_count++];
+        capture.layer_index = output.layer_index;
+        capture.token_count = tensor_tokens;
+        capture.experts_per_token = (size_t) tensor->ne[0];
+        capture.expert_stride = tensor->nb[0];
+        capture.token_dim_1 = (size_t) tensor->ne[1];
+        capture.token_dim_2 = (size_t) tensor->ne[2];
+        capture.token_stride_1 = tensor->nb[1];
+        capture.token_stride_2 = tensor->nb[2];
+        capture.token_stride_3 = tensor->nb[3];
+        capture.token_indices = std::move(token_indices);
+        capture.data.resize(ggml_nbytes(tensor));
+        capture.weight_data.clear();
+
+        GGML_ASSERT(capture.expert_stride == sizeof(int32_t));
+        GGML_ASSERT(capture.token_stride_1 >= capture.experts_per_token*capture.expert_stride);
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
+        GGML_ASSERT(backend != nullptr);
+        ggml_backend_tensor_get_async(backend, tensor, capture.data.data(), 0, capture.data.size());
+
+        ggml_tensor * weights = output.effective_weights;
+        const bool weights_usable = weights != nullptr
+            && weights->type == GGML_TYPE_F32
+            && weights->ne[0] == 1
+            && weights->ne[1] == (int64_t) capture.experts_per_token
+            && (size_t) ggml_nelements(weights)/(size_t) (weights->ne[0]*weights->ne[1]) == tensor_tokens;
+        if (!weights_usable) {
+            LLAMA_LOG_WARN("%s: cannot retain MoE layer %d effective weights with the selected expert IDs\n",
+                    __func__, output.layer_index);
+            continue;
+        }
+
+        capture.weight_expert_stride = weights->nb[1];
+        capture.weight_token_dim_1 = (size_t) weights->ne[2];
+        capture.weight_token_dim_2 = (size_t) weights->ne[3];
+        capture.weight_token_stride_1 = weights->nb[2];
+        capture.weight_token_stride_2 = weights->nb[3];
+        capture.weight_data.resize(ggml_nbytes(weights));
+
+        GGML_ASSERT(weights->nb[0] == sizeof(float));
+        GGML_ASSERT(capture.weight_token_dim_1*capture.weight_token_dim_2 == tensor_tokens);
+        GGML_ASSERT(capture.weight_expert_stride >= sizeof(float));
+        GGML_ASSERT(capture.weight_token_stride_1 >= capture.experts_per_token*capture.weight_expert_stride);
+
+        ggml_backend_t weights_backend = ggml_backend_sched_get_tensor_backend(sched.get(), weights);
+        GGML_ASSERT(weights_backend != nullptr);
+        ggml_backend_tensor_get_async(
+            weights_backend,
+            weights,
+            capture.weight_data.data(),
+            0,
+            capture.weight_data.size());
     }
 }
 
@@ -3307,6 +3488,10 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+llama_memory_primary_occupancy llama_context::memory_primary_occupancy() const {
+    return llama_memory_primary_occupancy_collect(memory.get());
+}
+
 llama_memory_diagnostics llama_context::memory_diagnostics() const {
     return llama_memory_diagnostics_collect(memory.get());
 }
@@ -3745,6 +3930,14 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+void llama_set_moe_routing(llama_context * ctx, bool enabled) {
+    ctx->set_moe_routing(enabled);
+}
+
+const llama_moe_routing_entry * llama_get_moe_routing(llama_context * ctx, size_t * count) {
+    return ctx->get_moe_routing(count);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
@@ -4235,6 +4428,10 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+llama_memory_primary_occupancy llama_get_memory_primary_occupancy(const struct llama_context * ctx) {
+    return ctx ? ctx->memory_primary_occupancy() : llama_memory_primary_occupancy {};
 }
 
 llama_memory_diagnostics llama_get_memory_diagnostics(const struct llama_context * ctx) {

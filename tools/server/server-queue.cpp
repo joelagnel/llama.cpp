@@ -25,11 +25,17 @@ static bool task_resets_idle_timer(server_task_type type) {
     return type != SERVER_TASK_TYPE_METRICS &&
         type != SERVER_TASK_TYPE_TELEMETRY_SNAPSHOT &&
         type != SERVER_TASK_TYPE_TELEMETRY_EVENTS &&
-        type != SERVER_TASK_TYPE_TELEMETRY_KV;
+        type != SERVER_TASK_TYPE_TELEMETRY_KV &&
+        type != SERVER_TASK_TYPE_TELEMETRY_KV_PRESSURE &&
+        type != SERVER_TASK_TYPE_TELEMETRY_GPU &&
+        type != SERVER_TASK_TYPE_TELEMETRY_TOKEN_CANDIDATES;
 }
 
 static void initialize_task_telemetry(server_task & task) {
-    if (task.type != SERVER_TASK_TYPE_COMPLETION && task.type != SERVER_TASK_TYPE_INFILL) {
+    if (task.type != SERVER_TASK_TYPE_COMPLETION &&
+            task.type != SERVER_TASK_TYPE_INFILL &&
+            task.type != SERVER_TASK_TYPE_EMBEDDING &&
+            task.type != SERVER_TASK_TYPE_RERANK) {
         return;
     }
     if (task.trace_id.empty()) {

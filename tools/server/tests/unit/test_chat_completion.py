@@ -539,11 +539,27 @@ def test_return_progress(n_batch, batch_count, reuse_cache):
     res = make_cmpl_request()
     last_progress = None
     total_batch_count = 0
+    prompt_start_monotonic_us = None
+    last_progress_monotonic_us = None
 
     for data in res:
         cur_progress = data.get("prompt_progress", None)
         if cur_progress is None:
             continue
+        assert isinstance(cur_progress["prompt_start_monotonic_us"], int)
+        assert cur_progress["prompt_start_monotonic_us"] > 0
+        assert isinstance(cur_progress["monotonic_us"], int)
+        assert cur_progress["monotonic_us"] >= cur_progress["prompt_start_monotonic_us"]
+        assert cur_progress["time_ms"] == (
+            cur_progress["monotonic_us"] - cur_progress["prompt_start_monotonic_us"]
+        ) // 1000
+        if prompt_start_monotonic_us is None:
+            prompt_start_monotonic_us = cur_progress["prompt_start_monotonic_us"]
+        else:
+            assert cur_progress["prompt_start_monotonic_us"] == prompt_start_monotonic_us
+        if last_progress_monotonic_us is not None:
+            assert cur_progress["monotonic_us"] >= last_progress_monotonic_us
+        last_progress_monotonic_us = cur_progress["monotonic_us"]
         if total_batch_count == 0:
             # first progress report must have n_cache == n_processed
             assert cur_progress["total"] > 0

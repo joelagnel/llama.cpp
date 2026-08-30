@@ -34,6 +34,26 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("prompt_perplexity", params.prompt_perplexity))
         ->set_desc("Opt in to exact text-prompt perplexity scoring from raw model logits. This disables prompt-cache reuse for the request, requests logits at every prompt position, and adds O(prompt tokens times vocabulary) CPU work"));
 
+    add((new field_bool("output_token_telemetry", params.output_token_telemetry))
+        ->set_desc("Opt in to bounded per-token model-ready timing diagnostics. Raw selected-token log probability is retained only when n_probs is also enabled; token identity additionally follows the telemetry content policy"));
+
+    add((new field_bool("output_token_candidate_telemetry", params.output_token_candidate_telemetry))
+        ->set_desc("Opt in to a separately retained, lazily fetched target-model top-K diagnostic for informative MTP mismatch, replacement, and bonus positions. Requires the administrator candidate gate and output_token_telemetry"));
+
+    add((new field_bool("output_token_candidate_include_accepted", params.output_token_candidate_include_accepted))
+        ->set_desc("Also retain target-model top-K candidates for accepted MTP draft positions. This is disabled by default because it increases scoring and retained-detail volume"));
+
+    add((new field_num("output_token_candidate_top_k", params.output_token_candidate_top_k))
+        ->set_hard_limits(1, 5)
+        ->set_desc("Number of raw target-model candidates retained per eligible MTP position, from 1 through 5"));
+
+    add((new field_num("output_token_candidate_byte_cap", params.output_token_candidate_byte_cap))
+        ->set_hard_limits(8192, 1024 * 1024)
+        ->set_desc("Maximum serialized bytes retained for this request's external candidate-detail block"));
+
+    add((new field_bool("moe_routing_telemetry", params.moe_routing_telemetry))
+        ->set_desc("Opt in to bounded routed-expert diagnostics when the llama-server administrator enables the native MoE telemetry gate"));
+
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));
 
