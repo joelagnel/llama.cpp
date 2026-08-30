@@ -7,6 +7,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
@@ -245,6 +246,10 @@ static void collect_memory_components(
     } else if (const auto * iswa = dynamic_cast<const llama_kv_cache_iswa *>(memory)) {
         collect_memory_components(iswa->get_base(), prefix + "base", logical_primary, output);
         collect_memory_components(iswa->get_swa(),  prefix + "swa",  false, output);
+    } else if (const auto * hybrid_idx = dynamic_cast<const llama_memory_hybrid_idx *>(memory)) {
+        collect_memory_components(hybrid_idx->get_mem_attn(), prefix + "attention", logical_primary, output);
+        collect_memory_components(hybrid_idx->get_mem_recr(), prefix + "recurrent", false, output);
+        collect_memory_components(hybrid_idx->get_mem_idx(),  prefix + "indexer",   false, output);
     } else if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory)) {
         collect_memory_components(hybrid->get_mem_attn(), prefix + "attention", logical_primary, output);
         collect_memory_components(hybrid->get_mem_recr(), prefix + "recurrent", false, output);
