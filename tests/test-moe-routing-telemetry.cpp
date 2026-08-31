@@ -71,29 +71,49 @@ static void test_cap_and_invalid_records_remain_distinct(testing & t) {
 }
 
 static void test_canonical_event_coverage(testing & t) {
-    t.test("available routing stays available", [](testing & t) {
-        t.assert_true(!server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, false, false));
+    t.test("disabled and dense routing stay available", [](testing & t) {
+        const server_moe_routing_chunk_coverage coverage;
+        t.assert_true(!server_moe_routing_chunk_is_partial(coverage));
+        t.assert_equal(0U, server_moe_routing_chunk_availability(coverage, true));
     });
 
     t.test("invalid records mark the canonical event partial", [](testing & t) {
-        t.assert_true(server_moe_routing_producer_coverage_is_partial(1, 0, 0, 0, false, false));
+        server_moe_routing_chunk_coverage coverage;
+        coverage.invalid_rows = 1;
+        t.assert_true(server_moe_routing_chunk_is_partial(coverage));
+        t.assert_equal(1U, server_moe_routing_chunk_availability(coverage, true));
     });
 
     t.test("unavailable K+1 or routing weights mark the canonical event partial", [](testing & t) {
-        t.assert_true(server_moe_routing_producer_coverage_is_partial(0, 1, 0, 0, false, false));
+        server_moe_routing_chunk_coverage coverage;
+        coverage.unavailable_rows = 1;
+        t.assert_true(server_moe_routing_chunk_is_partial(coverage));
+        t.assert_equal(1U, server_moe_routing_chunk_availability(coverage, true));
     });
 
     t.test("unavailable K+1 when K equals N marks the canonical event partial", [](testing & t) {
-        t.assert_true(server_moe_routing_producer_coverage_is_partial(0, 1, 0, 0, false, false));
+        server_moe_routing_chunk_coverage coverage;
+        coverage.unavailable_rows = 1;
+        t.assert_true(server_moe_routing_chunk_is_partial(coverage));
+        t.assert_equal(1U, server_moe_routing_chunk_availability(coverage, true));
     });
 
-    t.test("unmappable rows remain coordinate-free coverage loss", [](testing & t) {
-        t.assert_true(server_moe_routing_producer_coverage_is_partial(0, 0, 1, 1, false, false));
+    t.test("unmappable rows mark candidate traces partial without an exact loss count", [](testing & t) {
+        server_moe_routing_chunk_coverage coverage;
+        coverage.attribution_ambiguous = true;
+        t.assert_equal(0ULL, coverage.unlocated_rows);
+        t.assert_true(server_moe_routing_chunk_is_partial(coverage));
+        t.assert_equal(1U, server_moe_routing_chunk_availability(coverage, true));
     });
 
     t.test("interrupted and unavailable final markers stay partial", [](testing & t) {
-        t.assert_true(server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, true,  false));
-        t.assert_true(server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, false, true));
+        server_moe_routing_chunk_coverage interrupted;
+        interrupted.interrupted = true;
+        t.assert_equal(1U, server_moe_routing_chunk_availability(interrupted, false));
+
+        server_moe_routing_chunk_coverage source_unavailable;
+        source_unavailable.source_unavailable = true;
+        t.assert_equal(1U, server_moe_routing_chunk_availability(source_unavailable, false));
     });
 }
 

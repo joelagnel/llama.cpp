@@ -63,6 +63,34 @@ inline bool server_moe_routing_producer_coverage_is_partial(
     return invalid_rows > 0 || unavailable_rows > 0 || unlinked_rows > 0 || unlocated_rows > 0 || interrupted || source_unavailable;
 }
 
+struct server_moe_routing_chunk_coverage {
+    uint64_t invalid_rows = 0;
+    uint64_t unavailable_rows = 0;
+    uint64_t unlinked_rows = 0;
+    uint64_t unlocated_rows = 0;
+    bool interrupted = false;
+    bool source_unavailable = false;
+    bool attribution_ambiguous = false;
+    bool serialization_gaps = false;
+};
+
+inline bool server_moe_routing_chunk_is_partial(const server_moe_routing_chunk_coverage & coverage) {
+    return coverage.attribution_ambiguous || coverage.serialization_gaps ||
+        server_moe_routing_producer_coverage_is_partial(
+            coverage.invalid_rows,
+            coverage.unavailable_rows,
+            coverage.unlinked_rows,
+            coverage.unlocated_rows,
+            coverage.interrupted,
+            coverage.source_unavailable);
+}
+
+inline uint32_t server_moe_routing_chunk_availability(
+        const server_moe_routing_chunk_coverage & coverage,
+        bool has_routable_records) {
+    return server_moe_routing_chunk_is_partial(coverage) ? 1 : has_routable_records ? 0 : 10;
+}
+
 inline bool server_moe_routing_add_lost_population(uint64_t count, uint64_t & total) {
     if (count > std::numeric_limits<uint64_t>::max() - total) {
         return false;
