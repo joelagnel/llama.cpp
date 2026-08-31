@@ -384,6 +384,7 @@ struct telemetry_moe_native_dispatch_loss {
     int64_t last_dispatch_monotonic_us = 0;
     uint64_t logical_call = 0;
     llama_context_dispatch_operation operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
+    llama_context_dispatch_operation last_operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
     uint32_t first_physical_microbatch = 0;
     uint32_t last_physical_microbatch = 0;
     uint64_t last_logical_call = 0;
@@ -394,6 +395,9 @@ struct telemetry_moe_native_dispatch_loss {
     bool saturation = false;
     bool generation_mixed = false;
     bool native_moe_routing_mixed = false;
+    uint64_t encode_physical_dispatch_count = 0;
+    uint64_t decode_physical_dispatch_count = 0;
+    bool operation_mixed = false;
 };
 
 static json telemetry_moe_native_dispatch_loss_gap_json(
@@ -411,7 +415,8 @@ static json telemetry_moe_native_dispatch_loss_gap_json(
         {"logical_call", loss.logical_call},
         {"last_logical_call", loss.last_logical_call},
         {"operation", loss.operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode"},
-        {"last_operation", loss.operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode"},
+        {"last_operation", loss.last_operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode"},
+        {"operation_state", loss.operation_mixed ? "mixed" : "exact"},
         {"physical_context", "target"},
         {"first_physical_microbatch", loss.first_physical_microbatch},
         {"last_physical_microbatch", loss.last_physical_microbatch},
@@ -422,17 +427,36 @@ static json telemetry_moe_native_dispatch_loss_gap_json(
         {"last_microbatch_generation", loss.last_microbatch_generation},
         {"last_application_epoch", loss.last_application_epoch},
         {"physical_dispatch_count", loss.physical_dispatch_count},
+        {"encode_physical_dispatch_count", loss.encode_physical_dispatch_count},
+        {"decode_physical_dispatch_count", loss.decode_physical_dispatch_count},
         {"saturation", loss.saturation},
         {"loss_descriptor_state", loss.saturation ? "saturated_exact" : "detailed_exact"},
         {"generation_state", loss.generation_mixed ? "mixed" : "exact"},
         {"native_moe_routing_state", loss.native_moe_routing_mixed ? "mixed" : "enabled"},
         {"logical_sequence_known", false},
         {"cause", "native_dispatch_queue_overflow"},
-        {"reason", "The bounded native dispatch queue dropped this exact routing span."},
+        {"reason", "The bounded native dispatch queue suppressed routing evidence over this exact physical interval."},
     };
     gap["timestamp_state"] = loss.first_dispatch_monotonic_us > 0 &&
         loss.last_dispatch_monotonic_us > 0 ? "available" : "unavailable";
     return gap;
+}
+
+static void telemetry_moe_sort_physical_gaps(json & gaps) {
+    std::vector<json> sorted;
+    sorted.reserve(gaps.size());
+    for (const json & gap : gaps) {
+        sorted.push_back(gap);
+    }
+    std::stable_sort(sorted.begin(), sorted.end(), [](const json & left, const json & right) {
+        const uint64_t left_step = left.value("first_physical_step", std::numeric_limits<uint64_t>::max());
+        const uint64_t right_step = right.value("first_physical_step", std::numeric_limits<uint64_t>::max());
+        return left_step < right_step;
+    });
+    gaps = json::array();
+    for (json & gap : sorted) {
+        gaps.push_back(std::move(gap));
+    }
 }
 
 #ifdef LLAMA_SERVER_TEST_HOOKS
@@ -440,15 +464,28 @@ json server_test_moe_dispatch_saturation_gap_json() {
     return telemetry_moe_native_dispatch_loss_gap_json(17, {
         5, 288, 9, 288, 311, 101, 123, 44,
         LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE,
-        287, 309, 44, 8, 310, 12, 23, true, true, false,
+        LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE,
+        287, 0, 45, 8, 310, 12, 23, true, true, false,
+        1, 22, true,
     });
 }
 
 json server_test_moe_dispatch_saturation_chunk_json() {
+    const telemetry_moe_native_dispatch_loss prefix = {
+        4, 287, 8, 239, 240, 99, 100, 43,
+        LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE,
+        LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE,
+        238, 238, 43, 4, 287, 8, 1, false, false, false,
+        0, 1, false,
+    };
     json event = {
         {"event", "moe_routing_chunk"},
-        {"gaps", json::array({ server_test_moe_dispatch_saturation_gap_json() })},
+        {"gaps", json::array({
+            telemetry_moe_native_dispatch_loss_gap_json(16, prefix),
+            server_test_moe_dispatch_saturation_gap_json(),
+        })},
     };
+    telemetry_moe_sort_physical_gaps(event["gaps"]);
     server_moe_routing_apply_canonical_event_coverage(
         event, { 0, 0, 0, 0, false, false, false, true }, true,
         "The producer retained a partial routing population:",
@@ -6489,6 +6526,7 @@ private:
                 loss.last_dispatch_monotonic_us,
                 loss.logical_call,
                 loss.operation,
+                loss.last_operation,
                 loss.first_physical_microbatch,
                 loss.last_physical_microbatch,
                 loss.last_logical_call,
@@ -6499,6 +6537,9 @@ private:
                 loss.saturation,
                 loss.generation_mixed,
                 loss.native_moe_routing_mixed,
+                loss.encode_physical_dispatch_count,
+                loss.decode_physical_dispatch_count,
+                loss.operation_mixed,
             });
         };
         if (!draft) {
@@ -6545,13 +6586,16 @@ private:
                     {"microbatch_generation", loss.decision.microbatch_generation},
                     {"application_epoch", loss.decision.application_epoch},
                     {"native_moe_routing_enabled", loss.decision.native_moe_routing_enabled},
-                    {"last_operation", loss.operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode"},
+                    {"last_operation", loss.last_operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode"},
+                    {"operation_state", loss.operation_mixed ? "mixed" : "exact"},
                     {"first_physical_microbatch", loss.first_physical_microbatch},
                     {"last_physical_microbatch", loss.last_physical_microbatch},
                     {"last_props_generation", loss.last_props_generation},
                     {"last_microbatch_generation", loss.last_microbatch_generation},
                     {"last_application_epoch", loss.last_application_epoch},
                     {"physical_dispatch_count", loss.physical_dispatch_count},
+                    {"encode_physical_dispatch_count", loss.encode_physical_dispatch_count},
+                    {"decode_physical_dispatch_count", loss.decode_physical_dispatch_count},
                     {"saturation", loss.saturation},
                     {"loss_descriptor_state", loss.saturation ? "saturated_exact" : "detailed_exact"},
                     {"generation_state", loss.generation_mixed ? "mixed" : "exact"},
@@ -7468,6 +7512,7 @@ private:
                 gaps.push_back(telemetry_moe_native_dispatch_loss_gap_json(
                     slot.telemetry_moe_chunk_decision_sequence, loss));
             }
+            telemetry_moe_sort_physical_gaps(gaps);
             event["gaps"] = std::move(gaps);
             return true;
         };
