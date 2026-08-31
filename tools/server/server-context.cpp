@@ -55,6 +55,10 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+static int64_t telemetry_dispatch_clock_precision_us(int64_t before_us, int64_t after_us) {
+    return std::max<int64_t>(1, after_us - before_us);
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -5804,7 +5808,7 @@ private:
         const int64_t after_us = ggml_time_us();
         telemetry_clock_anchor_monotonic_us = before_us + (after_us - before_us)/2;
         telemetry_clock_anchor_timestamp_unix_ms = wall_ms;
-        telemetry_clock_anchor_precision_us = after_us - before_us;
+        telemetry_clock_anchor_precision_us = telemetry_dispatch_clock_precision_us(before_us, after_us);
     }
 
     json telemetry_dispatch_clock_json() const {
@@ -10293,6 +10297,10 @@ private:
 //
 
 #ifdef LLAMA_SERVER_TEST_HOOKS
+int64_t server_test_telemetry_dispatch_clock_precision_us(int64_t before_us, int64_t after_us) {
+    return telemetry_dispatch_clock_precision_us(before_us, after_us);
+}
+
 json server_context_impl::test_native_dispatch_loss_stream_finalization() {
     server_context_impl server;
     server.telemetry_server_instance_id = "server-test-native-loss-stream";

@@ -240,6 +240,12 @@ static void test_finalization_loss_combines_event_and_pending(testing & t) {
 }
 
 #if defined(LLAMA_SERVER_TEST_HOOKS)
+static void test_dispatch_clock_precision_floor(testing & t) {
+    t.assert_equal(1LL, server_test_telemetry_dispatch_clock_precision_us(100, 100));
+    t.assert_equal(1LL, server_test_telemetry_dispatch_clock_precision_us(100, 101));
+    t.assert_equal(7LL, server_test_telemetry_dispatch_clock_precision_us(100, 107));
+}
+
 static void test_saturated_native_dispatch_loss_serialization(testing & t) {
     const json gap = server_test_moe_dispatch_saturation_gap_json();
     const json chunk = server_test_moe_dispatch_saturation_chunk_json();
@@ -540,6 +546,7 @@ int main() {
     t.test("serialization loss counts pending and incoming", test_serialization_loss_counts_pending_and_incoming);
     t.test("finalization loss combines event and pending", test_finalization_loss_combines_event_and_pending);
 #if defined(LLAMA_SERVER_TEST_HOOKS)
+    t.test("dispatch clock precision floor", test_dispatch_clock_precision_floor);
     t.test("saturated native dispatch loss serialization", test_saturated_native_dispatch_loss_serialization);
     t.test("streamed native dispatch loss finalization", test_streamed_native_dispatch_loss_finalization);
     t.test("native dispatch loss timeline", test_native_dispatch_loss_timeline);

@@ -1976,7 +1976,7 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         assert all(clock["clock_domain"] == "server_process_monotonic_microseconds" for clock in clocks)
         assert all(clock["anchor_monotonic_us"] > 0 for clock in clocks)
         assert all(clock["anchor_timestamp_unix_ms"] > 0 for clock in clocks)
-        assert all(clock["anchor_precision_us"] >= 0 for clock in clocks)
+        assert all(clock["anchor_precision_us"] >= 1 for clock in clocks)
         assert len({
             (clock["anchor_monotonic_us"], clock["anchor_timestamp_unix_ms"], clock["anchor_precision_us"])
             for clock in clocks
@@ -2537,7 +2537,7 @@ def test_moe_routing_chunks_mark_on_off_on_intervals_partial():
             assert boundary_clock["clock_domain"] == "server_process_monotonic_microseconds"
             assert boundary_clock["anchor_monotonic_us"] > 0
             assert boundary_clock["anchor_timestamp_unix_ms"] > 0
-            assert boundary_clock["anchor_precision_us"] >= 0
+            assert boundary_clock["anchor_precision_us"] >= 1
             assert all(boundary["clock"] == boundary_clock for boundary in (
                 enabled_boundary, disabled_boundary, reenabled_boundary
             ))

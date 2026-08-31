@@ -7,6 +7,7 @@
 #include "json.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -113,6 +114,7 @@ struct server_context {
 };
 
 #ifdef LLAMA_SERVER_TEST_HOOKS
+int64_t server_test_telemetry_dispatch_clock_precision_us(int64_t before_us, int64_t after_us);
 json server_test_moe_dispatch_saturation_gap_json();
 json server_test_moe_dispatch_saturation_chunk_json();
 json server_test_moe_dispatch_loss_stream_finalization_json();
