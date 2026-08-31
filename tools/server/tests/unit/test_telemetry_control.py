@@ -540,9 +540,9 @@ def test_inflight_off_on_off_uses_recorded_microbatch_generation_and_request_sna
             generation_one_recorded = False
             while time.monotonic() < deadline and not completion.done():
                 generation_one_recorded = any(
-                    decision["control_generation"] == 1
+                    decision["event_key"]["control_generation"] == 1
                     for event in _telemetry_events(server)
-                    if event["event"] == "moe_routing_chunk" and not event["final"]
+                    if event["event"] == "moe_routing_chunk"
                     for decision in event["decisions"]
                 )
                 if generation_one_recorded:
@@ -573,14 +573,15 @@ def test_inflight_off_on_off_uses_recorded_microbatch_generation_and_request_sna
             event for event in events
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
         ]
-        assert chunks[-1]["final"] is True
-        assert chunks[-1]["control_generation"] == 2
-        assert chunks[-1]["capture_interruption_reason"] == "telemetry_control_disabled"
+        assert chunks[-1]["is_final_for_trace"] is True
+        partial_chunks = [chunk for chunk in chunks if chunk["availability"] == 1]
+        assert partial_chunks
+        assert any(chunk["unlocated_coverage_loss"]["count"] > 0 for chunk in partial_chunks)
         decisions = [
-            decision for chunk in chunks if not chunk["final"] for decision in chunk["decisions"]
+            decision for chunk in chunks for decision in chunk["decisions"]
         ]
         assert decisions
-        assert {decision["control_generation"] for decision in decisions} == {1}
+        assert {decision["event_key"]["control_generation"] for decision in decisions} == {1}
 
         completed = _completed_event(server, response.body["trace_id"])
         assert completed["output_token_telemetry"]["state"] == "not_enabled_for_request"

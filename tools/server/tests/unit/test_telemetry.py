@@ -1869,27 +1869,19 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == trace_id
         ]
         assert chunks
-        assert all(chunk["moe_routing_schema_version"] == 2 for chunk in chunks)
-        assert [chunk["trace_chunk_sequence"] for chunk in chunks] == list(range(1, len(chunks) + 1))
-        assert chunks[-1]["final"] is True
-        assert chunks[-1]["decisions"] == []
-        assert chunks[-1]["producer_coverage"]["state"] == "complete"
-        assert chunks[-1]["producer_coverage"]["trace_rows_total"] == sum(
-            chunk["producer_coverage"]["chunk_rows"]
-            for chunk in chunks if not chunk["final"]
-        )
-        assert chunks[-1]["producer_coverage"]["invalid_rows_total"] == 0
-        assert chunks[-1]["producer_coverage"]["unavailable_rows_total"] == 0
-        assert chunks[-1]["producer_coverage"]["unlinked_rows_total"] == 0
+        assert all(chunk["schema_version"] == 2 for chunk in chunks)
+        assert chunks[-1]["is_final_for_trace"] is True
+        assert chunks[-1]["decisions"]
+        assert all(chunk["availability"] == 0 for chunk in chunks)
+        assert all(chunk["descriptor"]["schema_version"] == 2 for chunk in chunks)
+        assert all(chunk["descriptor"]["model_fingerprint"] is None for chunk in chunks)
+        assert all(chunk["descriptor"]["model_fingerprint_availability"] == 10 for chunk in chunks)
+        assert all("moe_routing_schema_version" not in chunk and "final" not in chunk for chunk in chunks)
 
-        decisions = [
-            decision for chunk in chunks if not chunk["final"] for decision in chunk["decisions"]
-        ]
+        decisions = [decision for chunk in chunks for decision in chunk["decisions"]]
         assert decisions
-        assert [decision["trace_decision_sequence"] for decision in decisions] == list(
-            range(1, len(decisions) + 1)
-        )
-        assert {decision["phase"] for decision in decisions} >= {"prefill", "decode"}
+        assert [decision["sequence"] for decision in decisions] == list(range(len(decisions)))
+        assert {decision["event_key"]["phase"] for decision in decisions} >= {1, 2}
         assert all(chunk["serialized_bytes"] <= 1024 * 1024 for chunk in chunks)
         assert all(
             chunk["serialized_bytes"] == len(
@@ -1904,16 +1896,19 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         assert b'"events":[' + b",".join(serialized_events) + b"]" in events_http.content
         assert all(chunk["sequence"] > 0 for chunk in chunks)
         assert all(chunk["server_instance_id"] == events_response["server_instance_id"] for chunk in chunks)
-        assert all(chunk["physical_peer_coverage"] in ["complete", "partial"] for chunk in chunks)
-        assert all("shared_experts" in chunk for chunk in chunks)
-        assert len({decision["physical_ubatch_index"] for decision in decisions}) >= 2
+        assert all(chunk["first_sequence"] < chunk["next_sequence"] for chunk in chunks)
+        assert all(chunk["gaps"] == [] for chunk in chunks)
+        assert all(chunk["invalid_records"] == [] for chunk in chunks)
+        assert len({decision["event_key"]["physical_microbatch"] for decision in decisions}) >= 2
         for decision in decisions:
-            assert decision["physical_step_id"] > 0
-            assert decision["physical_ubatch_index"] >= 0
-            assert decision["control_generation"] == 1
+            assert decision["event_key"]["physical_step"] > 0
+            assert decision["event_key"]["physical_microbatch"] >= 0
+            assert decision["event_key"]["control_generation"] == 1
             assert decision["kth_selected_score_status"] in [0, 1, 2, 3]
             assert decision["highest_rejected_score_status"] in [0, 1, 2, 3]
             assert decision["selected_experts"]
+            assert decision["native_row"]["row_identity_status"] == 0
+            assert decision["shared_experts"]["execution_semantics"] == "metadata_only"
             for selected in decision["selected_experts"]:
                 assert selected["expert_id_status"] in [0, 1, 2, 3]
                 assert selected["effective_weight_status"] in [0, 1, 2, 3]
@@ -1942,12 +1937,12 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         server.stop()
 
 
-def test_moe_routing_chunk_byte_cap_marks_oversized_rows_partial(monkeypatch):
+def test_moe_routing_chunk_byte_cap_splits_canonical_envelopes(monkeypatch):
     global server
 
     api_key = "moe-routing-chunk-cap-test-key"
     auth = {"Authorization": f"Bearer {api_key}"}
-    monkeypatch.setenv("LLAMA_TELEMETRY_MOE_CHUNK_MAX_BYTES", "1024")
+    monkeypatch.setenv("LLAMA_TELEMETRY_MOE_CHUNK_MAX_BYTES", "4096")
     server = ServerPreset.stories15m_moe()
     server.server_props = True
     server.api_key = api_key
@@ -1985,14 +1980,22 @@ def test_moe_routing_chunk_byte_cap_marks_oversized_rows_partial(monkeypatch):
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
         ]
         assert chunks
-        assert all(chunk["serialized_bytes"] <= 1024 for chunk in chunks)
-        assert chunks[-1]["final"] is True
-        assert chunks[-1]["producer_coverage"]["state"] == "partial"
-        assert chunks[-1]["capture_interruption_reason"] == "serialized_chunk_limit"
-        assert chunks[-1]["producer_coverage"]["unavailable_rows_total"] == 0
-        assert chunks[-1]["producer_coverage"]["unlocated_rows_total"] > 0
-        assert chunks[-1]["producer_coverage"]["trace_rows_total"] >= (
-            chunks[-1]["producer_coverage"]["unlocated_rows_total"]
+        assert all(chunk["serialized_bytes"] <= 4096 for chunk in chunks)
+        assert all(
+            chunk["serialized_bytes"] == len(
+                json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            )
+            for chunk in chunks
+        )
+        assert chunks[-1]["is_final_for_trace"] is True
+        assert chunks[-1]["decisions"]
+        assert all(chunk["schema_version"] == 2 for chunk in chunks)
+        assert all(chunk["availability"] in [0, 1] for chunk in chunks)
+        assert any(chunk["availability"] == 1 for chunk in chunks)
+        assert any(chunk["gaps"] for chunk in chunks)
+        assert all(
+            chunk["availability"] != 1 or chunk["gaps"] or chunk.get("unlocated_coverage_loss")
+            for chunk in chunks
         )
     finally:
         server.stop()
@@ -2041,18 +2044,16 @@ def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
             for event in events.body["events"]
             if event["event"] == "moe_routing_chunk"
             and event["trace_id"] == response.body["trace_id"]
-            and not event["final"]
             for decision in event["decisions"]
         ]
-        mtp_decisions = [decision for decision in decisions if decision["phase"] == "mtp_verify"]
+        mtp_decisions = [decision for decision in decisions if decision["event_key"]["phase"] == 3]
         assert mtp_decisions
-        # LLAMA_CONTEXT_TYPE_MTP maps directly to LLM_GRAPH_TYPE_DECODER_MTP (3).
-        assert all(decision["graph_type"] == 3 for decision in mtp_decisions)
+        assert all(decision["native_row"]["graph_type"] == "decoder_mtp" for decision in mtp_decisions)
         assert all(decision["model_position"] is not None for decision in mtp_decisions)
-        assert all(decision["logical_step"] is not None for decision in mtp_decisions)
-        assert all(decision["actual_target_pass"] is not None for decision in mtp_decisions)
-        assert all(decision["proposal_position"] is not None for decision in mtp_decisions)
-        assert all(isinstance(decision["replay_pass"], bool) for decision in mtp_decisions)
+        assert all(decision["speculative_pass"]["logical_verification_step"] is not None for decision in mtp_decisions)
+        assert all(decision["speculative_pass"]["actual_target_pass"] is not None for decision in mtp_decisions)
+        assert all(decision["speculative_pass"]["proposal_position"] is not None for decision in mtp_decisions)
+        assert all(isinstance(decision["speculative_pass"]["is_replay_pass"], bool) for decision in mtp_decisions)
     finally:
         mtp_server.stop()
 
@@ -2123,16 +2124,17 @@ def test_moe_routing_chunks_mark_on_off_on_intervals_partial():
             event for event in events.body["events"]
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
         ]
-        assert chunks[-1]["final"] is True
-        assert chunks[-1]["producer_coverage"]["state"] == "partial"
-        assert chunks[-1]["capture_interruption_reason"] == "telemetry_control_disabled"
+        assert chunks[-1]["is_final_for_trace"] is True
+        partial_chunks = [chunk for chunk in chunks if chunk["availability"] == 1]
+        assert partial_chunks
+        assert any(chunk["unlocated_coverage_loss"]["count"] > 0 for chunk in partial_chunks)
         assert any(
-            decision["control_generation"] == 1
-            for chunk in chunks if not chunk["final"] for decision in chunk["decisions"]
+            decision["event_key"]["control_generation"] == 1
+            for chunk in chunks for decision in chunk["decisions"]
         )
         assert any(
-            decision["control_generation"] == 3
-            for chunk in chunks if not chunk["final"] for decision in chunk["decisions"]
+            decision["event_key"]["control_generation"] == 3
+            for chunk in chunks for decision in chunk["decisions"]
         )
     finally:
         server.stop()

@@ -29,7 +29,10 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <chrono>
+#include <ctime>
 #include <random>
+#include <tuple>
 #include <utility>
 #include <fstream>
 #include <deque>
@@ -533,10 +536,12 @@ struct server_slot {
     uint64_t telemetry_moe_chunk_unavailable_rows = 0;
     uint64_t telemetry_moe_chunk_unlinked_rows = 0;
     uint64_t telemetry_moe_chunk_unlocated_rows = 0;
+    uint64_t telemetry_moe_chunk_unlocated_pending = 0;
     bool telemetry_moe_chunk_capture_started = false;
     bool telemetry_moe_chunk_capture_interrupted = false;
     bool telemetry_moe_chunk_source_unavailable = false;
     bool telemetry_moe_chunk_serialization_dropped = false;
+    json telemetry_moe_pending_chunk;
 
     bool has_next_token = true;
     bool has_new_line   = false;
@@ -684,10 +689,12 @@ struct server_slot {
         telemetry_moe_chunk_unavailable_rows = 0;
         telemetry_moe_chunk_unlinked_rows = 0;
         telemetry_moe_chunk_unlocated_rows = 0;
+        telemetry_moe_chunk_unlocated_pending = 0;
         telemetry_moe_chunk_capture_started = false;
         telemetry_moe_chunk_capture_interrupted = false;
         telemetry_moe_chunk_source_unavailable = false;
         telemetry_moe_chunk_serialization_dropped = false;
+        telemetry_moe_pending_chunk = json();
         json_schema = json();
 
         task_prev = std::move(task);
@@ -4588,7 +4595,10 @@ private:
             if (llama_model_n_expert(model_tgt) > 0 && slot.task &&
                     slot.task->params.moe_routing_telemetry_permitted &&
                     !control.moe_routing && slot.telemetry_moe_chunk_capture_started) {
-                slot.telemetry_moe_chunk_capture_interrupted = true;
+                if (!slot.telemetry_moe_chunk_capture_interrupted) {
+                    slot.telemetry_moe_chunk_capture_interrupted = true;
+                    ++slot.telemetry_moe_chunk_unlocated_pending;
+                }
             }
             collect_moe_routing |= control.moe_routing
                 && llama_model_n_expert(model_tgt) > 0
@@ -4621,7 +4631,10 @@ private:
                     continue;
                 }
                 slot.telemetry_moe_chunk_capture_started = true;
-                slot.telemetry_moe_chunk_source_unavailable |= !readback_has_rows;
+                if (!readback_has_rows) {
+                    slot.telemetry_moe_chunk_source_unavailable = true;
+                    ++slot.telemetry_moe_chunk_unlocated_pending;
+                }
             }
             if (moe_routing_readback_copied) {
                 telemetry_record_moe_routing_chunks(
@@ -5984,15 +5997,25 @@ private:
         return status == LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
     }
 
-    static const char * telemetry_moe_phase_name(
+    static uint32_t telemetry_moe_phase_number(
             const server_batch::token & token,
             const server_slot & slot) {
         if (token.is_prompt) {
-            return "prefill";
+            return 1; // PrefillOutput
         }
         return slot.can_speculate() && !slot.spec_draft.empty()
-            ? "mtp_verify"
-            : "decode";
+            ? 3 // MtpVerify
+            : 2; // NormalDecode
+    }
+
+    static const char * telemetry_moe_graph_type_name(uint32_t graph_type) {
+        switch (graph_type) {
+            case 0: return "default";
+            case 1: return "encoder";
+            case 2: return "decoder";
+            case 3: return "decoder_mtp";
+        }
+        return "unknown";
     }
 
     bool telemetry_moe_row_is_invalid(const telemetry_moe_routing_row_capture & row) const {
@@ -6031,6 +6054,102 @@ private:
         return std::min(telemetry_moe_chunk_max_bytes, telemetry_event_max_bytes);
     }
 
+    static std::string telemetry_moe_created_at() {
+        const auto now = std::chrono::system_clock::now();
+        const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+        const time_t seconds = (time_t) (milliseconds.count() / 1000);
+        std::tm utc = {};
+#if defined(_WIN32)
+        gmtime_s(&utc, &seconds);
+#else
+        gmtime_r(&seconds, &utc);
+#endif
+        char timestamp[32] = {};
+        std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &utc);
+        return string_format("%s.%03" PRId64 "Z", timestamp, milliseconds.count() % 1000);
+    }
+
+    std::string telemetry_serialize_moe_routing_chunk(json event, uint64_t sequence) const {
+        event["schema_version"] = 2;
+        event["event"] = "moe_routing_chunk";
+        event["server_instance_id"] = telemetry_server_instance_id;
+        event["sequence"] = sequence;
+        event["serialized_bytes"] = 0;
+
+        std::string serialized = event.dump();
+        const std::string marker = "\"serialized_bytes\":0";
+        const size_t marker_offset = serialized.find(marker);
+        GGML_ASSERT(marker_offset != std::string::npos);
+
+        size_t final_bytes = serialized.size();
+        while (true) {
+            const size_t next_bytes = serialized.size() - 1 + std::to_string(final_bytes).size();
+            if (next_bytes == final_bytes) {
+                break;
+            }
+            final_bytes = next_bytes;
+        }
+        serialized.replace(marker_offset + marker.size() - 1, 1, std::to_string(final_bytes));
+        GGML_ASSERT(serialized.size() == final_bytes);
+        return serialized;
+    }
+
+    bool telemetry_moe_chunk_fits_limit(const json & event) const {
+        // Pack against the widest possible event-ring sequence so a later
+        // sequence-digit boundary cannot make an already-buffered chunk exceed
+        // its exact serialized limit.
+        return telemetry_serialize_moe_routing_chunk(event, std::numeric_limits<uint64_t>::max()).size()
+            <= telemetry_moe_chunk_limit_bytes();
+    }
+
+    bool telemetry_moe_chunk_can_be_finalized(const json & event) const {
+        // The one pending chunk becomes the substantive final chunk. Reserve
+        // the bounded, coordinate-free interruption evidence it may need at
+        // completion; never replace an oversized substantive chunk with an
+        // empty "final" marker.
+        json final_event = event;
+        final_event["is_final_for_trace"] = true;
+        final_event["availability"] = 1;
+        final_event["reason"] = "The request ended after routing capture lost an interval without complete routing coordinates.";
+        final_event["unlocated_coverage_loss"] = {
+            {"count", 65536},
+            {"reason", "Routing capture ended after an unavailable native or control-boundary interval."},
+        };
+        return telemetry_moe_chunk_fits_limit(final_event);
+    }
+
+    bool telemetry_append_moe_routing_chunk(json event) {
+        const uint64_t sequence = telemetry_next_sequence;
+        std::string serialized = telemetry_serialize_moe_routing_chunk(std::move(event), sequence);
+        if (serialized.size() > telemetry_moe_chunk_limit_bytes() || serialized.size() > telemetry_event_max_bytes) {
+            return false;
+        }
+        ++telemetry_next_sequence;
+        telemetry_append_serialized(sequence, std::move(serialized));
+        return true;
+    }
+
+    bool telemetry_flush_moe_pending_chunk(server_slot & slot) {
+        if (slot.telemetry_moe_pending_chunk.is_null()) {
+            return true;
+        }
+        if (!telemetry_append_moe_routing_chunk(slot.telemetry_moe_pending_chunk)) {
+            return false;
+        }
+        slot.telemetry_moe_pending_chunk = json();
+        return true;
+    }
+
+    void telemetry_queue_moe_routing_chunk(server_slot & slot, json event) {
+        GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(event));
+        if (!telemetry_flush_moe_pending_chunk(slot)) {
+            slot.telemetry_moe_chunk_serialization_dropped = true;
+            ++slot.telemetry_moe_chunk_unlocated_pending;
+            return;
+        }
+        slot.telemetry_moe_pending_chunk = std::move(event);
+    }
+
     void telemetry_record_moe_routing_chunks(
             const telemetry_moe_routing_readback_capture & readback,
             int32_t batch_offset,
@@ -6040,14 +6159,38 @@ private:
             return;
         }
 
-        struct physical_peer_coverage {
-            std::set<std::string> trace_ids;
-            bool complete = true;
+        struct physical_event_id {
+            uint32_t microbatch = 0;
+            int32_t layer = -1;
+            uint32_t phase = 0;
+
+            bool operator < (const physical_event_id & other) const {
+                return std::tie(microbatch, layer, phase) < std::tie(other.microbatch, other.layer, other.phase);
+            }
+        };
+        struct physical_event_coverage {
+            std::set<std::string> expected_trace_ids;
+            std::set<std::string> captured_trace_ids;
+            size_t expected_decisions = 0;
+            size_t captured_valid_decisions = 0;
+        };
+        struct trace_record {
+            const telemetry_moe_routing_row_capture * row = nullptr;
+            const server_batch::token * token = nullptr;
+            physical_event_id event;
+            uint64_t sequence = 0;
+            bool invalid = false;
+            bool gap = false;
+            int64_t proposal_position = -1;
+        };
+        struct trace_capture {
+            server_slot * slot = nullptr;
+            std::vector<trace_record> records;
+            size_t unlocated_rows = 0;
         };
 
-        std::map<std::string, std::vector<size_t>> rows_by_trace;
-        std::map<std::string, server_slot *> slots_by_trace;
-        std::map<uint32_t, physical_peer_coverage> peers_by_ubatch;
+        std::map<std::string, trace_capture> captures_by_trace;
+        std::map<physical_event_id, physical_event_coverage> coverage_by_event;
         std::vector<int64_t> proposal_positions((size_t) batch_token_count, -1);
         std::vector<int64_t> next_proposal_position(slots.size(), 0);
 
@@ -6064,218 +6207,222 @@ private:
 
         for (size_t row_index = 0; row_index < readback.rows.size(); ++row_index) {
             const telemetry_moe_routing_row_capture & row = readback.rows[row_index];
-            physical_peer_coverage & peers = peers_by_ubatch[row.physical_ubatch_index];
             if (row.token_index < 0 || row.token_index >= batch_token_count) {
-                peers.complete = false;
                 continue;
             }
             const server_batch::token & token = batch.tokens[batch_offset + row.token_index];
             if (token.id_slot < 0 || token.id_slot >= (int32_t) slots.size()) {
-                peers.complete = false;
                 continue;
             }
             server_slot & slot = slots[token.id_slot];
-            if (!telemetry_moe_request_enabled(slot)) {
-                peers.complete = false;
+            if (!slot.task) {
                 continue;
             }
-            if (row.row_identity_status != LLAMA_MOE_ROUTING_VALUE_STATUS_VALID) {
-                peers.complete = false;
-                slot.telemetry_moe_chunk_unlinked_rows++;
+            const uint32_t phase = telemetry_moe_phase_number(token, slot);
+            const physical_event_id event_id = { row.physical_ubatch_index, row.layer_index, phase };
+            const bool locatable = row.row_identity_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID
+                && row.layer_index >= 0
+                && row.position >= 0
+                && row.row_index >= 0
+                && row.ubatch_token_index >= 0;
+            const bool enabled = telemetry_moe_request_enabled(slot);
+            if (!locatable) {
+                if (enabled) {
+                    trace_capture & capture = captures_by_trace[slot.task->trace_id];
+                    capture.slot = &slot;
+                    ++capture.unlocated_rows;
+                    ++slot.telemetry_moe_chunk_unlocated_rows;
+                    ++slot.telemetry_moe_chunk_unlinked_rows;
+                }
+                continue;
             }
-            peers.trace_ids.insert(slot.task->trace_id);
-            rows_by_trace[slot.task->trace_id].push_back(row_index);
-            slots_by_trace[slot.task->trace_id] = &slot;
+
+            physical_event_coverage & coverage = coverage_by_event[event_id];
+            coverage.expected_trace_ids.insert(slot.task->trace_id);
+            ++coverage.expected_decisions;
+            if (!enabled) {
+                continue;
+            }
+
+            const int32_t expected_experts = llama_model_n_expert_used(model_tgt);
+            const bool invalid = telemetry_moe_row_is_invalid(row)
+                || expected_experts <= 0
+                || row.selected_experts.size() != (size_t) expected_experts;
+            trace_capture & capture = captures_by_trace[slot.task->trace_id];
+            capture.slot = &slot;
+            capture.records.push_back({
+                &row,
+                &token,
+                event_id,
+                slot.telemetry_moe_chunk_decision_sequence++,
+                invalid,
+                false,
+                proposal_positions[(size_t) row.token_index],
+            });
+            coverage.captured_trace_ids.insert(slot.task->trace_id);
+            coverage.captured_valid_decisions += invalid ? 0 : 1;
+            ++slot.telemetry_moe_chunk_trace_rows;
+            ++slot.telemetry_moe_chunk_rows;
+            slot.telemetry_moe_chunk_invalid_rows += invalid;
+            slot.telemetry_moe_chunk_unavailable_rows += telemetry_moe_row_is_unavailable(row);
         }
 
-        const size_t chunk_limit = telemetry_moe_chunk_limit_bytes();
-        constexpr size_t chunk_reserve_bytes = 64 * 1024;
-        const size_t chunk_payload_limit = chunk_limit > chunk_reserve_bytes
-            ? chunk_limit - chunk_reserve_bytes
-            : chunk_limit;
+        int32_t shared_expert_count = 0;
+        for (const telemetry_moe_shared_expert_capture & shared : readback.shared_experts) {
+            shared_expert_count = std::max(shared_expert_count, (int32_t) shared.configured_count);
+        }
+        const int32_t routed_expert_count = llama_model_n_expert(model_tgt);
+        const int32_t experts_per_token = llama_model_n_expert_used(model_tgt);
+        const int32_t moe_layer_count = llama_model_n_layer(model_tgt);
+        GGML_ASSERT(routed_expert_count > 0 && experts_per_token > 0 && moe_layer_count > 0);
+        const json descriptor = {
+            {"schema_version", 2},
+            {"server_instance_id", telemetry_server_instance_id},
+            {"server_build", std::string(llama_build_info())},
+            {"model_id", model_name},
+            {"model_fingerprint", nullptr},
+            {"model_fingerprint_availability", 10},
+            {"model_fingerprint_reason", "llama-server does not expose a stable model digest."},
+            {"routed_expert_count", routed_expert_count},
+            {"experts_per_token", experts_per_token},
+            {"moe_layer_count", moe_layer_count},
+            {"shared_expert_count", shared_expert_count},
+            {"weight_semantics", "exact effective routed coefficient"},
+            {"score_semantics", "router score after selection bias and group masking"},
+            {"clock_domain", "llama_server_process_monotonic"},
+        };
 
-        for (const auto & trace_rows : rows_by_trace) {
-            const std::string & trace_id = trace_rows.first;
-            server_slot & slot = *slots_by_trace.at(trace_id);
-            const std::vector<size_t> & all_rows = trace_rows.second;
-            size_t invalid_total = 0;
-            size_t unavailable_total = 0;
-            for (size_t index : all_rows) {
-                invalid_total += telemetry_moe_row_is_invalid(readback.rows[index]);
-                unavailable_total += telemetry_moe_row_is_unavailable(readback.rows[index]);
-            }
-            slot.telemetry_moe_chunk_trace_rows += all_rows.size();
-
-            json decisions = json::array();
-            std::vector<size_t> chunk_rows;
-            size_t estimated_bytes = 32 * 1024;
-            uint64_t next_decision_sequence = slot.telemetry_moe_chunk_decision_sequence;
-            auto make_event = [&]() {
-                std::set<std::pair<int32_t, uint32_t>> shared_keys;
-                json shared_experts = json::array();
-                json peer_trace_ids = json::array();
-                std::set<std::string> chunk_peer_trace_ids;
-                bool peer_coverage_complete = true;
-                json first_position = nullptr;
-                json last_position = nullptr;
-                for (size_t index : chunk_rows) {
-                    const telemetry_moe_routing_row_capture & row = readback.rows[index];
-                    shared_keys.insert({row.layer_index, row.graph_type});
-                    const physical_peer_coverage & peers = peers_by_ubatch.at(row.physical_ubatch_index);
-                    peer_coverage_complete = peer_coverage_complete && peers.complete;
-                    chunk_peer_trace_ids.insert(peers.trace_ids.begin(), peers.trace_ids.end());
-                    if (row.row_identity_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID && row.position >= 0) {
-                        first_position = first_position.is_null()
-                            ? json(row.position)
-                            : json(std::min(first_position.get<llama_pos>(), row.position));
-                        last_position = last_position.is_null()
-                            ? json(row.position)
-                            : json(std::max(last_position.get<llama_pos>(), row.position));
-                    }
-                }
-                for (const std::string & peer_trace_id : chunk_peer_trace_ids) {
-                    peer_trace_ids.push_back(peer_trace_id);
-                }
-                for (const telemetry_moe_shared_expert_capture & shared : readback.shared_experts) {
-                    if (shared_keys.count({shared.layer_index, shared.graph_type}) == 0) {
-                        continue;
-                    }
-                    shared_experts.push_back({
-                        {"layer_index", shared.layer_index},
-                        {"graph_type", shared.graph_type},
-                        {"present", shared.present},
+        const auto shared_metadata = [&](const telemetry_moe_routing_row_capture & row) {
+            for (const telemetry_moe_shared_expert_capture & shared : readback.shared_experts) {
+                if (shared.layer_index == row.layer_index && shared.graph_type == row.graph_type) {
+                    return json {
                         {"configured_count", shared.configured_count},
+                        {"present", shared.present},
                         {"ffn_size", shared.ffn_size},
-                    });
-                }
-
-                const bool trace_partial = server_moe_routing_producer_coverage_is_partial(
-                    invalid_total,
-                    unavailable_total,
-                    slot.telemetry_moe_chunk_unlinked_rows,
-                    slot.telemetry_moe_chunk_unlocated_rows,
-                    slot.telemetry_moe_chunk_capture_interrupted,
-                    slot.telemetry_moe_chunk_source_unavailable);
-                return json {
-                    {"event", "moe_routing_chunk"},
-                    {"moe_routing_schema_version", 2},
-                    {"trace_id", trace_id},
-                    {"trace_chunk_sequence", slot.telemetry_moe_chunk_sequence + 1},
-                    {"final", false},
-                    {"control_generation", control_generation},
-                    {"physical_step_id", readback.capture_generation},
-                    {"native_capture_generation", readback.capture_generation},
-                    {"task_id", slot.task->id},
-                    {"slot_id", slot.id},
-                    {"slot_assignment_ordinal", slot.telemetry_assignment_ordinal},
-                    {"producer_coverage", {
-                        {"state", trace_partial ? "partial" : "complete"},
-                        {"trace_rows_total", all_rows.size()},
-                        {"chunk_rows", chunk_rows.size()},
-                        {"invalid_rows_total", invalid_total},
-                        {"unavailable_rows_total", unavailable_total},
-                        {"unlinked_rows_total", slot.telemetry_moe_chunk_unlinked_rows},
-                        {"unlocated_rows_total", slot.telemetry_moe_chunk_unlocated_rows},
-                    }},
-                    {"physical_peer_coverage", peer_coverage_complete ? "complete" : "partial"},
-                    {"physical_peer_trace_ids", peer_trace_ids},
-                    {"position_coverage", {
-                        {"first_model_position", first_position},
-                        {"last_model_position", last_position},
-                    }},
-                    {"shared_experts", shared_experts},
-                    {"decisions", decisions},
-                };
-            };
-
-            auto serialized_size = [&]() {
-                return telemetry_serialize_with_serialized_bytes(
-                    make_event(), telemetry_next_sequence).size();
-            };
-
-            auto flush = [&]() {
-                if (decisions.empty()) {
-                    return;
-                }
-
-                json event = make_event();
-                GGML_ASSERT(telemetry_serialize_with_serialized_bytes(event, telemetry_next_sequence).size() <= chunk_limit);
-                ++slot.telemetry_moe_chunk_sequence;
-                telemetry_append_with_serialized_bytes(std::move(event));
-                slot.telemetry_moe_chunk_rows += chunk_rows.size();
-                for (size_t index : chunk_rows) {
-                    const telemetry_moe_routing_row_capture & row = readback.rows[index];
-                    slot.telemetry_moe_chunk_invalid_rows += telemetry_moe_row_is_invalid(row);
-                    slot.telemetry_moe_chunk_unavailable_rows += telemetry_moe_row_is_unavailable(row);
-                }
-                chunk_rows.clear();
-                decisions = json::array();
-                estimated_bytes = 32 * 1024;
-            };
-
-            for (size_t index : all_rows) {
-                const telemetry_moe_routing_row_capture & row = readback.rows[index];
-                const server_batch::token & token = batch.tokens[batch_offset + row.token_index];
-                const physical_peer_coverage & peers = peers_by_ubatch.at(row.physical_ubatch_index);
-                const size_t decision_estimate = 2048 + row.selected_experts.size() * 256 + peers.trace_ids.size() * 512;
-                if (!decisions.empty() && estimated_bytes + decision_estimate > chunk_payload_limit) {
-                    flush();
-                }
-
-                json selected_experts = json::array();
-                bool decision_valid = row.row_identity_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID &&
-                    row.selected_experts_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID;
-                for (const telemetry_moe_routing_expert_capture & expert : row.selected_experts) {
-                    const bool expert_id_valid = expert.expert_index_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID;
-                    const bool effective_weight_valid = telemetry_moe_value_is_valid(
-                        expert.effective_weight_status, expert.effective_weight);
-                    decision_valid = decision_valid && expert_id_valid && effective_weight_valid;
-                    json selected = {
-                        {"expert_id", expert_id_valid ? json(expert.expert_index) : json(nullptr)},
-                        {"expert_id_status", telemetry_moe_value_status_number(expert.expert_index_status)},
-                        {"effective_weight", effective_weight_valid ? json(expert.effective_weight) : json(nullptr)},
-                        {"effective_weight_status", telemetry_moe_value_status_number(expert.effective_weight_status)},
+                        {"activated_expert_ids", json::array()},
+                        {"execution_semantics", "metadata_only"},
                     };
-                    if (const char * reason = telemetry_moe_value_status_reason(expert.expert_index_status)) {
-                        selected["expert_id_reason"] = reason;
-                    }
-                    if (const char * reason = telemetry_moe_value_status_reason(expert.effective_weight_status)) {
-                        selected["effective_weight_reason"] = reason;
-                    }
-                    selected_experts.push_back(std::move(selected));
+                }
+            }
+            return json {
+                {"configured_count", 0},
+                {"present", false},
+                {"ffn_size", nullptr},
+                {"reason", "No shared-expert metadata was retained for this router row."},
+                {"activated_expert_ids", json::array()},
+                {"execution_semantics", "metadata_only"},
+            };
+        };
+
+        const auto event_key = [&](const trace_record & record) {
+            return json {
+                {"server_instance_id", telemetry_server_instance_id},
+                {"physical_microbatch", record.event.microbatch},
+                {"physical_step", readback.capture_generation},
+                {"phase", record.event.phase},
+                {"layer_index", record.event.layer},
+                {"control_generation", control_generation},
+            };
+        };
+
+        const auto speculative_pass = [&](const trace_record & record, const server_slot & slot) {
+            if (record.event.phase != 3) {
+                return json(nullptr);
+            }
+            return json {
+                {"logical_verification_step", (int64_t) slot.stats.n_draft_verif_steps},
+                {"actual_target_pass", (int64_t) slot.n_spec_target_passes},
+                {"proposal_position", record.proposal_position},
+                {"is_replay_pass", slot.spec_is_replay},
+            };
+        };
+
+        const auto selected_experts = [&](const telemetry_moe_routing_row_capture & row) {
+            json result = json::array();
+            for (const telemetry_moe_routing_expert_capture & expert : row.selected_experts) {
+                const bool weight_valid = telemetry_moe_value_is_valid(expert.effective_weight_status, expert.effective_weight);
+                json selected = {
+                    {"expert_id", expert.expert_index},
+                    {"effective_weight", weight_valid ? json(expert.effective_weight) : json(nullptr)},
+                    {"expert_id_status", telemetry_moe_value_status_number(expert.expert_index_status)},
+                    {"effective_weight_status", telemetry_moe_value_status_number(expert.effective_weight_status)},
+                };
+                if (const char * reason = telemetry_moe_value_status_reason(expert.expert_index_status)) {
+                    selected["expert_id_reason"] = reason;
+                }
+                if (const char * reason = telemetry_moe_value_status_reason(expert.effective_weight_status)) {
+                    selected["effective_weight_reason"] = reason;
+                }
+                result.push_back(std::move(selected));
+            }
+            return result;
+        };
+
+        const auto make_event = [&](const std::string & trace_id, const trace_capture & capture,
+                                    const std::vector<const trace_record *> & records,
+                                    uint64_t unlocated_rows, const std::string & chunk_id) {
+            GGML_ASSERT(!records.empty());
+            json decisions = json::array();
+            json invalid_records = json::array();
+            json intervals = json::array();
+            json gaps = json::array();
+            std::set<physical_event_id> physical_events_in_chunk;
+            for (const trace_record * record : records) {
+                const telemetry_moe_routing_row_capture & row = *record->row;
+                if (record->gap) {
+                    gaps.push_back({
+                        {"first_sequence", record->sequence},
+                        {"next_sequence", record->sequence + 1},
+                        {"first_physical_step", readback.capture_generation},
+                        {"last_physical_step", readback.capture_generation},
+                        {"first_physical_microbatch", record->event.microbatch},
+                        {"last_physical_microbatch", record->event.microbatch},
+                        {"first_model_position", row.position},
+                        {"last_model_position", row.position},
+                        {"phase", record->event.phase},
+                        {"layer_index", record->event.layer},
+                        {"control_generation", control_generation},
+                        {"cause", 5},
+                        {"reason", "The producer could not retain this exact routing record within the serialized chunk limit."},
+                    });
+                    continue;
+                }
+                physical_events_in_chunk.insert(record->event);
+                if (record->invalid) {
+                    invalid_records.push_back({
+                        {"sequence", record->sequence},
+                        {"request_trace_id", trace_id},
+                        {"event_key", event_key(*record)},
+                        {"model_position", row.position},
+                        {"speculative_pass", speculative_pass(*record, *capture.slot)},
+                        {"code", "invalid_router_row"},
+                        {"reason", "The native router row contained invalid or non-finite routing evidence."},
+                    });
+                    continue;
                 }
 
-                const bool kth_selected_valid = telemetry_moe_value_is_valid(
-                    row.selected_score_status, row.selected_score);
-                const bool highest_rejected_valid = telemetry_moe_value_is_valid(
-                    row.rejected_score_status, row.rejected_score);
-                decision_valid = decision_valid && kth_selected_valid && highest_rejected_valid;
-                const bool mtp_verify = !token.is_prompt && slot.can_speculate() && !slot.spec_draft.empty();
+                const bool kth_valid = telemetry_moe_value_is_valid(row.selected_score_status, row.selected_score);
+                const bool rejected_valid = telemetry_moe_value_is_valid(row.rejected_score_status, row.rejected_score);
                 json decision = {
-                    {"trace_decision_sequence", next_decision_sequence + 1},
-                    {"physical_step_id", readback.capture_generation},
-                    {"physical_ubatch_index", row.physical_ubatch_index},
-                    {"physical_ubatch_token_index", row.ubatch_token_index >= 0 ? json(row.ubatch_token_index) : json(nullptr)},
-                    {"row_index", row.row_index >= 0 ? json(row.row_index) : json(nullptr)},
-                    {"graph_type", row.graph_type},
-                    {"layer_index", row.layer_index >= 0 ? json(row.layer_index) : json(nullptr)},
-                    {"model_position", row.row_identity_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID && row.position >= 0
-                        ? json(row.position) : json(nullptr)},
-                    {"phase", telemetry_moe_phase_name(token, slot)},
-                    {"control_generation", control_generation},
-                    {"logical_step", mtp_verify ? json((int64_t) slot.stats.n_draft_verif_steps) : json(nullptr)},
-                    {"actual_target_pass", mtp_verify ? json((int64_t) slot.n_spec_target_passes) : json(nullptr)},
-                    {"proposal_position", mtp_verify ? json(proposal_positions[(size_t) row.token_index]) : json(nullptr)},
-                    {"replay_pass", mtp_verify && slot.spec_is_replay},
-                    {"row_identity_status", telemetry_moe_value_status_number(row.row_identity_status)},
-                    {"selected_experts_status", telemetry_moe_value_status_number(row.selected_experts_status)},
-                    {"decision_valid", decision_valid},
-                    {"selected_experts", std::move(selected_experts)},
-                    {"kth_selected_score", kth_selected_valid ? json(row.selected_score) : json(nullptr)},
+                    {"sequence", record->sequence},
+                    {"request_trace_id", trace_id},
+                    {"event_key", event_key(*record)},
+                    {"model_position", row.position},
+                    {"speculative_pass", speculative_pass(*record, *capture.slot)},
+                    {"selected_experts", selected_experts(row)},
+                    {"kth_selected_score", kth_valid ? json(row.selected_score) : json(nullptr)},
                     {"kth_selected_score_status", telemetry_moe_value_status_number(row.selected_score_status)},
-                    {"highest_rejected_score", highest_rejected_valid ? json(row.rejected_score) : json(nullptr)},
+                    {"highest_rejected_score", rejected_valid ? json(row.rejected_score) : json(nullptr)},
                     {"highest_rejected_score_status", telemetry_moe_value_status_number(row.rejected_score_status)},
-                    {"physical_peer_coverage", peers.complete ? "complete" : "partial"},
+                    {"native_row", {
+                        {"graph_type", telemetry_moe_graph_type_name(row.graph_type)},
+                        {"physical_ubatch_index", row.physical_ubatch_index},
+                        {"row_index", row.row_index},
+                        {"ubatch_token_index", row.ubatch_token_index},
+                        {"logical_token_index", row.token_index},
+                        {"row_identity_status", telemetry_moe_value_status_number(row.row_identity_status)},
+                    }},
+                    {"shared_experts", shared_metadata(row)},
                 };
                 if (const char * reason = telemetry_moe_value_status_reason(row.selected_score_status)) {
                     decision["kth_selected_score_reason"] = reason;
@@ -6283,83 +6430,197 @@ private:
                 if (const char * reason = telemetry_moe_value_status_reason(row.rejected_score_status)) {
                     decision["highest_rejected_score_reason"] = reason;
                 }
-                decisions.push_back(decision);
-                chunk_rows.push_back(index);
-                if (serialized_size() > chunk_limit) {
-                    decisions.erase(decisions.size() - 1);
-                    chunk_rows.pop_back();
-                    if (!decisions.empty()) {
-                        flush();
+                decisions.push_back(std::move(decision));
+                intervals.push_back({
+                    {"first_sequence", record->sequence},
+                    {"next_sequence", record->sequence + 1},
+                    {"first_physical_step", readback.capture_generation},
+                    {"last_physical_step", readback.capture_generation},
+                    {"first_physical_microbatch", record->event.microbatch},
+                    {"last_physical_microbatch", record->event.microbatch},
+                    {"first_model_position", row.position},
+                    {"last_model_position", row.position},
+                    {"phase", record->event.phase},
+                    {"layer_index", record->event.layer},
+                    {"control_generation", control_generation},
+                });
+            }
+
+            json physical_events = json::array();
+            for (const physical_event_id & id : physical_events_in_chunk) {
+                const physical_event_coverage & coverage = coverage_by_event.at(id);
+                const bool complete = coverage.captured_valid_decisions == coverage.expected_decisions
+                    && coverage.captured_trace_ids.size() == coverage.expected_trace_ids.size();
+                json trace_ids = json::array();
+                for (const std::string & captured_trace_id : coverage.captured_trace_ids) {
+                    trace_ids.push_back(captured_trace_id);
+                }
+                json physical = {
+                    {"event_key", {
+                        {"server_instance_id", telemetry_server_instance_id},
+                        {"physical_microbatch", id.microbatch},
+                        {"physical_step", readback.capture_generation},
+                        {"phase", id.phase},
+                        {"layer_index", id.layer},
+                        {"control_generation", control_generation},
+                    }},
+                    {"expected_request_trace_count", coverage.expected_trace_ids.size()},
+                    {"expected_decision_count", coverage.expected_decisions},
+                    {"captured_valid_decision_count", coverage.captured_valid_decisions},
+                    {"captured_request_trace_ids", trace_ids},
+                    {"is_complete", complete},
+                };
+                if (!complete) {
+                    physical["reason"] = "One or more request peers or router rows were not retained as valid routing decisions.";
+                }
+                physical_events.push_back(std::move(physical));
+            }
+
+            const bool partial = !gaps.empty() || unlocated_rows > 0;
+            json event = {
+                {"chunk_id", chunk_id},
+                {"trace_id", trace_id},
+                {"created_at", telemetry_moe_created_at()},
+                {"first_sequence", records.front()->sequence},
+                {"next_sequence", records.back()->sequence + 1},
+                {"is_final_for_trace", false},
+                {"availability", partial ? 1 : 0},
+                {"descriptor", descriptor},
+                {"coverage_intervals", intervals},
+                {"gaps", gaps},
+                {"invalid_records", invalid_records},
+                {"physical_events", physical_events},
+                {"decisions", decisions},
+            };
+            if (partial) {
+                event["reason"] = "The producer retained only a partial routing population for this trace chunk.";
+            }
+            if (unlocated_rows > 0) {
+                event["unlocated_coverage_loss"] = {
+                    {"count", std::min<uint64_t>(unlocated_rows, 65536)},
+                    {"reason", "Native routing rows were lost before complete routing coordinates were available."},
+                };
+            }
+            return event;
+        };
+
+        for (auto & trace_pair : captures_by_trace) {
+            const std::string & trace_id = trace_pair.first;
+            trace_capture & capture = trace_pair.second;
+            if (capture.slot == nullptr) {
+                continue;
+            }
+
+            uint64_t unlocated_rows = capture.unlocated_rows + capture.slot->telemetry_moe_chunk_unlocated_pending;
+            std::vector<std::vector<const trace_record *>> chunks;
+            std::vector<const trace_record *> current;
+            for (trace_record & record : capture.records) {
+                current.push_back(&record);
+                const json preview = make_event(trace_id, capture, current, chunks.empty() ? unlocated_rows : 0,
+                    "moe-pending-18446744073709551615");
+                if (telemetry_moe_chunk_fits_limit(preview) && telemetry_moe_chunk_can_be_finalized(preview)) {
+                    continue;
+                }
+                current.pop_back();
+                if (!current.empty()) {
+                    chunks.push_back(std::move(current));
+                    current.clear();
+                    current.push_back(&record);
+                }
+                if (current.size() == 1) {
+                    record.gap = true;
+                    physical_event_coverage & coverage = coverage_by_event.at(record.event);
+                    if (!record.invalid && coverage.captured_valid_decisions > 0) {
+                        --coverage.captured_valid_decisions;
                     }
-                    decisions.push_back(decision);
-                    chunk_rows.push_back(index);
-                    if (serialized_size() > chunk_limit) {
-                        decisions.erase(decisions.size() - 1);
-                        chunk_rows.pop_back();
-                        slot.telemetry_moe_chunk_serialization_dropped = true;
-                        slot.telemetry_moe_chunk_unlocated_rows++;
-                        continue;
+                    const json gap_preview = make_event(trace_id, capture, current, chunks.empty() ? unlocated_rows : 0,
+                        "moe-pending-18446744073709551615");
+                    if (!telemetry_moe_chunk_fits_limit(gap_preview)
+                            || !telemetry_moe_chunk_can_be_finalized(gap_preview)) {
+                        record.gap = false;
+                        ++capture.slot->telemetry_moe_chunk_unlocated_pending;
+                        ++capture.slot->telemetry_moe_chunk_unlocated_rows;
+                        current.clear();
                     }
                 }
-                ++next_decision_sequence;
-                estimated_bytes += decision_estimate;
             }
-            slot.telemetry_moe_chunk_decision_sequence = next_decision_sequence;
-            flush();
-            slot.telemetry_moe_chunk_capture_started = true;
+            if (!current.empty()) {
+                chunks.push_back(std::move(current));
+            }
+            if (chunks.empty()) {
+                capture.slot->telemetry_moe_chunk_unlocated_pending += unlocated_rows;
+                continue;
+            }
+
+            capture.slot->telemetry_moe_chunk_unlocated_pending = 0;
+            for (size_t index = 0; index < chunks.size(); ++index) {
+                const std::string chunk_id = string_format("moe-%d-%" PRIu64,
+                    capture.slot->id, ++capture.slot->telemetry_moe_chunk_sequence);
+                json event = make_event(trace_id, capture, chunks[index], index == 0 ? unlocated_rows : 0, chunk_id);
+                GGML_ASSERT(telemetry_moe_chunk_fits_limit(event));
+                GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(event));
+                telemetry_queue_moe_routing_chunk(*capture.slot, std::move(event));
+            }
+            capture.slot->telemetry_moe_chunk_capture_started = true;
         }
     }
 
     void telemetry_record_moe_routing_final_marker(server_slot & slot, const char * outcome) {
-        if (!slot.task || !slot.telemetry_moe_chunk_capture_started) {
+        if (!slot.task || (!slot.telemetry_moe_chunk_capture_started && !slot.telemetry_moe_chunk_source_unavailable)) {
             return;
         }
-        const bool partial = server_moe_routing_producer_coverage_is_partial(
-            slot.telemetry_moe_chunk_invalid_rows,
-            slot.telemetry_moe_chunk_unavailable_rows,
-            slot.telemetry_moe_chunk_unlinked_rows,
-            slot.telemetry_moe_chunk_unlocated_rows,
-            slot.telemetry_moe_chunk_capture_interrupted,
-            slot.telemetry_moe_chunk_source_unavailable);
-        json event = {
-            {"event", "moe_routing_chunk"},
-            {"moe_routing_schema_version", 2},
-            {"trace_id", slot.task->trace_id},
-            {"trace_chunk_sequence", ++slot.telemetry_moe_chunk_sequence},
-            {"final", true},
-            {"outcome", outcome},
-            {"control_generation", telemetry_control_current().generation},
-            {"physical_step_id", nullptr},
-            {"native_capture_generation", nullptr},
-            {"task_id", slot.task->id},
-            {"slot_id", slot.id},
-            {"slot_assignment_ordinal", slot.telemetry_assignment_ordinal},
-            {"producer_coverage", {
-                {"state", partial ? "partial" : "complete"},
-                {"trace_rows_total", slot.telemetry_moe_chunk_trace_rows},
-                {"chunk_rows", 0},
-                {"invalid_rows_total", slot.telemetry_moe_chunk_invalid_rows},
-                {"unavailable_rows_total", slot.telemetry_moe_chunk_unavailable_rows},
-                {"unlinked_rows_total", slot.telemetry_moe_chunk_unlinked_rows},
-                {"unlocated_rows_total", slot.telemetry_moe_chunk_unlocated_rows},
-            }},
-            {"physical_peer_coverage", "partial"},
-            {"physical_peer_trace_ids", json::array()},
-            {"position_coverage", {
-                {"first_model_position", nullptr},
-                {"last_model_position", nullptr},
-            }},
-            {"shared_experts", json::array()},
-            {"decisions", json::array()},
-        };
-        if (slot.telemetry_moe_chunk_capture_interrupted) {
-            event["capture_interruption_reason"] = "telemetry_control_disabled";
-        } else if (slot.telemetry_moe_chunk_serialization_dropped) {
-            event["capture_interruption_reason"] = "serialized_chunk_limit";
-        } else if (slot.telemetry_moe_chunk_source_unavailable) {
-            event["capture_interruption_reason"] = "native_readback_unavailable";
+        const uint64_t unlocated_rows = slot.telemetry_moe_chunk_unlocated_pending
+            + (slot.telemetry_moe_chunk_serialization_dropped ? 1 : 0);
+        if (!slot.telemetry_moe_pending_chunk.is_null()) {
+            slot.telemetry_moe_pending_chunk["is_final_for_trace"] = true;
+            if (unlocated_rows > 0) {
+                slot.telemetry_moe_pending_chunk["availability"] = 1;
+                slot.telemetry_moe_pending_chunk["reason"] = "The request ended after routing capture lost an interval without complete routing coordinates.";
+                slot.telemetry_moe_pending_chunk["unlocated_coverage_loss"] = {
+                    {"count", std::min<uint64_t>(unlocated_rows, 65536)},
+                    {"reason", "Routing capture ended after an unavailable native or control-boundary interval."},
+                };
+            }
+            slot.telemetry_moe_chunk_unlocated_pending = 0;
+            if (!telemetry_flush_moe_pending_chunk(slot)) {
+                slot.telemetry_moe_chunk_serialization_dropped = true;
+            }
+            return;
         }
-        telemetry_append_with_serialized_bytes(std::move(event));
+
+        const int32_t routed_expert_count = llama_model_n_expert(model_tgt);
+        const int32_t experts_per_token = llama_model_n_expert_used(model_tgt);
+        const int32_t moe_layer_count = llama_model_n_layer(model_tgt);
+        if (routed_expert_count <= 0 || experts_per_token <= 0 || moe_layer_count <= 0) {
+            return;
+        }
+        json marker = {
+            {"chunk_id", string_format("moe-%d-%" PRIu64, slot.id, ++slot.telemetry_moe_chunk_sequence)},
+            {"trace_id", slot.task->trace_id},
+            {"created_at", telemetry_moe_created_at()},
+            {"first_sequence", slot.telemetry_moe_chunk_decision_sequence},
+            {"next_sequence", slot.telemetry_moe_chunk_decision_sequence},
+            {"is_final_for_trace", true},
+            {"availability", 10},
+            {"reason", "No routable MoE records were retained for this request."},
+            {"descriptor", {
+                {"schema_version", 2},
+                {"server_instance_id", telemetry_server_instance_id},
+                {"server_build", std::string(llama_build_info())},
+                {"model_id", model_name},
+                {"model_fingerprint", nullptr},
+                {"model_fingerprint_availability", 10},
+                {"model_fingerprint_reason", "llama-server does not expose a stable model digest."},
+                {"routed_expert_count", routed_expert_count},
+                {"experts_per_token", experts_per_token},
+                {"moe_layer_count", moe_layer_count},
+                {"shared_expert_count", 0},
+                {"weight_semantics", "exact effective routed coefficient"},
+                {"score_semantics", "router score after selection bias and group masking"},
+                {"clock_domain", "llama_server_process_monotonic"},
+            }},
+        };
+        telemetry_append_moe_routing_chunk(std::move(marker));
     }
 
     bool telemetry_moe_request_enabled(const server_slot & slot) const {
