@@ -1955,6 +1955,11 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
             event for event in events_response["events"]
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == trace_id
         ]
+        terminals = [
+            event for event in events_response["events"]
+            if event.get("trace_id") == trace_id
+            and event["event"] in ("request_completed", "request_ended")
+        ]
         raw_chunks = [
             raw
             for raw in raw_telemetry_event_envelopes(events_http.content)
@@ -1962,6 +1967,10 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
             and event.get("trace_id") == trace_id
         ]
         assert chunks
+        assert len(terminals) == 1
+        terminal = terminals[0]
+        assert terminal["event"] == "request_completed"
+        assert all(chunk["sequence"] < terminal["sequence"] for chunk in chunks)
         assert raw_chunks
         assert [json.loads(raw)["sequence"] for raw in raw_chunks] == [chunk["sequence"] for chunk in chunks]
         assert all(chunk["schema_version"] == 3 for chunk in chunks)
