@@ -2133,10 +2133,78 @@ def test_moe_routing_chunk_byte_cap_splits_canonical_envelopes(monkeypatch):
             for chunk in chunks for gap in chunk["gaps"]
         )
     finally:
+        for chunk in chunks:
+            represented = sorted(
+                [decision["sequence"] for decision in chunk["decisions"]]
+                + [invalid["sequence"] for invalid in chunk["invalid_records"]]
+                + [sequence for gap in chunk["gaps"] for sequence in range(gap["first_sequence"], gap["next_sequence"])]
+            )
+            assert represented == list(range(chunk["first_sequence"], chunk["next_sequence"]))
         server.stop()
 
 
 def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
+def test_moe_routing_chunks_pack_large_prefill_near_byte_cap():
+    global server
+
+    api_key = "moe-routing-large-prefill-test-key"
+    auth = {"Authorization": f"Bearer {api_key}"}
+    server = ServerPreset.stories15m_moe()
+    server.server_props = True
+    server.api_key = api_key
+    server.n_batch = 128
+    server.n_ubatch = 16
+    server.start()
+
+    try:
+        control = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"moe_routing": True}},
+            headers=auth,
+        )
+        assert control.status_code == 200
+
+        response = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": "routing " * 384,
+                "n_predict": 1,
+                "ignore_eos": True,
+                "temperature": 0,
+            },
+            headers=auth,
+        )
+        assert response.status_code == 200
+
+        events = server.make_request(
+            "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
+        )
+        chunks = [
+            event for event in events.body["events"]
+            if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
+        ]
+        assert len(chunks) > 1
+        assert all(chunk["decisions"] for chunk in chunks)
+        assert chunks[-1]["is_final_for_trace"] is True
+        assert sum(chunk["is_final_for_trace"] for chunk in chunks) == 1
+        assert max(chunk["serialized_bytes"] for chunk in chunks) >= 512 * 1024
+        assert max(len(chunk["decisions"]) for chunk in chunks) > 100
+        assert all(chunk["serialized_bytes"] <= 1024 * 1024 for chunk in chunks)
+        assert all(not chunk["gaps"] and not chunk["invalid_records"] for chunk in chunks)
+
+        decisions = [decision for chunk in chunks for decision in chunk["decisions"]]
+        assert [decision["sequence"] for decision in decisions] == list(range(len(decisions)))
+        assert all(
+            chunk["first_sequence"] < chunk["next_sequence"]
+            and chunk["next_sequence"] - chunk["first_sequence"] == len(chunk["decisions"])
+            for chunk in chunks
+        )
+    finally:
+        server.stop()
+
+
     api_key = "moe-routing-mtp-test-key"
     auth = {"Authorization": f"Bearer {api_key}"}
     mtp_server = ServerPreset.stories15m_moe()

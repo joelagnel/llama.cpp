@@ -6275,6 +6275,9 @@ private:
             server_slot * slot = nullptr;
             std::vector<trace_record> records;
             size_t unlocated_rows = 0;
+            std::string created_at;
+            uint64_t pending_unlocated_rows = 0;
+            std::vector<std::vector<const trace_record *>> chunks;
         };
 
         std::map<std::string, trace_capture> captures_by_trace;
@@ -6325,6 +6328,9 @@ private:
             if (!locatable) {
                 trace_capture & capture = captures_by_trace[slot.task->trace_id];
                 capture.slot = &slot;
+                if (capture.created_at.empty()) {
+                    capture.created_at = telemetry_moe_created_at();
+                }
                 ++capture.unlocated_rows;
                 ++slot.telemetry_moe_chunk_unlocated_rows;
                 ++slot.telemetry_moe_chunk_unlinked_rows;
@@ -6339,6 +6345,9 @@ private:
                 || row.selected_experts.size() != (size_t) expected_experts;
             trace_capture & capture = captures_by_trace[slot.task->trace_id];
             capture.slot = &slot;
+            if (capture.created_at.empty()) {
+                capture.created_at = telemetry_moe_created_at();
+            }
             capture.records.push_back({
                 &row,
                 &token,
@@ -6427,7 +6436,6 @@ private:
         const auto make_event = [&](const std::string & trace_id, const trace_capture & capture,
                                     const std::vector<const trace_record *> & records,
                                     uint64_t unlocated_rows, const std::string & chunk_id) {
-            GGML_ASSERT(!records.empty());
             json decisions = json::array();
             json invalid_records = json::array();
             json intervals = json::array();
@@ -6546,9 +6554,9 @@ private:
             json event = {
                 {"chunk_id", chunk_id},
                 {"trace_id", trace_id},
-                {"created_at", telemetry_moe_created_at()},
-                {"first_sequence", records.front()->sequence},
-                {"next_sequence", records.back()->sequence + 1},
+                {"created_at", capture.created_at},
+                {"first_sequence", records.empty() ? uint64_t(0) : records.front()->sequence},
+                {"next_sequence", records.empty() ? uint64_t(0) : records.back()->sequence + 1},
                 {"is_final_for_trace", false},
                 {"availability", partial ? 1 : 0},
                 {"descriptor", descriptor},
@@ -6577,57 +6585,84 @@ private:
                 continue;
             }
 
-            uint64_t unlocated_rows = capture.unlocated_rows + capture.slot->telemetry_moe_chunk_unlocated_pending;
-            std::vector<std::vector<const trace_record *>> chunks;
+            capture.pending_unlocated_rows = capture.slot->telemetry_moe_chunk_unlocated_pending;
+            capture.slot->telemetry_moe_chunk_unlocated_pending = 0;
+            uint64_t unlocated_rows = capture.unlocated_rows;
+            GGML_ASSERT(server_moe_routing_add_lost_population(
+                capture.pending_unlocated_rows, unlocated_rows));
+            std::vector<std::vector<const trace_record *>> & chunks = capture.chunks;
             std::vector<const trace_record *> current;
+            const std::vector<const trace_record *> no_records;
+            const size_t chunk_base_upper_bound = telemetry_moe_chunk_finalized_size(make_event(
+                trace_id, capture, no_records, std::numeric_limits<uint64_t>::max(),
+                "moe-pending-18446744073709551615"));
+            size_t current_upper_bound = chunk_base_upper_bound;
+            constexpr size_t completeness_reserve = 128;
             for (trace_record & record : capture.records) {
-                current.push_back(&record);
-                const json preview = make_event(trace_id, capture, current, chunks.empty() ? unlocated_rows : 0,
-                    "moe-pending-18446744073709551615");
-                if (telemetry_moe_chunk_fits_limit(preview) && telemetry_moe_chunk_can_be_finalized(preview)) {
-                    continue;
-                }
-                current.pop_back();
-                if (!current.empty()) {
-                    chunks.push_back(std::move(current));
-                    current.clear();
-                    current.push_back(&record);
-                }
-                if (current.size() == 1) {
+                const std::vector<const trace_record *> one_record = { &record };
+                size_t one_record_upper_bound = telemetry_moe_chunk_finalized_size(make_event(
+                    trace_id, capture, one_record, std::numeric_limits<uint64_t>::max(),
+                    "moe-pending-18446744073709551615"));
+                if (one_record_upper_bound > telemetry_moe_chunk_limit_bytes() && !record.invalid) {
                     record.gap = true;
                     physical_event_coverage & coverage = coverage_by_event.at(record.event);
-                    if (!record.invalid && coverage.captured_valid_decisions > 0) {
+                    if (coverage.captured_valid_decisions > 0) {
                         --coverage.captured_valid_decisions;
                     }
-                    const json gap_preview = make_event(trace_id, capture, current, chunks.empty() ? unlocated_rows : 0,
-                        "moe-pending-18446744073709551615");
-                    if (!telemetry_moe_chunk_fits_limit(gap_preview)
-                            || !telemetry_moe_chunk_can_be_finalized(gap_preview)) {
-                        record.gap = false;
-                        ++capture.slot->telemetry_moe_chunk_unlocated_pending;
-                        ++capture.slot->telemetry_moe_chunk_unlocated_rows;
-                        current.clear();
-                    }
+                    one_record_upper_bound = telemetry_moe_chunk_finalized_size(make_event(
+                        trace_id, capture, one_record, std::numeric_limits<uint64_t>::max(),
+                        "moe-pending-18446744073709551615"));
                 }
+                GGML_ASSERT(one_record_upper_bound >= chunk_base_upper_bound);
+                size_t record_upper_bound = one_record_upper_bound - chunk_base_upper_bound;
+                if (record_upper_bound <= std::numeric_limits<size_t>::max() - completeness_reserve) {
+                    record_upper_bound += completeness_reserve;
+                }
+                if (chunk_base_upper_bound > telemetry_moe_chunk_limit_bytes()
+                        || record_upper_bound > telemetry_moe_chunk_limit_bytes() - chunk_base_upper_bound) {
+                    ++capture.slot->telemetry_moe_chunk_unlocated_pending;
+                    ++capture.slot->telemetry_moe_chunk_unlocated_rows;
+                    continue;
+                }
+                if (!current.empty() && record_upper_bound > telemetry_moe_chunk_limit_bytes() - current_upper_bound) {
+                    chunks.push_back(std::move(current));
+                    current.clear();
+                    current_upper_bound = chunk_base_upper_bound;
+                }
+                current.push_back(&record);
+                current_upper_bound += record_upper_bound;
             }
             if (!current.empty()) {
                 chunks.push_back(std::move(current));
             }
             if (chunks.empty()) {
-                capture.slot->telemetry_moe_chunk_unlocated_pending += unlocated_rows;
+                GGML_ASSERT(server_moe_routing_add_lost_population(
+                    unlocated_rows, capture.slot->telemetry_moe_chunk_unlocated_pending));
+                capture.slot->telemetry_moe_chunk_capture_started = true;
                 continue;
             }
 
-            capture.slot->telemetry_moe_chunk_unlocated_pending = 0;
-            for (size_t index = 0; index < chunks.size(); ++index) {
+            capture.slot->telemetry_moe_chunk_capture_started = true;
+        }
+
+        for (auto & trace_pair : captures_by_trace) {
+            const std::string & trace_id = trace_pair.first;
+            trace_capture & capture = trace_pair.second;
+            if (capture.slot == nullptr || capture.chunks.empty()) {
+                continue;
+            }
+
+            uint64_t unlocated_rows = capture.unlocated_rows;
+            GGML_ASSERT(server_moe_routing_add_lost_population(
+                capture.pending_unlocated_rows, unlocated_rows));
+            for (size_t index = 0; index < capture.chunks.size(); ++index) {
                 const std::string chunk_id = string_format("moe-%d-%" PRIu64,
                     capture.slot->id, ++capture.slot->telemetry_moe_chunk_sequence);
-                json event = make_event(trace_id, capture, chunks[index], index == 0 ? unlocated_rows : 0, chunk_id);
+                json event = make_event(trace_id, capture, capture.chunks[index], index == 0 ? unlocated_rows : 0, chunk_id);
                 GGML_ASSERT(telemetry_moe_chunk_fits_limit(event));
                 GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(event));
                 telemetry_queue_moe_routing_chunk(*capture.slot, std::move(event));
             }
-            capture.slot->telemetry_moe_chunk_capture_started = true;
         }
     }
 
