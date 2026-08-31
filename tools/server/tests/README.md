@@ -57,6 +57,31 @@ To run a single test:
 ./tests.sh unit/test_chat_completion.py::test_invalid_chat_completion_req
 ```
 
+### Focused LlamaScope telemetry checks
+
+The private-fork telemetry contract has a native MoE unit test and authenticated server scenarios. Build the server and native test targets first, then run the focused CTest selection:
+
+```shell
+cmake --build build --target llama-server test-moe-routing test-moe-routing-telemetry
+ctest --test-dir build --output-on-failure -R "^(test-moe-routing-telemetry|test-moe-routing-dense|test-moe-routing-dsv4)$"
+```
+
+Run the server scenarios from this directory. Set `LLAMA_SERVER_BIN_PATH` to the server from the same build tree when it is not the default path:
+
+```shell
+LLAMA_SERVER_BIN_PATH=../../../build/bin/llama-server \
+  ./tests.sh unit/test_telemetry_control.py unit/test_telemetry.py -v -x
+```
+
+On Windows PowerShell, the equivalent environment setup is:
+
+```powershell
+$env:LLAMA_SERVER_BIN_PATH = (Resolve-Path ..\..\..\build\bin\llama-server.exe)
+py -m pytest -q .\unit\test_telemetry_control.py .\unit\test_telemetry.py
+```
+
+These checks cover full-replacement `/props` control, authentication, environment/request non-activation, restart reset, dense-path behavior, and generic telemetry behavior. They do not replace the release-only focused gates for raw schema-v2 bytes consumed by the managed mapper, CUDA routing readback, MTP verification, exact transport overrun gaps, or forced unavailable and unlocated producer loss. A CPU pass is not evidence of CUDA capture; run that gate only with an explicitly CUDA-enabled build and model fixture, never by silently falling back to CPU.
+
 Hint: You can compile and run test in single command, useful for local development:
 
 ```shell

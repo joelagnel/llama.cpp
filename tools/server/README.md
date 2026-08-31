@@ -928,11 +928,24 @@ By default, it is read-only. To make POST request to change global properties, y
 
 ### POST `/props`: Change server global properties.
 
-To use this endpoint with POST method, you need to start server with `--props`
+To use this endpoint with POST method, you need to start server with `--props`.
+
+The private telemetry control contract is documented in [README-telemetry.md](README-telemetry.md#runtime-telemetry-control). It accepts only a `telemetry_control` object and is intentionally a full replacement: omitted controls become false and `{}` turns all optional telemetry producers off. It is not a general properties API.
+
+Telemetry control requires all of the following:
+
+- `--props`;
+- a non-empty API-key configuration, preferably `--api-key-file` so the secret is not a command-line value;
+- a loopback-bound listener; use literal `127.0.0.1` or `::1` for control; and
+- normal API-key authentication on the request.
+
+Use environment variables only for documented bounds and storage sizes. They cannot activate an optional telemetry producer, and request booleans can only opt out of a globally enabled producer. In router mode, include the target `model` in the JSON request body; the router applies the same control guard before forwarding it.
+
+At this source revision, the loopback guard checks configured listener text. The pending hardening correction verifies the actual numeric bind address; it is required before treating a control-capable release as loopback-only.
 
 *Options:*
 
-- None yet
+- `telemetry_control`: object containing only documented boolean controls; see [Telemetry control](README-telemetry.md#runtime-telemetry-control).
 
 ### POST `/embeddings`: non-OpenAI-compatible embeddings API
 
