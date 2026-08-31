@@ -116,6 +116,8 @@ struct server_context {
 json server_test_moe_dispatch_saturation_gap_json();
 json server_test_moe_dispatch_saturation_chunk_json();
 json server_test_moe_dispatch_loss_stream_finalization_json();
+json server_test_moe_dispatch_loss_timeline_json();
+json server_test_moe_dispatch_loss_small_cap_json();
 #endif
 
 
