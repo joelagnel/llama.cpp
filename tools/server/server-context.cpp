@@ -9460,6 +9460,13 @@ private:
             }
             previous_sequence = entry.sequence;
         }
+        if (next_cursor < latest &&
+                (telemetry_events.empty() || telemetry_events.back().sequence <= next_cursor)) {
+            gap_ranges.push_back({
+                {"first_sequence", next_cursor + 1},
+                {"last_sequence", latest},
+            });
+        }
         return telemetry_response_with_serialized_events({
             {"schema_version", 1},
             {"server_instance_id", telemetry_server_instance_id},

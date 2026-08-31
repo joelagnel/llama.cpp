@@ -322,9 +322,11 @@ def test_event_ring_reports_singleton_trailing_gap_for_dropped_completion():
     body = response.body
     final_sequence = body["next_sequence"] - 1
     assert limited_body["cursor"] < final_sequence
+    assert limited_body["cursor"] < body["events"][0]["sequence"]
     assert body["dropped_events"] == 1
     assert body["last_dropped_sequence"] == final_sequence
     assert body["events"][-1]["sequence"] == final_sequence - 1
+    assert body["cursor"] == final_sequence - 1
     assert body["gap"] is True
     assert body["gap_ranges"] == [{
         "first_sequence": final_sequence,
