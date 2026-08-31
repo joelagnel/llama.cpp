@@ -42,6 +42,22 @@ static bool decode_unequal_sequences(llama_context * ctx) {
     return ok;
 }
 
+static bool encode_one(llama_context * ctx, llama_token token, llama_pos pos) {
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    common_batch_add(batch, token, pos, { 0 }, true);
+    const bool ok = llama_encode(ctx, batch) == 0;
+    llama_batch_free(batch);
+    return ok;
+}
+
+struct abort_dispatch {
+    bool requested = false;
+
+    static bool callback(void * user_data) {
+        return static_cast<abort_dispatch *>(user_data)->requested;
+    }
+};
+
 struct dispatch_script {
     std::vector<llama_context_dispatch_decision> decisions;
     size_t next = 0;
@@ -453,6 +469,80 @@ static bool test_dispatch_observer(llama_model * model, const common_params & pa
             saturation.last_dispatch_monotonic_us < saturation.first_dispatch_monotonic_us) {
         fprintf(stderr, "%s: saturation interval was not exact\n", __func__);
         return false;
+    }
+
+    llama_context_ptr ctx_interleaved { llama_init_from_model(model, cparams) };
+    if (!ctx_interleaved) {
+        fprintf(stderr, "%s: failed to create interleaved saturation context\n", __func__);
+        return false;
+    }
+    dispatch_script interleaved;
+    for (uint64_t generation = 1; generation <= 272; ++generation) {
+        interleaved.decisions.push_back({ 1, generation, generation,
+            (uint8_t) (generation % 2 ? 1 : 33), true, true, true });
+    }
+    ctx_interleaved->set_dispatch_observer({ &interleaved, dispatch_script::pre });
+    if (!decode_many(ctx_interleaved.get(), 1, 0, 544)) {
+        fprintf(stderr, "%s: interleaved saturation decode failed\n", __func__);
+        return false;
+    }
+
+    abort_dispatch abort = { true };
+    llama_set_abort_callback(ctx_interleaved.get(), abort_dispatch::callback, &abort);
+    if (decode_one(ctx_interleaved.get(), 545, 544)) {
+        fprintf(stderr, "%s: requested graph failure unexpectedly succeeded\n", __func__);
+        return false;
+    }
+    abort.requested = false;
+    llama_set_abort_callback(ctx_interleaved.get(), nullptr, nullptr);
+
+    for (llama_token token = 1; token <= 8; ++token) {
+        if (!encode_one(ctx_interleaved.get(), token, 0) ||
+                !decode_one(ctx_interleaved.get(), 544 + token, 543 + token)) {
+            fprintf(stderr, "%s: alternating encode/decode saturation work failed\n", __func__);
+            return false;
+        }
+    }
+    drained = ctx_interleaved->dispatch_drain();
+    if (interleaved.next != 272 || drained.losses.size() != 256 ||
+            drained.moe_routing_spans.size() != 32 || drained.dropped_loss_descriptors != 0) {
+        fprintf(stderr, "%s: interleaved saturation drain did not preserve its detailed prefix\n", __func__);
+        return false;
+    }
+    const auto & interleaved_saturation = drained.losses.back();
+    if (!interleaved_saturation.saturation || !interleaved_saturation.moe_routing_span ||
+            interleaved_saturation.first_physical_step != 272 ||
+            interleaved_saturation.next_physical_step != 289 ||
+            interleaved_saturation.first_physical_microbatch != 271 ||
+            interleaved_saturation.last_physical_microbatch != 0 ||
+            interleaved_saturation.physical_dispatch_count != 17 ||
+            interleaved_saturation.operation != LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE ||
+            interleaved_saturation.last_operation != LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE ||
+            !interleaved_saturation.operation_mixed ||
+            interleaved_saturation.encode_physical_dispatch_count != 8 ||
+            interleaved_saturation.decode_physical_dispatch_count != 9 ||
+            interleaved_saturation.encode_physical_dispatch_count +
+                interleaved_saturation.decode_physical_dispatch_count !=
+                    interleaved_saturation.physical_dispatch_count ||
+            interleaved_saturation.last_dispatch_monotonic_us <
+                interleaved_saturation.first_dispatch_monotonic_us) {
+        fprintf(stderr, "%s: mixed-operation saturation was not exact after a failed graph\n", __func__);
+        return false;
+    }
+    for (const auto & loss : drained.losses) {
+        if (&loss != &interleaved_saturation &&
+                loss.next_physical_step > interleaved_saturation.first_physical_step) {
+            fprintf(stderr, "%s: detailed loss overlaps the terminal saturation interval\n", __func__);
+            return false;
+        }
+    }
+    for (size_t i = 0; i < drained.moe_routing_spans.size(); ++i) {
+        const auto & span = drained.moe_routing_spans[i];
+        if (span.first_physical_step != 240 + i || span.last_physical_step != 240 + i ||
+                span.last_physical_step >= interleaved_saturation.first_physical_step) {
+            fprintf(stderr, "%s: retained evidence overlaps the terminal saturation interval\n", __func__);
+            return false;
+        }
     }
 
     return true;

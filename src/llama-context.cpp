@@ -1232,10 +1232,8 @@ llama_context_dispatch_drain llama_context::dispatch_drain() {
     result.losses.assign(
         std::make_move_iterator(dispatch_losses.begin()),
         std::make_move_iterator(dispatch_losses.end()));
-    for (size_t index = 0; index < dispatch_loss_saturation.size(); ++index) {
-        if (dispatch_loss_saturation_active[index]) {
-            result.losses.push_back(std::move(dispatch_loss_saturation[index]));
-        }
+    if (dispatch_loss_saturation_active) {
+        result.losses.push_back(std::move(dispatch_loss_saturation));
     }
     result.dropped_notices = dispatch_dropped_notices;
     result.dropped_moe_routing_spans = dispatch_dropped_moe_routing_spans;
@@ -1244,7 +1242,7 @@ llama_context_dispatch_drain llama_context::dispatch_drain() {
     dispatch_moe_routing_spans.clear();
     dispatch_losses.clear();
     dispatch_loss_saturation = {};
-    dispatch_loss_saturation_active = {};
+    dispatch_loss_saturation_active = false;
     dispatch_dropped_notices = 0;
     dispatch_dropped_moe_routing_spans = 0;
     dispatch_dropped_loss_descriptors = 0;
@@ -1253,11 +1251,6 @@ llama_context_dispatch_drain llama_context::dispatch_drain() {
 
 static constexpr size_t llama_context_dispatch_loss_capacity = 256;
 static constexpr size_t llama_context_dispatch_loss_saturation_reserve = 1;
-
-static size_t llama_context_dispatch_loss_saturation_index(
-        llama_context_dispatch_operation operation) {
-    return operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? 0 : 1;
-}
 
 static llama_context_dispatch_loss llama_context_dispatch_make_loss(
         const llama_context_dispatch_decision & decision,
@@ -1287,6 +1280,12 @@ static llama_context_dispatch_loss llama_context_dispatch_make_loss(
     result.last_microbatch_generation = decision.microbatch_generation;
     result.last_application_epoch = decision.application_epoch;
     result.physical_dispatch_count = next_physical_step - first_physical_step;
+    result.last_operation = operation;
+    if (operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE) {
+        result.encode_physical_dispatch_count = result.physical_dispatch_count;
+    } else {
+        result.decode_physical_dispatch_count = result.physical_dispatch_count;
+    }
     return result;
 }
 
@@ -1297,24 +1296,22 @@ static bool llama_context_dispatch_loss_can_record_detail(
 }
 
 static bool llama_context_dispatch_loss_is_saturated(
-        const std::array<bool, 2> & saturation_active,
-        llama_context_dispatch_operation operation) {
-    return saturation_active[llama_context_dispatch_loss_saturation_index(operation)];
+        bool saturation_active) {
+    return saturation_active;
 }
 
 static void llama_context_dispatch_saturate_loss(
-        std::array<llama_context_dispatch_loss, 2> & saturation,
-        std::array<bool, 2> & saturation_active,
+        llama_context_dispatch_loss & saturation,
+        bool & saturation_active,
         llama_context_dispatch_loss loss) {
-    const size_t index = llama_context_dispatch_loss_saturation_index(loss.operation);
-    if (!saturation_active[index]) {
+    if (!saturation_active) {
         loss.saturation = true;
-        saturation[index] = std::move(loss);
-        saturation_active[index] = true;
+        saturation = std::move(loss);
+        saturation_active = true;
         return;
     }
 
-    llama_context_dispatch_loss & current = saturation[index];
+    llama_context_dispatch_loss & current = saturation;
     GGML_ASSERT(current.next_physical_step == loss.first_physical_step);
     current.next_physical_step = loss.next_physical_step;
     current.last_physical_microbatch = loss.last_physical_microbatch;
@@ -1332,6 +1329,10 @@ static void llama_context_dispatch_saturate_loss(
     current.last_microbatch_generation = loss.last_microbatch_generation;
     current.last_application_epoch = loss.last_application_epoch;
     current.physical_dispatch_count += loss.physical_dispatch_count;
+    current.operation_mixed |= current.operation != loss.operation || loss.operation_mixed;
+    current.last_operation = loss.last_operation;
+    current.encode_physical_dispatch_count += loss.encode_physical_dispatch_count;
+    current.decode_physical_dispatch_count += loss.decode_physical_dispatch_count;
     current.moe_routing_span |= loss.moe_routing_span;
 }
 
@@ -1368,7 +1369,7 @@ void llama_context::dispatch_pre_ubatch() {
         : llama_context_dispatch_decision {};
 
     const bool saturation_active = llama_context_dispatch_loss_is_saturated(
-        dispatch_loss_saturation_active, dispatch_operation);
+        dispatch_loss_saturation_active);
 
     const bool same_capture =
         moe_routing_capture_logical_call == dispatch_logical_call &&
@@ -1422,7 +1423,7 @@ void llama_context::dispatch_success(uint32_t physical_microbatch) {
 
     if (dispatch_decision.version == 0) {
         const bool saturation_active = llama_context_dispatch_loss_is_saturated(
-            dispatch_loss_saturation_active, dispatch_operation);
+            dispatch_loss_saturation_active);
         if (saturation_active) {
             llama_context_dispatch_saturate_loss(
                 dispatch_loss_saturation,
@@ -1478,8 +1479,7 @@ void llama_context::dispatch_success(uint32_t physical_microbatch) {
         moe_routing_capture_decision.application_epoch = dispatch_decision.application_epoch;
     }
 
-    if (llama_context_dispatch_loss_is_saturated(
-                dispatch_loss_saturation_active, dispatch_operation)) {
+    if (llama_context_dispatch_loss_is_saturated(dispatch_loss_saturation_active)) {
         llama_context_dispatch_saturate_loss(
             dispatch_loss_saturation,
             dispatch_loss_saturation_active,
@@ -1582,7 +1582,7 @@ void llama_context::dispatch_finish_moe_routing_span() {
 
     static constexpr size_t dispatch_moe_routing_span_capacity = 32;
     const bool saturation_active = llama_context_dispatch_loss_is_saturated(
-        dispatch_loss_saturation_active, moe_routing_capture_operation);
+        dispatch_loss_saturation_active);
     if (saturation_active || (dispatch_moe_routing_spans.size() == dispatch_moe_routing_span_capacity &&
             !llama_context_dispatch_loss_can_record_detail(dispatch_losses))) {
         llama_context_dispatch_saturate_loss(

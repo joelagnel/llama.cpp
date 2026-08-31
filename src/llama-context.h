@@ -136,6 +136,10 @@ struct llama_context_dispatch_loss {
     bool saturation = false;
     bool generation_mixed = false;
     bool native_moe_routing_mixed = false;
+    llama_context_dispatch_operation last_operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
+    uint64_t encode_physical_dispatch_count = 0;
+    uint64_t decode_physical_dispatch_count = 0;
+    bool operation_mixed = false;
 };
 
 struct llama_context_dispatch_drain {
@@ -521,8 +525,8 @@ private:
     std::deque<llama_context_dispatch_notice> dispatch_notices;
     std::deque<llama_context_moe_routing_span> dispatch_moe_routing_spans;
     std::deque<llama_context_dispatch_loss> dispatch_losses;
-    std::array<llama_context_dispatch_loss, 2> dispatch_loss_saturation;
-    std::array<bool, 2> dispatch_loss_saturation_active = {};
+    llama_context_dispatch_loss dispatch_loss_saturation;
+    bool dispatch_loss_saturation_active = false;
     uint64_t dispatch_dropped_notices = 0;
     uint64_t dispatch_dropped_moe_routing_spans = 0;
     uint64_t dispatch_dropped_loss_descriptors = 0;
