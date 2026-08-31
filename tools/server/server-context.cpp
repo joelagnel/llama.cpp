@@ -4603,13 +4603,14 @@ private:
         const int64_t decode_completed_us = ggml_time_us();
 
         if (ret == 0 && collect_moe_routing) {
+            const bool readback_has_rows = moe_routing_readback_copied && !moe_routing_readback.rows.empty();
             for (int i = off; i < off + batch_view.n_tokens; ++i) {
                 server_slot & slot = slots[batch.tokens[i].id_slot];
                 if (!telemetry_moe_request_enabled(slot)) {
                     continue;
                 }
                 slot.telemetry_moe_chunk_capture_started = true;
-                slot.telemetry_moe_chunk_source_unavailable |= !moe_routing_readback_copied;
+                slot.telemetry_moe_chunk_source_unavailable |= !readback_has_rows;
             }
             if (moe_routing_readback_copied) {
                 telemetry_record_moe_routing_chunks(
@@ -6065,6 +6066,7 @@ private:
             }
             if (row.row_identity_status != LLAMA_MOE_ROUTING_VALUE_STATUS_VALID) {
                 peers.complete = false;
+                slot.telemetry_moe_chunk_unlinked_rows++;
             }
             peers.trace_ids.insert(slot.task->trace_id);
             rows_by_trace[slot.task->trace_id].push_back(row_index);
@@ -6138,8 +6140,12 @@ private:
                     });
                 }
 
-                const bool trace_partial = unavailable_total > 0 || slot.telemetry_moe_chunk_capture_interrupted ||
-                    slot.telemetry_moe_chunk_source_unavailable;
+                const bool trace_partial = server_moe_routing_producer_coverage_is_partial(
+                    invalid_total,
+                    unavailable_total,
+                    slot.telemetry_moe_chunk_unlinked_rows,
+                    slot.telemetry_moe_chunk_capture_interrupted,
+                    slot.telemetry_moe_chunk_source_unavailable);
                 json event = {
                     {"event", "moe_routing_chunk"},
                     {"moe_routing_schema_version", 2},
@@ -6261,9 +6267,12 @@ private:
         if (!slot.task || !slot.telemetry_moe_chunk_capture_started) {
             return;
         }
-        const bool partial = slot.telemetry_moe_chunk_capture_interrupted ||
-            slot.telemetry_moe_chunk_source_unavailable ||
-            slot.telemetry_moe_chunk_unavailable_rows > 0;
+        const bool partial = server_moe_routing_producer_coverage_is_partial(
+            slot.telemetry_moe_chunk_invalid_rows,
+            slot.telemetry_moe_chunk_unavailable_rows,
+            slot.telemetry_moe_chunk_unlinked_rows,
+            slot.telemetry_moe_chunk_capture_interrupted,
+            slot.telemetry_moe_chunk_source_unavailable);
         json event = {
             {"event", "moe_routing_chunk"},
             {"moe_routing_schema_version", 2},

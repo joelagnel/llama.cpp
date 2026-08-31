@@ -52,6 +52,15 @@ inline bool server_moe_routing_was_truncated(const server_moe_routing_capture_co
     return counts.cap_dropped > 0;
 }
 
+inline bool server_moe_routing_producer_coverage_is_partial(
+        uint64_t invalid_rows,
+        uint64_t unavailable_rows,
+        uint64_t unlinked_rows,
+        bool interrupted,
+        bool source_unavailable) {
+    return invalid_rows > 0 || unavailable_rows > 0 || unlinked_rows > 0 || interrupted || source_unavailable;
+}
+
 inline const char * server_moe_routing_capture_state(
         const server_moe_routing_capture_counts & counts,
         bool has_data) {

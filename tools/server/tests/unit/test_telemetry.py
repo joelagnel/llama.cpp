@@ -1874,6 +1874,13 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         assert chunks[-1]["final"] is True
         assert chunks[-1]["decisions"] == []
         assert chunks[-1]["producer_coverage"]["state"] == "complete"
+        assert chunks[-1]["producer_coverage"]["trace_rows_total"] == sum(
+            chunk["producer_coverage"]["chunk_rows"]
+            for chunk in chunks if not chunk["final"]
+        )
+        assert chunks[-1]["producer_coverage"]["invalid_rows_total"] == 0
+        assert chunks[-1]["producer_coverage"]["unavailable_rows_total"] == 0
+        assert chunks[-1]["producer_coverage"]["unlinked_rows_total"] == 0
 
         decisions = [
             decision for chunk in chunks if not chunk["final"] for decision in chunk["decisions"]

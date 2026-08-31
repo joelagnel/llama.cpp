@@ -70,6 +70,15 @@ static void test_cap_and_invalid_records_remain_distinct(testing & t) {
     t.assert_true(std::strcmp("truncated", server_moe_routing_capture_state(counts, true)) == 0);
 }
 
+static void test_producer_coverage_requires_valid_linked_rows(testing & t) {
+    t.assert_true(!server_moe_routing_producer_coverage_is_partial(0, 0, 0, false, false));
+    t.assert_true( server_moe_routing_producer_coverage_is_partial(1, 0, 0, false, false));
+    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 1, 0, false, false));
+    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 1, false, false));
+    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 0, true,  false));
+    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 0, false, true));
+}
+
 int main() {
     testing t;
 
@@ -77,6 +86,7 @@ int main() {
     t.test("invalid records do not look capped", test_invalid_records_do_not_look_capped);
     t.test("cap truncation", test_cap_truncation);
     t.test("cap and invalid records remain distinct", test_cap_and_invalid_records_remain_distinct);
+    t.test("producer coverage requires valid linked rows", test_producer_coverage_requires_valid_linked_rows);
 
     return t.summary();
 }
