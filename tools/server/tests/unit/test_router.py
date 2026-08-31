@@ -374,7 +374,8 @@ def test_router_child_api_key_is_file_backed():
     assert 'child_env.push_back("LLAMA_API_KEY="' not in text
     assert 'child_args.push_back("--api-key-file")' in text
     assert 'is_env_var(entry, "LLAMA_API_KEY")' in text
-    assert "child_api_key_file_dacl_sddl" in text
+    assert "child_api_key_file_security_sddl" in text
+    assert 'return L"O:" + user_sid + L"D:P' in text
     assert 'D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;' in text
     assert "SECURITY_ATTRIBUTES attributes" in text
     assert "ConvertStringSecurityDescriptorToSecurityDescriptorW" in text

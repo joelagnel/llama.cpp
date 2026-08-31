@@ -1,6 +1,9 @@
 #include "testing.h"
 
 #include "../tools/server/server-moe-routing.h"
+#if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
+#include "../tools/server/server-models.h"
+#endif
 
 #include <cstring>
 #include <limits>
@@ -233,6 +236,20 @@ static void test_finalization_loss_combines_event_and_pending(testing & t) {
     t.assert_equal(18ULL, unlocated_rows);
 }
 
+#if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
+static void test_router_child_api_key_file_security(testing & t) {
+    const server_child_api_key_file_security_test_result result = server_test_child_api_key_file_security();
+    t.assert_true("protected DACL", result.protected_dacl);
+    t.assert_true("current-user owner", result.owner_is_current_user);
+    t.assert_true("current-user full control", result.current_user_full_control);
+    t.assert_true("SYSTEM full control", result.system_full_control);
+    t.assert_true("Administrators full control", result.administrators_full_control);
+    t.assert_true("only explicit current-user/SYSTEM/Administrators ACEs", result.only_expected_explicit_allow_aces);
+    t.assert_true("exclusive open rejects a shared peer", result.exclusive_open_rejects_shared_open);
+    t.assert_true("cleanup", result.cleanup_succeeded);
+}
+#endif
+
 int main() {
     testing t;
 
@@ -244,6 +261,9 @@ int main() {
     t.test("canonical event coverage serialization", test_canonical_event_coverage_serialization);
     t.test("serialization loss counts pending and incoming", test_serialization_loss_counts_pending_and_incoming);
     t.test("finalization loss combines event and pending", test_finalization_loss_combines_event_and_pending);
+#if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
+    t.test("router child API key file security", test_router_child_api_key_file_security);
+#endif
 
     return t.summary();
 }

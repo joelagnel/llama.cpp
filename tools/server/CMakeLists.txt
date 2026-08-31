@@ -54,6 +54,9 @@ target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMA
 if (WIN32)
     target_link_libraries(${TARGET} PRIVATE advapi32)
 endif()
+if (LLAMA_BUILD_TESTS)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_TEST_HOOKS)
+endif()
 
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)

@@ -32,6 +32,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <aclapi.h>
 #include <sddl.h>
 #endif
 
@@ -392,8 +393,35 @@ static std::vector<std::string> get_child_environment() {
 }
 
 #ifdef _WIN32
-static std::wstring child_api_key_file_dacl_sddl(const std::wstring & user_sid) {
-    return L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + user_sid + L")";
+static std::wstring child_api_key_file_security_sddl(const std::wstring & user_sid) {
+    return L"O:" + user_sid + L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + user_sid + L")";
+}
+
+static bool child_api_key_file_current_user_sid(std::wstring & user_sid) {
+    HANDLE token = INVALID_HANDLE_VALUE;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return false;
+    }
+
+    DWORD token_user_size = 0;
+    const bool sized = GetTokenInformation(token, TokenUser, nullptr, 0, &token_user_size) == 0
+        && GetLastError() == ERROR_INSUFFICIENT_BUFFER;
+    std::vector<BYTE> token_user(sized ? token_user_size : 0);
+    const bool read = sized && GetTokenInformation(token, TokenUser, token_user.data(), token_user_size, &token_user_size) != 0;
+    CloseHandle(token);
+    if (!read) {
+        return false;
+    }
+
+    LPWSTR user_sid_value = nullptr;
+    const bool converted = ConvertSidToStringSidW(
+        reinterpret_cast<TOKEN_USER *>(token_user.data())->User.Sid, &user_sid_value) != 0;
+    if (!converted) {
+        return false;
+    }
+    user_sid = user_sid_value;
+    LocalFree(user_sid_value);
+    return true;
 }
 
 struct child_api_key_file_security_attributes {
@@ -407,30 +435,12 @@ struct child_api_key_file_security_attributes {
     }
 
     bool initialize() {
-        HANDLE token = INVALID_HANDLE_VALUE;
-        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        std::wstring user_sid;
+        if (!child_api_key_file_current_user_sid(user_sid)) {
             return false;
         }
 
-        DWORD token_user_size = 0;
-        const bool sized = GetTokenInformation(token, TokenUser, nullptr, 0, &token_user_size) == 0
-            && GetLastError() == ERROR_INSUFFICIENT_BUFFER;
-        std::vector<BYTE> token_user(sized ? token_user_size : 0);
-        const bool read = sized && GetTokenInformation(token, TokenUser, token_user.data(), token_user_size, &token_user_size) != 0;
-        CloseHandle(token);
-        if (!read) {
-            return false;
-        }
-
-        LPWSTR user_sid_value = nullptr;
-        const bool converted = ConvertSidToStringSidW(
-            reinterpret_cast<TOKEN_USER *>(token_user.data())->User.Sid, &user_sid_value) != 0;
-        if (!converted) {
-            return false;
-        }
-
-        const std::wstring sddl = child_api_key_file_dacl_sddl(user_sid_value);
-        LocalFree(user_sid_value);
+        const std::wstring sddl = child_api_key_file_security_sddl(user_sid);
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) {
             return false;
@@ -529,6 +539,111 @@ static std::string create_child_api_key_file(const std::vector<std::string> & ap
     return path.data();
 #endif
 }
+
+#if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
+static void inspect_child_api_key_file_security(
+        const std::filesystem::path & path,
+        server_child_api_key_file_security_test_result & result) {
+    std::wstring user_sid_value;
+    if (!child_api_key_file_current_user_sid(user_sid_value)) {
+        return;
+    }
+
+    PSID user_sid = nullptr;
+    if (!ConvertStringSidToSidW(user_sid_value.c_str(), &user_sid)) {
+        return;
+    }
+
+    PSID owner_sid = nullptr;
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD security_status = GetNamedSecurityInfoW(
+        path.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &owner_sid, nullptr, &dacl, nullptr, &descriptor);
+    if (security_status != ERROR_SUCCESS) {
+        LocalFree(user_sid);
+        return;
+    }
+
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    result.protected_dacl = GetSecurityDescriptorControl(descriptor, &control, &revision) != 0
+        && (control & SE_DACL_PROTECTED) != 0;
+    result.owner_is_current_user = owner_sid != nullptr && EqualSid(owner_sid, user_sid) != 0;
+
+    ACL_SIZE_INFORMATION acl_size = {};
+    bool only_expected = dacl != nullptr
+        && GetAclInformation(dacl, &acl_size, sizeof(acl_size), AclSizeInformation) != 0
+        && acl_size.AceCount == 3;
+    for (DWORD index = 0; only_expected && index < acl_size.AceCount; ++index) {
+        void * ace_value = nullptr;
+        if (!GetAce(dacl, index, &ace_value)) {
+            only_expected = false;
+            break;
+        }
+        const ACE_HEADER * header = static_cast<const ACE_HEADER *>(ace_value);
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE || (header->AceFlags & INHERITED_ACE) != 0) {
+            only_expected = false;
+            break;
+        }
+        const ACCESS_ALLOWED_ACE * ace = static_cast<const ACCESS_ALLOWED_ACE *>(ace_value);
+        const bool full_control = (ace->Mask & FILE_ALL_ACCESS) == FILE_ALL_ACCESS
+            || (ace->Mask & GENERIC_ALL) == GENERIC_ALL;
+        PSID ace_sid = const_cast<DWORD *>(&ace->SidStart);
+        if (EqualSid(ace_sid, user_sid) != 0) {
+            result.current_user_full_control = full_control;
+        } else if (IsWellKnownSid(ace_sid, WinLocalSystemSid)) {
+            result.system_full_control = full_control;
+        } else if (IsWellKnownSid(ace_sid, WinBuiltinAdministratorsSid)) {
+            result.administrators_full_control = full_control;
+        } else {
+            only_expected = false;
+        }
+        if (!full_control) {
+            only_expected = false;
+        }
+    }
+    result.only_expected_explicit_allow_aces = only_expected
+        && result.current_user_full_control
+        && result.system_full_control
+        && result.administrators_full_control;
+
+    LocalFree(descriptor);
+    LocalFree(user_sid);
+
+    HANDLE exclusive = CreateFileW(
+        path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (exclusive == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    SetLastError(ERROR_SUCCESS);
+    HANDLE shared = CreateFileW(
+        path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    result.exclusive_open_rejects_shared_open = shared == INVALID_HANDLE_VALUE
+        && GetLastError() == ERROR_SHARING_VIOLATION;
+    if (shared != INVALID_HANDLE_VALUE) {
+        CloseHandle(shared);
+    }
+    CloseHandle(exclusive);
+}
+
+server_child_api_key_file_security_test_result server_test_child_api_key_file_security() {
+    const std::string path = create_child_api_key_file({ "server-child-api-key-test" });
+    server_child_api_key_file_security_test_result result;
+    try {
+        inspect_child_api_key_file_security(path, result);
+    } catch (...) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        throw;
+    }
+
+    std::error_code ec;
+    const bool removed = std::filesystem::remove(path, ec);
+    result.cleanup_succeeded = removed && !ec && !std::filesystem::exists(path, ec) && !ec;
+    return result;
+}
+#endif
 
 void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
     // update params

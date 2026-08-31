@@ -321,6 +321,21 @@ struct server_child {
     void notify_to_router(const std::string & state_name, const json & payload);
 };
 
+#if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
+struct server_child_api_key_file_security_test_result {
+    bool protected_dacl = false;
+    bool owner_is_current_user = false;
+    bool current_user_full_control = false;
+    bool system_full_control = false;
+    bool administrators_full_control = false;
+    bool only_expected_explicit_allow_aces = false;
+    bool exclusive_open_rejects_shared_open = false;
+    bool cleanup_succeeded = false;
+};
+
+server_child_api_key_file_security_test_result server_test_child_api_key_file_security();
+#endif
+
 struct server_models_routes {
     common_params params;
     json ui_settings = json::object();     // Primary: new name
