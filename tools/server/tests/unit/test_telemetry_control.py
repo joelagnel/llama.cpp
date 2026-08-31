@@ -66,6 +66,22 @@ def _control_boundaries(server):
     ]
 
 
+def _wait_for_control_boundary(server, props_generation, completion):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not completion.done():
+        boundaries = _control_boundaries(server)
+        matched = [
+            boundary
+            for boundary in boundaries
+            if boundary["props_generation"] == props_generation
+            and boundary["physical_context"] == "target"
+        ]
+        if matched:
+            return matched[-1]
+        time.sleep(0.01)
+    return None
+
+
 def test_props_telemetry_control_replaces_state_and_resets_on_restart():
     server = _controlled_server()
     server.start()
@@ -185,6 +201,8 @@ def test_rejected_props_writes_leave_the_control_snapshot_unchanged():
     assert boundary["props_generation"] == 2
     assert boundary["microbatch_generation"] == 1
     assert boundary["timestamp_unix_ms"] >= 0
+    assert boundary["physical_context"] == "target"
+    assert boundary["operation"] == "decode"
     assert boundary["physical_step"] >= 1
     assert boundary["physical_microbatch"] == 0
     assert boundary["effective"] == expected["effective"]
@@ -226,6 +244,98 @@ def test_overwritten_microbatch_controls_do_not_emit_a_fake_boundary():
         )
         assert completion.status_code == 200
         assert _control_boundaries(server) == []
+    finally:
+        server.stop()
+
+
+def test_encoder_dispatch_emits_an_exact_control_boundary():
+    server = ServerPreset.bert_bge_small()
+    server.server_props = True
+    server.api_key = API_KEY
+    server.start()
+    try:
+        enabled = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"kv_pressure_detail": True}},
+            headers=AUTH,
+        )
+        assert enabled.status_code == 200
+
+        response = server.make_request(
+            "POST",
+            "/v1/embeddings",
+            data={"input": ["encoder control boundary"]},
+            headers=AUTH,
+        )
+        assert response.status_code == 200
+
+        boundaries = _control_boundaries(server)
+        assert len(boundaries) == 1
+        boundary = boundaries[0]
+        assert boundary["props_generation"] == 1
+        assert boundary["microbatch_generation"] == 1
+        assert boundary["physical_context"] == "target"
+        assert boundary["operation"] == "encode"
+        assert boundary["physical_step"] > 0
+        assert boundary["physical_microbatch"] == 0
+        assert boundary["effective"]["kv_pressure_detail"] is True
+        assert boundary["native_moe_routing_enabled"] is False
+        assert boundary["moe_routing_applicable"] is False
+
+        kv_events = _kv_pressure(server)["events"]
+        assert kv_events
+        assert all(event["props_generation"] == 1 for event in kv_events)
+        assert all(event["microbatch_generation"] == 1 for event in kv_events)
+    finally:
+        server.stop()
+
+
+def test_mtmd_image_prefill_emits_a_target_decode_boundary():
+    server = ServerPreset.tinygemma3()
+    server.server_props = True
+    server.api_key = API_KEY
+    server.start()
+    try:
+        enabled = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"kv_pressure_detail": True}},
+            headers=AUTH,
+        )
+        assert enabled.status_code == 200
+
+        response = server.make_request(
+            "POST",
+            "/chat/completions",
+            data={
+                "n_predict": 1,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this image?"},
+                        {"type": "image_url", "image_url": {
+                            "url": "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/11_truck.png",
+                        }},
+                    ],
+                }],
+            },
+            headers=AUTH,
+        )
+        assert response.status_code == 200
+
+        boundaries = [
+            boundary for boundary in _control_boundaries(server)
+            if boundary["props_generation"] == 1
+        ]
+        assert len(boundaries) == 1
+        boundary = boundaries[0]
+        assert boundary["physical_context"] == "target"
+        assert boundary["operation"] == "decode"
+        assert boundary["physical_step"] > 0
+        assert boundary["effective"]["kv_pressure_detail"] is True
+        assert boundary["native_moe_routing_enabled"] is False
+        assert boundary["moe_routing_applicable"] is False
     finally:
         server.stop()
 
@@ -838,22 +948,13 @@ def test_inflight_off_on_off_uses_recorded_microbatch_generation_and_request_sna
             assert enabled.body["telemetry_control"]["effective"]["output_token_detail"] is True
             assert enabled.body["telemetry_control"]["effective_from"] == "next_microbatch"
 
-            deadline = time.monotonic() + 30
-            generation_one_recorded = False
-            while time.monotonic() < deadline and not completion.done():
-                generation_one_recorded = any(
-                    decision["event_key"]["control_generation"] == 1
-                    for event in _telemetry_events(server)
-                    if event["event"] == "moe_routing_chunk"
-                    for decision in event["decisions"]
-                )
-                if generation_one_recorded:
-                    break
-                time.sleep(0.01)
-            if not generation_one_recorded:
+            enabled_boundary = _wait_for_control_boundary(server, 1, completion)
+            if enabled_boundary is None:
                 response = completion.result(timeout=60)
                 assert response.status_code == 200
-                pytest.skip("MoE fixture completed before control generation 1 was recorded")
+                pytest.skip("MoE fixture completed before the enabled control boundary was observed")
+            assert enabled_boundary["microbatch_generation"] == 1
+            assert enabled_boundary["native_moe_routing_enabled"] is True
             if completion.done():
                 response = completion.result(timeout=60)
                 assert response.status_code == 200
@@ -866,6 +967,18 @@ def test_inflight_off_on_off_uses_recorded_microbatch_generation_and_request_sna
             assert disabled.body["telemetry_control"]["generation"] == 2
             assert disabled.body["telemetry_control"]["effective_from"] == "next_microbatch"
             assert all(value is False for value in disabled.body["telemetry_control"]["effective"].values())
+
+            disabled_boundary = _wait_for_control_boundary(server, 2, completion)
+            if disabled_boundary is None:
+                response = completion.result(timeout=60)
+                assert response.status_code == 200
+                pytest.skip("MoE fixture completed before the disabled control boundary was observed")
+            assert disabled_boundary["microbatch_generation"] == 2
+            assert disabled_boundary["operation"] == "decode"
+            assert disabled_boundary["physical_step"] > enabled_boundary["physical_step"]
+            assert all(value is False for value in disabled_boundary["effective"].values())
+            assert disabled_boundary["native_moe_routing_enabled"] is False
+            assert "trace_id" not in disabled_boundary
 
             response = completion.result(timeout=90)
             assert response.status_code == 200
@@ -880,7 +993,7 @@ def test_inflight_off_on_off_uses_recorded_microbatch_generation_and_request_sna
         assert partial_chunks
         assert any(chunk["unlocated_coverage_loss"]["count"] > 0 for chunk in partial_chunks)
         decisions = [
-            decision for chunk in chunks for decision in chunk["decisions"]
+            decision for chunk in chunks for decision in chunk.get("decisions", [])
         ]
         assert decisions
         assert {decision["event_key"]["control_generation"] for decision in decisions} == {1}

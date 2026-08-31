@@ -1951,13 +1951,23 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         assert chunks
         assert raw_chunks
         assert [json.loads(raw)["sequence"] for raw in raw_chunks] == [chunk["sequence"] for chunk in chunks]
-        assert all(chunk["schema_version"] == 2 for chunk in chunks)
+        assert all(chunk["schema_version"] == 3 for chunk in chunks)
         assert chunks[-1]["is_final_for_trace"] is True
-        assert chunks[-1]["decisions"]
+        assert chunks[-1]["decisions"], [(chunk["serialized_bytes"], len(chunk["decisions"]), len(chunk["gaps"])) for chunk in chunks]
         assert all(chunk["availability"] == 0 for chunk in chunks)
         assert all("reason" not in chunk and "unlocated_coverage_loss" not in chunk for chunk in chunks)
-        assert all(chunk["descriptor"]["schema_version"] == 2 for chunk in chunks)
-        assert all(chunk["descriptor"]["clock_domain"] == "utc_wall_clock" for chunk in chunks)
+        assert all(chunk["descriptor"]["schema_version"] == 3 for chunk in chunks)
+        assert all(chunk["descriptor"]["clock_domain"] == "server_process_monotonic_microseconds" for chunk in chunks)
+        clocks = [chunk["clock"] for chunk in chunks]
+        assert all(clock["schema_version"] == 1 for clock in clocks)
+        assert all(clock["clock_domain"] == "server_process_monotonic_microseconds" for clock in clocks)
+        assert all(clock["anchor_monotonic_us"] > 0 for clock in clocks)
+        assert all(clock["anchor_timestamp_unix_ms"] > 0 for clock in clocks)
+        assert all(clock["anchor_precision_us"] >= 0 for clock in clocks)
+        assert len({
+            (clock["anchor_monotonic_us"], clock["anchor_timestamp_unix_ms"], clock["anchor_precision_us"])
+            for clock in clocks
+        }) == 1
         assert all(
             chunk["descriptor"]["moe_layer_count"] == len(chunk["descriptor"]["moe_layer_indices"])
             and chunk["descriptor"]["moe_layer_indices"] == sorted(set(chunk["descriptor"]["moe_layer_indices"]))
@@ -2005,7 +2015,7 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         for raw, chunk in zip(raw_chunks, chunks):
             assert raw == json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             assert chunk["serialized_bytes"] == len(raw)
-            assert chunk["schema_version"] == 2
+            assert chunk["schema_version"] == 3
             assert chunk["event"] == "moe_routing_chunk"
             assert legacy_envelope_fields.isdisjoint(chunk)
             assert isinstance(chunk["availability"], int) and not isinstance(chunk["availability"], bool)
@@ -2019,8 +2029,10 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
                 assert decision["speculative_pass"] is None
                 assert all(
                     isinstance(decision["event_key"][field], int)
-                    for field in ("physical_microbatch", "physical_step", "phase", "layer_index", "control_generation")
+                    for field in ("physical_microbatch", "physical_step", "phase", "layer_index", "control_generation", "dispatch_monotonic_us")
                 )
+                assert decision["event_key"]["physical_context"] == "target"
+                assert decision["event_key"]["operation"] == "decode"
                 assert isinstance(decision["native_row"]["row_identity_status"], int)
                 for selected in decision["selected_experts"]:
                     assert isinstance(selected["expert_id_status"], int)
@@ -2068,6 +2080,22 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
                 assert selected["effective_weight_status"] in [0, 1, 2, 3]
                 if selected["effective_weight_status"] == 0:
                     assert selected["effective_weight"] is not None
+
+        timestamps_by_step = {}
+        for chunk in chunks:
+            for physical in chunk["physical_events"]:
+                key = physical["event_key"]
+                assert key["physical_context"] == "target"
+                assert key["operation"] == "decode"
+                assert key["dispatch_monotonic_us"] > 0
+                assert "timestamp_state" not in physical
+                previous = timestamps_by_step.setdefault(
+                    key["physical_step"], key["dispatch_monotonic_us"]
+                )
+                assert previous == key["dispatch_monotonic_us"]
+        assert timestamps_by_step
+        ordered_timestamps = [timestamps_by_step[step] for step in sorted(timestamps_by_step)]
+        assert ordered_timestamps == sorted(ordered_timestamps)
 
         opted_out = server.make_request(
             "POST",
@@ -2142,19 +2170,10 @@ def test_moe_routing_chunk_byte_cap_splits_canonical_envelopes(monkeypatch):
             for chunk in chunks
         )
         assert chunks[-1]["is_final_for_trace"] is True
+        assert len(chunks) > 1
         assert chunks[-1]["decisions"]
-        assert all(chunk["schema_version"] == 2 for chunk in chunks)
-        assert all(chunk["availability"] in [0, 1] for chunk in chunks)
-        assert any(chunk["availability"] == 1 for chunk in chunks)
-        assert any(chunk["gaps"] for chunk in chunks)
-        assert all(
-            chunk["availability"] != 1 or chunk["gaps"] or chunk.get("unlocated_coverage_loss")
-            for chunk in chunks
-        )
-        assert all(
-            gap["cause"] == 8
-            for chunk in chunks for gap in chunk["gaps"]
-        )
+        assert all(chunk["schema_version"] == 3 for chunk in chunks)
+        assert all(chunk["availability"] == 0 and not chunk["gaps"] for chunk in chunks)
         for chunk in chunks:
             represented = sorted(
                 [decision["sequence"] for decision in chunk["decisions"]]
@@ -2162,6 +2181,74 @@ def test_moe_routing_chunk_byte_cap_splits_canonical_envelopes(monkeypatch):
                 + [sequence for gap in chunk["gaps"] for sequence in range(gap["first_sequence"], gap["next_sequence"])]
             )
             assert represented == list(range(chunk["first_sequence"], chunk["next_sequence"]))
+    finally:
+        server.stop()
+
+
+def test_moe_routing_chunk_subrecord_capacity_fails_closed(monkeypatch):
+    global server
+
+    api_key = "moe-routing-subrecord-cap-test-key"
+    auth = {"Authorization": f"Bearer {api_key}"}
+    monkeypatch.setenv("LLAMA_TELEMETRY_MOE_CHUNK_MAX_BYTES", "3700")
+    server = ServerPreset.stories15m_moe()
+    server.server_props = True
+    server.api_key = api_key
+    server.n_batch = 4
+    server.n_ubatch = 2
+    server.start()
+
+    try:
+        control = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"moe_routing": True}},
+            headers=auth,
+        )
+        assert control.status_code == 200
+
+        response = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": "A capacity-reserved routing envelope.",
+                "n_predict": 1,
+                "ignore_eos": True,
+                "temperature": 0,
+            },
+            headers=auth,
+        )
+        assert response.status_code == 200
+
+        events = server.make_request(
+            "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
+        )
+        chunks = [
+            event for event in events.body["events"]
+            if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
+        ]
+        assert len(chunks) == 1
+        chunk = chunks[0]
+        assert chunk["schema_version"] == 3
+        assert chunk["is_final_for_trace"] is True
+        assert chunk["availability"] == 1
+        assert not chunk.get("decisions", [])
+        assert not chunk.get("invalid_records", [])
+        assert not chunk.get("gaps", [])
+        loss = chunk["unlocated_coverage_loss"]
+        assert loss["count"] > 0
+        assert loss["state"] == "loss"
+        assert loss["classification"] == "serialized_capacity_reservation"
+        assert loss["coordinate_state"] == "unavailable"
+        assert loss["physical_context"] == "target"
+        assert loss["operation"] == "decode"
+        assert loss["props_generation"] == 1
+        assert loss["microbatch_generation"] == 1
+        assert loss["application_epoch"] > 0
+        assert "first_physical_step" not in loss
+        assert "next_physical_step" not in loss
+        assert "first_dispatch_monotonic_us" not in loss
+        assert "last_dispatch_monotonic_us" not in loss
     finally:
         server.stop()
 
@@ -2216,6 +2303,7 @@ def test_moe_routing_chunks_pack_large_prefill_near_byte_cap():
         boundary = boundaries[0]
         assert boundary["props_generation"] == 1
         assert boundary["microbatch_generation"] == 1
+        assert boundary["operation"] == "decode"
         assert boundary["native_moe_routing_enabled"] is True
         assert boundary["sequence"] < min(chunk["sequence"] for chunk in chunks)
         assert len(chunks) > 1
@@ -2227,7 +2315,7 @@ def test_moe_routing_chunks_pack_large_prefill_near_byte_cap():
 
         decisions = [decision for chunk in chunks for decision in chunk["decisions"]]
         assert [decision["sequence"] for decision in decisions] == list(range(len(decisions)))
-        assert all(decision["native_row"]["physical_ubatch_index"] == 0 for decision in decisions)
+        assert len({decision["native_row"]["physical_ubatch_index"] for decision in decisions}) >= 2
         assert len({decision["event_key"]["physical_step"] for decision in decisions}) > 1
         assert all(
             chunk["first_sequence"] < chunk["next_sequence"]
@@ -2280,11 +2368,28 @@ def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
             event for event in events.body["events"]
             if event["event"] == "telemetry_control_boundary"
         ]
-        assert len(boundaries) == 1
-        boundary = boundaries[0]
+        target_boundaries = [boundary for boundary in boundaries if boundary["physical_context"] == "target"]
+        draft_boundaries = [boundary for boundary in boundaries if boundary["physical_context"] == "draft"]
+        assert len(target_boundaries) == 1
+        assert draft_boundaries
+        boundary = target_boundaries[0]
         assert boundary["props_generation"] == 1
         assert boundary["microbatch_generation"] == 1
+        assert boundary["operation"] == "decode"
         assert boundary["native_moe_routing_enabled"] is True
+        assert boundary["moe_routing_applicable"] is True
+        assert boundary["schema_version"] == 1
+        assert boundary["clock"]["clock_domain"] == "server_process_monotonic_microseconds"
+        assert boundary["dispatch_monotonic_us"] > 0
+        assert all(
+            draft_boundary["native_moe_routing_enabled"] is False
+            and draft_boundary["moe_routing_applicable"] is False
+            and draft_boundary["operation"] == "decode"
+            and draft_boundary["schema_version"] == 1
+            and draft_boundary["clock"] == boundary["clock"]
+            and draft_boundary["dispatch_monotonic_us"] > 0
+            for draft_boundary in draft_boundaries
+        )
         decisions = [
             decision
             for event in events.body["events"]
@@ -2345,6 +2450,8 @@ def test_moe_routing_chunks_mark_on_off_on_intervals_partial():
             enabled_boundary = wait_for_control_boundary(server, auth, 1, completion)
             assert enabled_boundary is not None
             assert enabled_boundary["microbatch_generation"] == 1
+            assert enabled_boundary["physical_context"] == "target"
+            assert enabled_boundary["operation"] == "decode"
             assert enabled_boundary["effective"]["moe_routing"] is True
             assert enabled_boundary["native_moe_routing_enabled"] is True
 
@@ -2356,6 +2463,9 @@ def test_moe_routing_chunks_mark_on_off_on_intervals_partial():
             disabled_boundary = wait_for_control_boundary(server, auth, 2, completion)
             assert disabled_boundary is not None
             assert disabled_boundary["microbatch_generation"] == 2
+            assert disabled_boundary["physical_context"] == "target"
+            assert disabled_boundary["operation"] == "decode"
+            assert disabled_boundary["physical_step"] > enabled_boundary["physical_step"]
             assert all(value is False for value in disabled_boundary["effective"].values())
             assert disabled_boundary["native_moe_routing_enabled"] is False
             assert "trace_id" not in disabled_boundary
@@ -2368,8 +2478,26 @@ def test_moe_routing_chunks_mark_on_off_on_intervals_partial():
             reenabled_boundary = wait_for_control_boundary(server, auth, 3, completion)
             assert reenabled_boundary is not None
             assert reenabled_boundary["microbatch_generation"] == 3
+            assert reenabled_boundary["physical_context"] == "target"
+            assert reenabled_boundary["operation"] == "decode"
+            assert reenabled_boundary["physical_step"] > disabled_boundary["physical_step"]
             assert reenabled_boundary["effective"]["moe_routing"] is True
             assert reenabled_boundary["native_moe_routing_enabled"] is True
+            boundary_clock = enabled_boundary["clock"]
+            assert all(boundary["schema_version"] == 1 for boundary in (
+                enabled_boundary, disabled_boundary, reenabled_boundary
+            ))
+            assert boundary_clock["schema_version"] == 1
+            assert boundary_clock["clock_domain"] == "server_process_monotonic_microseconds"
+            assert boundary_clock["anchor_monotonic_us"] > 0
+            assert boundary_clock["anchor_timestamp_unix_ms"] > 0
+            assert boundary_clock["anchor_precision_us"] >= 0
+            assert all(boundary["clock"] == boundary_clock for boundary in (
+                enabled_boundary, disabled_boundary, reenabled_boundary
+            ))
+            assert enabled_boundary["dispatch_monotonic_us"] > 0
+            assert disabled_boundary["dispatch_monotonic_us"] >= enabled_boundary["dispatch_monotonic_us"]
+            assert reenabled_boundary["dispatch_monotonic_us"] >= disabled_boundary["dispatch_monotonic_us"]
             response = completion.result(timeout=60)
             assert response.status_code == 200
 
@@ -2397,6 +2525,16 @@ def test_moe_routing_chunks_mark_on_off_on_intervals_partial():
             decision["event_key"]["control_generation"] == 2
             for chunk in chunks for decision in chunk["decisions"]
         )
+        first_generation_chunks = [
+            chunk for chunk in chunks
+            if any(decision["event_key"]["control_generation"] == 1 for decision in chunk["decisions"])
+        ]
+        third_generation_chunks = [
+            chunk for chunk in chunks
+            if any(decision["event_key"]["control_generation"] == 3 for decision in chunk["decisions"])
+        ]
+        assert max(chunk["sequence"] for chunk in first_generation_chunks) < disabled_boundary["sequence"]
+        assert min(chunk["sequence"] for chunk in third_generation_chunks) > reenabled_boundary["sequence"]
     finally:
         server.stop()
 
