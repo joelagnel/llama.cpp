@@ -1,4 +1,5 @@
 #include "../src/llama-ext.h"
+#include "../src/llama-context.h"
 
 #include "arg.h"
 #include "common.h"
@@ -9,6 +10,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <vector>
 
 static bool decode_one(llama_context * ctx, llama_token token, llama_pos pos) {
     llama_batch batch = llama_batch_init(1, 0, 1);
@@ -27,6 +29,33 @@ static bool decode_many(llama_context * ctx, llama_token token, llama_pos pos, i
     llama_batch_free(batch);
     return ok;
 }
+
+static bool decode_unequal_sequences(llama_context * ctx) {
+    llama_batch batch = llama_batch_init(5, 0, 1);
+    common_batch_add(batch, 1, 0, { 0 }, true);
+    common_batch_add(batch, 2, 0, { 1 }, true);
+    common_batch_add(batch, 3, 1, { 0 }, true);
+    common_batch_add(batch, 4, 2, { 0 }, true);
+    common_batch_add(batch, 5, 1, { 1 }, true);
+    const bool ok = llama_decode(ctx, batch) == 0;
+    llama_batch_free(batch);
+    return ok;
+}
+
+struct dispatch_script {
+    std::vector<llama_context_dispatch_decision> decisions;
+    size_t next = 0;
+
+    static llama_context_dispatch_decision pre(
+            void * user_data,
+            llama_context_dispatch_operation operation) {
+        dispatch_script * script = static_cast<dispatch_script *>(user_data);
+        if (operation != LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE || script->next >= script->decisions.size()) {
+            return {};
+        }
+        return script->decisions[script->next++];
+    }
+};
 
 static bool has_explicit_gpu_layers(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
@@ -223,6 +252,134 @@ static llama_context_ptr make_context(llama_model * model, const common_params &
     return llama_context_ptr { llama_init_from_model(model, cparams) };
 }
 
+static bool test_dispatch_observer(llama_model * model, const common_params & params) {
+    if (llama_model_n_expert(model) == 0) {
+        return true;
+    }
+
+    auto ctx = make_context(model, params);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to create context\n", __func__);
+        return false;
+    }
+
+    dispatch_script script = {{
+        { 1, 1, 1, 1, true,  true,  true },
+        { 1, 2, 2, 0, false, true,  true },
+        { 1, 3, 3, 1, true,  true,  true },
+    }};
+    ctx->set_dispatch_observer({ &script, dispatch_script::pre });
+    llama_moe_routing_test_observer_reset(ctx.get());
+    if (!decode_many(ctx.get(), 1, 0, 6)) {
+        fprintf(stderr, "%s: scripted multi-ubatch decode failed\n", __func__);
+        return false;
+    }
+
+    llama_context_dispatch_drain drained = ctx->dispatch_drain();
+    if (script.next != 3 || drained.notices.size() != 3 || drained.moe_routing_spans.size() != 2 ||
+            !drained.losses.empty() || drained.dropped_notices != 0 || drained.dropped_moe_routing_spans != 0) {
+        fprintf(stderr, "%s: missing scripted dispatch records\n", __func__);
+        return false;
+    }
+    for (size_t i = 0; i < drained.notices.size(); ++i) {
+        const auto & notice = drained.notices[i];
+        if (notice.operation != LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE ||
+                notice.physical_step != i + 1 || notice.physical_microbatch != i ||
+                notice.decision.microbatch_generation != i + 1 || notice.dispatch_monotonic_us <= 0) {
+            fprintf(stderr, "%s: invalid physical boundary coordinate\n", __func__);
+            return false;
+        }
+    }
+    if (drained.moe_routing_spans[0].decision.microbatch_generation != 1 ||
+            drained.moe_routing_spans[0].first_physical_step != 1 ||
+            drained.moe_routing_spans[0].last_physical_step != 1 ||
+            drained.moe_routing_spans[1].decision.microbatch_generation != 3 ||
+            drained.moe_routing_spans[1].first_physical_step != 3 ||
+            drained.moe_routing_spans[1].last_physical_step != 3 ||
+            drained.moe_routing_spans[0].physical_dispatches.size() != 1 ||
+            drained.moe_routing_spans[1].physical_dispatches.size() != 1 ||
+            drained.moe_routing_spans[0].physical_dispatches.front().dispatch_monotonic_us <= 0 ||
+            drained.moe_routing_spans[1].physical_dispatches.front().dispatch_monotonic_us <= 0) {
+        fprintf(stderr, "%s: transition did not preserve exact routing spans\n", __func__);
+        return false;
+    }
+    if (drained.moe_routing_spans[0].rows.empty() || drained.moe_routing_spans[1].rows.empty()) {
+        fprintf(stderr, "%s: enabled spans did not retain routing rows\n", __func__);
+        return false;
+    }
+
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_ctx = 64;
+    cparams.n_batch = 8;
+    cparams.n_ubatch = 2;
+    cparams.n_seq_max = 2;
+    llama_context_ptr ctx_multi { llama_init_from_model(model, cparams) };
+    if (!ctx_multi) {
+        fprintf(stderr, "%s: failed to create multi-sequence context\n", __func__);
+        return false;
+    }
+    dispatch_script steady = {{
+        { 1, 3, 3, 1, true, true, true },
+        { 1, 3, 3, 1, true, true, true },
+        { 1, 3, 3, 1, true, true, true },
+    }};
+    ctx_multi->set_dispatch_observer({ &steady, dispatch_script::pre });
+    if (!decode_unequal_sequences(ctx_multi.get())) {
+        fprintf(stderr, "%s: unequal-sequence decode failed\n", __func__);
+        return false;
+    }
+    drained = ctx_multi->dispatch_drain();
+    if (drained.notices.empty() || drained.notices.front().physical_step != 1 ||
+            drained.moe_routing_spans.size() != 1 ||
+            drained.moe_routing_spans.front().first_physical_step != 1 ||
+            drained.moe_routing_spans.front().last_physical_step <
+                drained.moe_routing_spans.front().first_physical_step) {
+        fprintf(stderr, "%s: unequal-sequence routing span was not retained\n", __func__);
+        return false;
+    }
+
+    cparams.n_ctx = 128;
+    cparams.n_batch = 72;
+    cparams.n_ubatch = 2;
+    cparams.n_seq_max = 1;
+    llama_context_ptr ctx_loss { llama_init_from_model(model, cparams) };
+    if (!ctx_loss) {
+        fprintf(stderr, "%s: failed to create queue-loss context\n", __func__);
+        return false;
+    }
+    dispatch_script changing;
+    for (uint64_t generation = 1; generation <= 36; ++generation) {
+        changing.decisions.push_back({ 1, generation, generation, 1, true, true, true });
+    }
+    ctx_loss->set_dispatch_observer({ &changing, dispatch_script::pre });
+    if (!decode_many(ctx_loss.get(), 1, 0, 72)) {
+        fprintf(stderr, "%s: queue-loss decode failed\n", __func__);
+        return false;
+    }
+    drained = ctx_loss->dispatch_drain();
+    if (changing.next != 36 || drained.notices.size() != 1 ||
+            drained.moe_routing_spans.size() != 32 || drained.dropped_moe_routing_spans != 4 ||
+            drained.losses.size() != 4 || drained.dropped_loss_descriptors != 0) {
+        fprintf(stderr, "%s: bounded queue did not report the expected loss (next=%zu notices=%zu spans=%zu dropped=%llu losses=%zu descriptors=%llu)\n",
+                __func__, changing.next, drained.notices.size(), drained.moe_routing_spans.size(),
+                (unsigned long long) drained.dropped_moe_routing_spans, drained.losses.size(),
+                (unsigned long long) drained.dropped_loss_descriptors);
+        return false;
+    }
+    for (size_t i = 0; i < drained.losses.size(); ++i) {
+        const auto & loss = drained.losses[i];
+        if (!loss.moe_routing_span || loss.operation != LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE ||
+                loss.first_physical_step != i + 1 || loss.next_physical_step != i + 2 ||
+                loss.decision.microbatch_generation != i + 1 || loss.first_dispatch_monotonic_us <= 0 ||
+                loss.last_dispatch_monotonic_us < loss.first_dispatch_monotonic_us) {
+            fprintf(stderr, "%s: queue loss did not retain exact coordinates\n", __func__);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static bool test_dense_model(llama_model * model, const common_params & params) {
     if (llama_model_n_expert(model) != 0 || llama_model_n_expert_shared(model) != 0 ||
             llama_model_n_moe_layer(model) != 0 || llama_model_moe_layer_index(model, 0) != -1) {
@@ -358,5 +515,6 @@ int main(int argc, char ** argv) {
         return test_dense_model(model, params) ? 0 : 1;
     }
 
-    return test_moe_model(model, params, require_cuda_readback) ? 0 : 1;
+    return test_moe_model(model, params, require_cuda_readback) &&
+        test_dispatch_observer(model, params) ? 0 : 1;
 }

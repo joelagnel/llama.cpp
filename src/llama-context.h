@@ -12,9 +12,12 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <deque>
+#include <iterator>
 #include <vector>
 
 struct llama_model;
+struct llama_context;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -23,6 +26,115 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
+
+// Internal dispatch observation. This stays out of the C API because callers
+// must drain it on the same context-owning execution path.
+enum llama_context_dispatch_operation {
+    LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE,
+    LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE,
+};
+
+struct llama_context_dispatch_decision {
+    uint32_t version = 0;
+    uint64_t props_generation = 0;
+    uint64_t microbatch_generation = 0;
+    uint8_t effective_flags = 0;
+    bool native_moe_routing_enabled = false;
+    bool moe_routing_applicable = false;
+    bool report_control_boundary = false;
+    uint64_t application_epoch = 0;
+};
+
+using llama_context_dispatch_pre_callback = llama_context_dispatch_decision (*) (
+        void * user_data,
+        llama_context_dispatch_operation operation);
+
+struct llama_context_dispatch_observer {
+    void * user_data = nullptr;
+    llama_context_dispatch_pre_callback pre = nullptr;
+};
+
+struct llama_context_dispatch_notice {
+    llama_context_dispatch_decision decision;
+    llama_context_dispatch_operation operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
+    uint64_t logical_call = 0;
+    uint64_t physical_step = 0;
+    uint32_t physical_microbatch = 0;
+    int64_t dispatch_monotonic_us = 0;
+};
+
+struct llama_context_dispatch_physical {
+    uint64_t physical_step = 0;
+    uint32_t physical_microbatch = 0;
+    int64_t dispatch_monotonic_us = 0;
+};
+
+struct llama_context_moe_routing_span_expert {
+    int32_t expert_index = -1;
+    float effective_weight = 0.0f;
+    llama_moe_routing_value_status expert_index_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    llama_moe_routing_value_status effective_weight_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+};
+
+struct llama_context_moe_routing_span_row {
+    int32_t layer_index = -1;
+    uint32_t graph_type = 0;
+    uint32_t physical_ubatch_index = 0;
+    int32_t row_index = -1;
+    int32_t ubatch_token_index = -1;
+    int32_t token_index = -1;
+    llama_token token = LLAMA_TOKEN_NULL;
+    llama_pos position = -1;
+    llama_moe_routing_value_status row_identity_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    llama_moe_routing_value_status selected_experts_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    float selected_score = 0.0f;
+    float rejected_score = 0.0f;
+    llama_moe_routing_value_status selected_score_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    llama_moe_routing_value_status rejected_score_status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+    std::vector<llama_context_moe_routing_span_expert> selected_experts;
+};
+
+struct llama_context_moe_routing_span_shared_expert {
+    int32_t layer_index = -1;
+    uint32_t graph_type = 0;
+    bool present = false;
+    uint32_t configured_count = 0;
+    uint32_t ffn_size = 0;
+};
+
+struct llama_context_moe_routing_span {
+    llama_context_dispatch_decision decision;
+    llama_context_dispatch_operation operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
+    uint64_t logical_call = 0;
+    uint64_t capture_generation = 0;
+    uint64_t first_physical_step = 0;
+    uint64_t last_physical_step = 0;
+    uint32_t first_physical_microbatch = 0;
+    uint32_t last_physical_microbatch = 0;
+    std::vector<llama_context_dispatch_physical> physical_dispatches;
+    std::vector<llama_context_moe_routing_span_row> rows;
+    std::vector<llama_context_moe_routing_span_shared_expert> shared_experts;
+};
+
+struct llama_context_dispatch_loss {
+    llama_context_dispatch_decision decision;
+    llama_context_dispatch_operation operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
+    uint64_t logical_call = 0;
+    uint64_t first_physical_step = 0;
+    uint64_t next_physical_step = 0;
+    int64_t first_dispatch_monotonic_us = 0;
+    int64_t last_dispatch_monotonic_us = 0;
+    bool moe_routing_span = false;
+};
+
+struct llama_context_dispatch_drain {
+    std::vector<llama_context_dispatch_notice> notices;
+    std::vector<llama_context_moe_routing_span> moe_routing_spans;
+    std::vector<llama_context_dispatch_loss> losses;
+    uint64_t dropped_notices = 0;
+    uint64_t dropped_moe_routing_spans = 0;
+    uint64_t dropped_loss_descriptors = 0;
+};
 
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
@@ -118,6 +230,8 @@ struct llama_context {
     void set_moe_routing(bool value);
     const llama_moe_routing_entry * get_moe_routing(size_t * count);
     const llama_moe_routing_readback * get_moe_routing_readback();
+    LLAMA_API void set_dispatch_observer(llama_context_dispatch_observer observer);
+    LLAMA_API llama_context_dispatch_drain dispatch_drain();
 
 #ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
     void reset_moe_routing_test_observer();
@@ -253,6 +367,11 @@ private:
             const llama_ubatch & ubatch);
     void clear_moe_routing_readback();
     void materialize_moe_routing_readback();
+    void dispatch_begin(llama_context_dispatch_operation operation);
+    void dispatch_pre_ubatch();
+    void dispatch_success(uint32_t physical_microbatch);
+    void dispatch_finish();
+    void dispatch_finish_moe_routing_span();
 
     //
     // graph
@@ -369,6 +488,31 @@ private:
     llama_moe_routing_readback moe_routing_readback;
     uint64_t moe_routing_capture_generation = 0;
     bool moe_routing_readback_ready = false;
+
+    llama_context_dispatch_observer dispatch_observer;
+    llama_context_dispatch_decision dispatch_decision;
+    llama_context_dispatch_decision dispatch_last_applied_decision;
+    bool dispatch_has_applied_decision = false;
+    uint64_t dispatch_application_epoch = 0;
+    llama_context_dispatch_operation dispatch_operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
+    uint64_t dispatch_logical_call = 0;
+    uint64_t dispatch_physical_step = 0;
+    uint64_t dispatch_first_physical_step = 0;
+    uint64_t dispatch_last_physical_step = 0;
+    uint64_t moe_routing_capture_logical_call = 0;
+    llama_context_dispatch_decision moe_routing_capture_decision;
+    llama_context_dispatch_operation moe_routing_capture_operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
+    uint64_t moe_routing_capture_first_physical_step = 0;
+    uint64_t moe_routing_capture_last_physical_step = 0;
+    uint32_t moe_routing_capture_first_physical_microbatch = 0;
+    uint32_t moe_routing_capture_last_physical_microbatch = 0;
+    std::vector<llama_context_dispatch_physical> moe_routing_capture_physical_dispatches;
+    std::deque<llama_context_dispatch_notice> dispatch_notices;
+    std::deque<llama_context_moe_routing_span> dispatch_moe_routing_spans;
+    std::deque<llama_context_dispatch_loss> dispatch_losses;
+    uint64_t dispatch_dropped_notices = 0;
+    uint64_t dispatch_dropped_moe_routing_spans = 0;
+    uint64_t dispatch_dropped_loss_descriptors = 0;
 
 #ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
     llama_moe_routing_test_observer moe_routing_test_observer;
