@@ -42,23 +42,6 @@ static bool decode_unequal_sequences(llama_context * ctx) {
     return ok;
 }
 
-static bool decode_interleaved_prefill(
-        llama_context * ctx,
-        llama_token first_token,
-        int32_t n_sequences,
-        int32_t n_tokens_per_sequence) {
-    const int32_t n_tokens = n_sequences*n_tokens_per_sequence;
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    for (int32_t token = 0; token < n_tokens; ++token) {
-        const int32_t sequence = token % n_sequences;
-        const llama_pos position = sequence*n_tokens_per_sequence + token/n_sequences;
-        common_batch_add(batch, first_token + token, position, { sequence }, true);
-    }
-    const bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
-    return ok;
-}
-
 static bool encode_one(llama_context * ctx, llama_token token, llama_pos pos) {
     llama_batch batch = llama_batch_init(1, 0, 1);
     common_batch_add(batch, token, pos, { 0 }, true);
@@ -259,69 +242,6 @@ static bool expect_moe_routing(
     return true;
 }
 
-static bool test_interleaved_prefill_row_positions(llama_model * model, const common_params & params) {
-    constexpr int32_t n_sequences = 4;
-    constexpr int32_t n_tokens_per_sequence = 10;
-    constexpr int32_t n_tokens = n_sequences*n_tokens_per_sequence;
-
-    auto cparams = common_context_params_to_llama(params);
-    cparams.n_ctx = 64;
-    cparams.n_batch = n_tokens;
-    cparams.n_ubatch = n_tokens;
-    cparams.n_seq_max = n_sequences;
-    llama_context_ptr ctx { llama_init_from_model(model, cparams) };
-    if (!ctx) {
-        fprintf(stderr, "%s: failed to create prefill context\n", __func__);
-        return false;
-    }
-
-    llama_set_moe_routing(ctx.get(), true);
-    if (!decode_interleaved_prefill(ctx.get(), 1, n_sequences, n_tokens_per_sequence)) {
-        fprintf(stderr, "%s: interleaved prefill failed\n", __func__);
-        return false;
-    }
-
-    const llama_moe_routing_readback * readback = llama_get_moe_routing_readback(ctx.get());
-    if (readback == nullptr || readback->row_count == 0 || readback->rows == nullptr) {
-        fprintf(stderr, "%s: missing interleaved prefill routing readback\n", __func__);
-        return false;
-    }
-
-    std::map<int32_t, std::set<int32_t>> token_indices_by_layer;
-    std::map<int32_t, std::set<llama_pos>> positions_by_layer;
-    for (size_t index = 0; index < readback->row_count; ++index) {
-        const llama_moe_routing_row & row = readback->rows[index];
-        const llama_pos expected_position = (row.token_index % n_sequences)*n_tokens_per_sequence
-            + row.token_index/n_sequences;
-        if (row.layer_index < 0 || row.physical_ubatch_index != 0 ||
-                row.row_index < 0 || row.ubatch_token_index < 0 || row.token_index < 0 ||
-                row.row_index != row.ubatch_token_index || row.row_index != row.token_index ||
-                row.token_index >= n_tokens || row.position != expected_position) {
-            fprintf(stderr, "%s: invalid interleaved prefill identity layer=%d physical=%u row=%d ubatch=%d token=%d position=%d\n",
-                    __func__, row.layer_index, row.physical_ubatch_index, row.row_index,
-                    row.ubatch_token_index, row.token_index, row.position);
-            return false;
-        }
-        token_indices_by_layer[row.layer_index].insert(row.token_index);
-        positions_by_layer[row.layer_index].insert(row.position);
-    }
-
-    if (token_indices_by_layer.size() != (size_t) llama_model_n_moe_layer(model) ||
-            positions_by_layer.size() != token_indices_by_layer.size()) {
-        fprintf(stderr, "%s: incomplete interleaved prefill layer coverage\n", __func__);
-        return false;
-    }
-    for (const auto & item : token_indices_by_layer) {
-        if (item.second.size() != n_tokens || positions_by_layer[item.first].size() != n_tokens) {
-            fprintf(stderr, "%s: duplicate or missing interleaved prefill position for layer %d\n",
-                    __func__, item.first);
-            return false;
-        }
-    }
-
-    return true;
-}
-
 static bool equal_logits(llama_context * lhs, llama_context * rhs, int32_t n_vocab) {
     llama_synchronize(lhs);
     llama_synchronize(rhs);
@@ -346,6 +266,18 @@ static llama_context_ptr make_context(llama_model * model, const common_params &
     cparams.n_ubatch = 2;
     cparams.n_seq_max = 1;
     return llama_context_ptr { llama_init_from_model(model, cparams) };
+}
+
+static bool test_moe_routing_primary_position_mapping() {
+    const llama_moe_routing_test_row_position_mapping result =
+        llama_context::test_map_moe_routing_primary_positions();
+    if (result.all_row_count != 40 || result.output_row_count != 20 ||
+            !result.all_rows_use_primary_positions || !result.output_rows_use_primary_positions ||
+            !result.all_rows_are_unique || !result.output_rows_are_unique) {
+        fprintf(stderr, "%s: four-plane row-position mapping was not exact\n", __func__);
+        return false;
+    }
+    return true;
 }
 
 static bool test_dispatch_observer(llama_model * model, const common_params & params) {
@@ -762,7 +694,7 @@ int main(int argc, char ** argv) {
         return test_dense_model(model, params) ? 0 : 1;
     }
 
-    return test_moe_model(model, params, require_cuda_readback) &&
-        test_interleaved_prefill_row_positions(model, params) &&
+    return test_moe_routing_primary_position_mapping() &&
+        test_moe_model(model, params, require_cuda_readback) &&
         test_dispatch_observer(model, params) ? 0 : 1;
 }

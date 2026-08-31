@@ -222,6 +222,15 @@ struct llama_moe_routing_test_observer {
     uint64_t batch_peer_reads = 0;
 };
 
+struct llama_moe_routing_test_row_position_mapping {
+    uint32_t all_row_count = 0;
+    uint32_t output_row_count = 0;
+    bool all_rows_use_primary_positions = false;
+    bool output_rows_use_primary_positions = false;
+    bool all_rows_are_unique = false;
+    bool output_rows_are_unique = false;
+};
+
 LLAMA_API void llama_moe_routing_test_observer_reset(struct llama_context * ctx);
 LLAMA_API llama_moe_routing_test_observer llama_moe_routing_test_observer_get(
         const struct llama_context * ctx);

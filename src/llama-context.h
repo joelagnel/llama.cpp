@@ -251,6 +251,7 @@ struct llama_context {
 #ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
     void reset_moe_routing_test_observer();
     llama_moe_routing_test_observer get_moe_routing_test_observer() const;
+    LLAMA_API static llama_moe_routing_test_row_position_mapping test_map_moe_routing_primary_positions();
 #endif
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -472,6 +473,12 @@ private:
         llama_pos position = -1;
         llama_moe_routing_value_status status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
     };
+
+    static size_t map_moe_routing_row_identities(
+            std::vector<moe_routing_row_identity> & identities,
+            size_t row_count,
+            size_t token_offset,
+            const llama_ubatch & ubatch);
 
     struct moe_routing_capture {
         int32_t layer_index = -1;

@@ -3033,6 +3033,48 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
     }
 }
 
+size_t llama_context::map_moe_routing_row_identities(
+        std::vector<moe_routing_row_identity> & identities,
+        size_t row_count,
+        size_t token_offset,
+        const llama_ubatch & ubatch) {
+    identities.resize(row_count);
+    if (row_count == ubatch.n_tokens) {
+        for (size_t token = 0; token < row_count; ++token) {
+            identities[token] = {
+                (int32_t) token,
+                (int32_t) (token_offset + token),
+                ubatch.token ? ubatch.token[token] : -1,
+                ubatch.pos ? ubatch.pos[token] : -1,
+                LLAMA_MOE_ROUTING_VALUE_STATUS_VALID,
+            };
+        }
+        return row_count;
+    }
+
+    if (ubatch.output == nullptr) {
+        return 0;
+    }
+
+    size_t row = 0;
+    for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
+        if (!ubatch.output[token]) {
+            continue;
+        }
+        if (row == row_count) {
+            break;
+        }
+        identities[row++] = {
+            (int32_t) token,
+            (int32_t) (token_offset + token),
+            ubatch.token ? ubatch.token[token] : -1,
+            ubatch.pos ? ubatch.pos[token] : -1,
+            LLAMA_MOE_ROUTING_VALUE_STATUS_VALID,
+        };
+    }
+    return row;
+}
+
 void llama_context::extract_moe_routing(
         const llm_graph_result * res,
         size_t token_offset,
@@ -3136,35 +3178,15 @@ void llama_context::extract_moe_routing(
 #ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
             moe_routing_test_observer.batch_peer_reads += capture.token_count;
 #endif
-            for (size_t token = 0; token < capture.token_count; ++token) {
-                capture.row_identities[token] = {
-                    (int32_t) token,
-                    (int32_t) (token_offset + token),
-                    ubatch.token ? ubatch.token[token] : -1,
-                    ubatch.pos ? ubatch.pos[token] : -1,
-                    LLAMA_MOE_ROUTING_VALUE_STATUS_VALID,
-                };
-            }
+            map_moe_routing_row_identities(
+                capture.row_identities, capture.token_count, token_offset, ubatch);
         } else if (ubatch.output != nullptr) {
-            size_t row = 0;
 #ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
             moe_routing_test_observer.batch_peer_reads += ubatch.n_tokens;
 #endif
-            for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
-                if (ubatch.output[token]) {
-                    if (row == capture.token_count) {
-                        break;
-                    }
-                    capture.row_identities[row++] = {
-                        (int32_t) token,
-                        (int32_t) (token_offset + token),
-                        ubatch.token ? ubatch.token[token] : -1,
-                        ubatch.pos ? ubatch.pos[token] : -1,
-                        LLAMA_MOE_ROUTING_VALUE_STATUS_VALID,
-                    };
-                }
-            }
-            if (row != capture.token_count) {
+            const size_t mapped_rows = map_moe_routing_row_identities(
+                capture.row_identities, capture.token_count, token_offset, ubatch);
+            if (mapped_rows != capture.token_count) {
                 LLAMA_LOG_WARN("%s: cannot map %zu MoE layer %d rows to %u batch tokens\n",
                         __func__, capture.token_count, output.layer_index, ubatch.n_tokens);
             }
@@ -3200,6 +3222,89 @@ void llama_context::extract_moe_routing(
         capture_score(output.rejected_score, capture.rejected_score);
     }
 }
+
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+llama_moe_routing_test_row_position_mapping llama_context::test_map_moe_routing_primary_positions() {
+    constexpr uint32_t n_tokens = 40;
+    constexpr uint32_t n_pos = 4;
+    constexpr int32_t token_offset = 17;
+    std::array<llama_token, n_tokens> tokens;
+    std::array<llama_pos, n_tokens*n_pos> positions;
+    std::array<int8_t, n_tokens> output;
+    for (uint32_t token = 0; token < n_tokens; ++token) {
+        tokens[token] = (llama_token) (token + 1);
+        positions[token] = (llama_pos) token;
+        output[token] = (token % 2) == 0;
+        for (uint32_t plane = 1; plane < n_pos; ++plane) {
+            positions[plane*n_tokens + token] = (llama_pos) (1000*plane + token);
+        }
+    }
+    const llama_ubatch ubatch = {
+        /*.b_equal_seqs =*/ false,
+        /*.n_tokens     =*/ n_tokens,
+        /*.n_seq_tokens =*/ n_tokens,
+        /*.n_seqs       =*/ 1,
+        /*.n_seqs_unq   =*/ 1,
+        /*.n_pos        =*/ n_pos,
+        /*.token        =*/ tokens.data(),
+        /*.embd         =*/ nullptr,
+        /*.pos          =*/ positions.data(),
+        /*.n_seq_id     =*/ nullptr,
+        /*.seq_id       =*/ nullptr,
+        /*.seq_id_unq   =*/ nullptr,
+        /*.seq_idx      =*/ nullptr,
+        /*.output       =*/ output.data(),
+        /*.data         =*/ {},
+    };
+
+    const auto validate = [](const std::vector<moe_routing_row_identity> & identities,
+                             uint32_t source_stride, uint32_t * count, bool * primary, bool * unique) {
+        *count = (uint32_t) identities.size();
+        *primary = true;
+        *unique = true;
+        std::array<bool, n_tokens> seen_ubatch = {};
+        std::array<bool, n_tokens> seen_token = {};
+        std::array<bool, n_tokens> seen_position = {};
+        for (size_t row = 0; row < identities.size(); ++row) {
+            const int32_t expected = (int32_t) (row*source_stride);
+            const auto & identity = identities[row];
+            if (identity.ubatch_token_index != expected ||
+                    identity.token_index != token_offset + expected ||
+                    identity.position != expected) {
+                *primary = false;
+            }
+            if (identity.ubatch_token_index < 0 || identity.ubatch_token_index >= (int32_t) n_tokens ||
+                    identity.token_index < token_offset || identity.token_index >= token_offset + (int32_t) n_tokens ||
+                    identity.position < 0 || identity.position >= (llama_pos) n_tokens) {
+                *unique = false;
+                continue;
+            }
+            const size_t ubatch_index = (size_t) identity.ubatch_token_index;
+            const size_t token_index = (size_t) (identity.token_index - token_offset);
+            const size_t position_index = (size_t) identity.position;
+            if (seen_ubatch[ubatch_index] || seen_token[token_index] || seen_position[position_index]) {
+                *unique = false;
+                continue;
+            }
+            seen_ubatch[ubatch_index] = true;
+            seen_token[token_index] = true;
+            seen_position[position_index] = true;
+        }
+    };
+
+    llama_moe_routing_test_row_position_mapping result;
+    std::vector<moe_routing_row_identity> all_rows;
+    map_moe_routing_row_identities(all_rows, n_tokens, token_offset, ubatch);
+    validate(all_rows, 1, &result.all_row_count, &result.all_rows_use_primary_positions,
+        &result.all_rows_are_unique);
+
+    std::vector<moe_routing_row_identity> output_rows;
+    map_moe_routing_row_identities(output_rows, n_tokens/2, token_offset, ubatch);
+    validate(output_rows, 2, &result.output_row_count, &result.output_rows_use_primary_positions,
+        &result.output_rows_are_unique);
+    return result;
+}
+#endif
 
 void llama_context::output_reorder() {
     const uint64_t n_vocab     = model.vocab.n_tokens();
