@@ -15,6 +15,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "src/llama-ext.h"
+#include "src/llama-context.h"
 #include "src/llama-graph.h"
 #include "log.h"
 #include "sampling.h"
@@ -272,11 +273,40 @@ struct telemetry_control_application {
     const char * effective_from = "next_request";
 };
 
-struct telemetry_control_boundary_pending {
-    bool pending = false;
-    telemetry_control_state effective;
-    uint64_t microbatch_generation = 0;
+enum telemetry_control_flag : uint8_t {
+    TELEMETRY_CONTROL_FLAG_MOE_ROUTING         = 1u << 0,
+    TELEMETRY_CONTROL_FLAG_OUTPUT_TOKEN_DETAIL = 1u << 1,
+    TELEMETRY_CONTROL_FLAG_TOKEN_CANDIDATES    = 1u << 2,
+    TELEMETRY_CONTROL_FLAG_PROMPT_PERPLEXITY   = 1u << 3,
+    TELEMETRY_CONTROL_FLAG_REQUEST_CONTENT     = 1u << 4,
+    TELEMETRY_CONTROL_FLAG_KV_PRESSURE_DETAIL  = 1u << 5,
+    TELEMETRY_CONTROL_FLAG_NATIVE_GPU_GPM      = 1u << 6,
 };
+
+static uint8_t telemetry_control_flags(const telemetry_control_state & control) {
+    return (control.moe_routing         ? TELEMETRY_CONTROL_FLAG_MOE_ROUTING         : 0) |
+        (control.output_token_detail    ? TELEMETRY_CONTROL_FLAG_OUTPUT_TOKEN_DETAIL : 0) |
+        (control.token_candidates       ? TELEMETRY_CONTROL_FLAG_TOKEN_CANDIDATES    : 0) |
+        (control.prompt_perplexity      ? TELEMETRY_CONTROL_FLAG_PROMPT_PERPLEXITY   : 0) |
+        (control.request_content        ? TELEMETRY_CONTROL_FLAG_REQUEST_CONTENT     : 0) |
+        (control.kv_pressure_detail     ? TELEMETRY_CONTROL_FLAG_KV_PRESSURE_DETAIL  : 0) |
+        (control.native_gpu_gpm         ? TELEMETRY_CONTROL_FLAG_NATIVE_GPU_GPM      : 0);
+}
+
+static telemetry_control_state telemetry_control_from_flags(
+        uint8_t flags,
+        uint64_t props_generation) {
+    return {
+        (flags & TELEMETRY_CONTROL_FLAG_MOE_ROUTING) != 0,
+        (flags & TELEMETRY_CONTROL_FLAG_OUTPUT_TOKEN_DETAIL) != 0,
+        (flags & TELEMETRY_CONTROL_FLAG_TOKEN_CANDIDATES) != 0,
+        (flags & TELEMETRY_CONTROL_FLAG_PROMPT_PERPLEXITY) != 0,
+        (flags & TELEMETRY_CONTROL_FLAG_REQUEST_CONTENT) != 0,
+        (flags & TELEMETRY_CONTROL_FLAG_KV_PRESSURE_DETAIL) != 0,
+        (flags & TELEMETRY_CONTROL_FLAG_NATIVE_GPU_GPM) != 0,
+        props_generation,
+    };
+}
 
 enum telemetry_moe_token_phase {
     TELEMETRY_MOE_TOKEN_PHASE_PREFILL_OUTPUT,
@@ -334,8 +364,34 @@ struct telemetry_moe_shared_expert_capture {
 struct telemetry_moe_routing_readback_capture {
     uint32_t version = 0;
     uint64_t capture_generation = 0;
+    llama_context_dispatch_operation operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
+    uint64_t first_physical_step = 0;
+    uint64_t last_physical_step = 0;
+    uint32_t first_physical_microbatch = 0;
+    uint32_t last_physical_microbatch = 0;
+    std::vector<llama_context_dispatch_physical> physical_dispatches;
     std::vector<telemetry_moe_routing_row_capture> rows;
     std::vector<telemetry_moe_shared_expert_capture> shared_experts;
+};
+
+struct telemetry_moe_native_dispatch_loss {
+    uint64_t props_generation = 0;
+    uint64_t microbatch_generation = 0;
+    uint64_t application_epoch = 0;
+    uint64_t first_physical_step = 0;
+    uint64_t next_physical_step = 0;
+    int64_t first_dispatch_monotonic_us = 0;
+    int64_t last_dispatch_monotonic_us = 0;
+    uint64_t logical_call = 0;
+    llama_context_dispatch_operation operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
+};
+
+struct telemetry_moe_unlocated_capacity_loss {
+    bool known = false;
+    uint64_t props_generation = 0;
+    uint64_t microbatch_generation = 0;
+    uint64_t application_epoch = 0;
+    llama_context_dispatch_operation operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
 };
 
 struct server_batch {
@@ -548,6 +604,8 @@ struct server_slot {
     bool telemetry_moe_chunk_capture_interrupted = false;
     bool telemetry_moe_chunk_source_unavailable = false;
     bool telemetry_moe_chunk_attribution_ambiguous = false;
+    telemetry_moe_unlocated_capacity_loss telemetry_moe_chunk_capacity_loss;
+    std::vector<telemetry_moe_native_dispatch_loss> telemetry_moe_chunk_native_losses;
     json telemetry_moe_pending_chunk;
 
     bool has_next_token = true;
@@ -701,6 +759,8 @@ struct server_slot {
         telemetry_moe_chunk_capture_interrupted = false;
         telemetry_moe_chunk_source_unavailable = false;
         telemetry_moe_chunk_attribution_ambiguous = false;
+        telemetry_moe_chunk_capacity_loss = {};
+        telemetry_moe_chunk_native_losses.clear();
         telemetry_moe_pending_chunk = json();
         json_schema = json();
 
@@ -1291,6 +1351,16 @@ public:
         return telemetry_control;
     }
 
+    struct telemetry_microbatch_control_snapshot {
+        telemetry_control_state control;
+        uint64_t microbatch_generation = 0;
+    };
+
+    telemetry_microbatch_control_snapshot telemetry_microbatch_control_current() const {
+        std::lock_guard<std::mutex> lock(mutex_telemetry_control);
+        return { telemetry_control, telemetry_microbatch_generation };
+    }
+
     telemetry_control_application telemetry_control_apply(telemetry_control_state next) {
         std::lock_guard<std::mutex> lock(mutex_telemetry_control);
         const bool microbatch_changed =
@@ -1299,6 +1369,9 @@ public:
                 telemetry_control.native_gpu_gpm != next.native_gpu_gpm;
         next.generation = telemetry_control.generation + 1;
         telemetry_control = next;
+        if (microbatch_changed) {
+            ++telemetry_microbatch_generation;
+        }
         return {
             telemetry_control,
             microbatch_changed ? "next_microbatch" : "next_request",
@@ -1593,6 +1666,9 @@ private:
     std::deque<telemetry_token_candidate_block_entry> telemetry_token_candidate_blocks;
     std::deque<std::string> telemetry_token_candidate_expired_trace_ids;
     std::string telemetry_server_instance_id = "server-" + random_string();
+    int64_t telemetry_clock_anchor_monotonic_us = 0;
+    int64_t telemetry_clock_anchor_timestamp_unix_ms = 0;
+    int64_t telemetry_clock_anchor_precision_us = 0;
     uint64_t telemetry_next_sequence = 1;
     uint64_t telemetry_next_assignment_ordinal = 1;
     uint64_t telemetry_dropped_events = 0;
@@ -1618,12 +1694,36 @@ private:
     uint64_t telemetry_slot_epoch = 0;
     mutable std::mutex mutex_telemetry_control;
     telemetry_control_state telemetry_control;
-    telemetry_control_state telemetry_microbatch_control;
-    telemetry_control_boundary_pending telemetry_control_boundary;
     uint64_t telemetry_microbatch_generation = 0;
-    bool telemetry_native_moe_routing_enabled = false;
+    struct telemetry_control_context_state {
+        uint8_t applied_microbatch_flags = 0;
+        bool native_moe_routing_enabled = false;
+        bool moe_routing_applicable = false;
+        uint64_t application_epoch = 0;
+        bool has_application = false;
+    };
+    telemetry_control_context_state telemetry_control_target;
+    telemetry_control_context_state telemetry_control_draft;
+    struct telemetry_dispatch_scope_state {
+        const telemetry_dispatch_scope_state * previous = nullptr;
+        bool target_moe_routing_permitted = false;
+        bool report_control_boundary = false;
+    };
+    const telemetry_dispatch_scope_state * telemetry_dispatch_scope = nullptr;
+    struct telemetry_dispatch_observer_binding {
+        server_context_impl * server = nullptr;
+        bool draft = false;
+    };
+    telemetry_dispatch_observer_binding telemetry_target_dispatch_binding;
+    telemetry_dispatch_observer_binding telemetry_draft_dispatch_binding;
+    bool telemetry_target_has_moe = false;
+    bool telemetry_draft_has_moe = false;
     bool telemetry_gpu_gpm_active = false;
     bool telemetry_kv_pressure_active = false;
+    bool telemetry_kv_pressure_pending_initialize = false;
+    uint64_t telemetry_kv_pressure_pending_generation = 0;
+    uint64_t telemetry_kv_pressure_applied_props_generation = 0;
+    uint64_t telemetry_kv_pressure_applied_microbatch_generation = 0;
     size_t telemetry_output_token_limit = 512;
     size_t telemetry_mtp_pass_limit = 512;
     size_t telemetry_mtp_proposal_limit = 512;
@@ -1657,11 +1757,26 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (ctx_tgt) {
+            ctx_tgt->set_dispatch_observer({});
+        }
+        if (ctx_dft) {
+            ctx_dft->set_dispatch_observer({});
+        }
         gpu_telemetry.stop();
         telemetry_gpu_gpm_active = false;
         telemetry_kv_pressure_active = false;
-        telemetry_native_moe_routing_enabled = false;
-        telemetry_microbatch_control = {};
+        telemetry_kv_pressure_pending_initialize = false;
+        telemetry_kv_pressure_pending_generation = 0;
+        telemetry_kv_pressure_applied_props_generation = 0;
+        telemetry_kv_pressure_applied_microbatch_generation = 0;
+        telemetry_control_target = {};
+        telemetry_control_draft = {};
+        telemetry_dispatch_scope = nullptr;
+        telemetry_target_dispatch_binding = {};
+        telemetry_draft_dispatch_binding = {};
+        telemetry_target_has_moe = false;
+        telemetry_draft_has_moe = false;
         spec.reset();
         spec_init.reset();
 
@@ -1677,40 +1792,20 @@ private:
         mctx = nullptr;
     }
 
-    static bool telemetry_microbatch_controls_changed(
-            const telemetry_control_state & current,
-            const telemetry_control_state & next) {
-        return current.moe_routing != next.moe_routing ||
-            current.kv_pressure_detail != next.kv_pressure_detail ||
-            current.native_gpu_gpm != next.native_gpu_gpm;
-    }
-
-    void telemetry_apply_micro_controls(
+    void telemetry_apply_side_controls_pre(
             const telemetry_control_state & control,
-            bool native_moe_routing_enabled) {
-        if (telemetry_microbatch_controls_changed(telemetry_microbatch_control, control)) {
-            telemetry_microbatch_control = control;
-            ++telemetry_microbatch_generation;
-            telemetry_control_boundary = {
-                true,
-                control,
-                telemetry_microbatch_generation,
-            };
-        } else if (telemetry_control_boundary.pending) {
-            telemetry_control_boundary.effective = control;
-        }
-
+            uint64_t microbatch_generation) {
         if (control.kv_pressure_detail != telemetry_kv_pressure_active) {
             telemetry_kv_pressure_active = control.kv_pressure_detail;
             telemetry_kv_wait.clear();
             if (telemetry_kv_pressure_active) {
-                telemetry_kv_pressure_initialize();
-                telemetry_kv_pressure_sample(0, true);
-                for (const auto & slot : slots) {
-                    if (slot.is_processing() && slot.task) {
-                        telemetry_kv_request_started(slot);
-                    }
-                }
+                telemetry_kv_pressure_pending_initialize = true;
+                telemetry_kv_pressure_pending_generation = microbatch_generation;
+            } else {
+                telemetry_kv_pressure_pending_initialize = false;
+                telemetry_kv_pressure_pending_generation = 0;
+                telemetry_kv_pressure_applied_props_generation = 0;
+                telemetry_kv_pressure_applied_microbatch_generation = 0;
             }
         }
         if (control.native_gpu_gpm != telemetry_gpu_gpm_active) {
@@ -1721,34 +1816,122 @@ private:
             }
             telemetry_gpu_gpm_active = control.native_gpu_gpm;
         }
+    }
 
-        if (llama_model_n_expert(model_tgt) > 0 &&
-                native_moe_routing_enabled != telemetry_native_moe_routing_enabled) {
-            llama_set_moe_routing(ctx_tgt, native_moe_routing_enabled);
-            telemetry_native_moe_routing_enabled = native_moe_routing_enabled;
+    llama_context_dispatch_decision telemetry_dispatch_pre(
+            bool draft,
+            llama_context_dispatch_operation /* operation */) {
+        const telemetry_microbatch_control_snapshot snapshot = telemetry_microbatch_control_current();
+        const telemetry_control_state & control = snapshot.control;
+        telemetry_apply_side_controls_pre(control, snapshot.microbatch_generation);
+        const telemetry_dispatch_scope_state * scope = telemetry_dispatch_scope;
+        const bool moe_applicable = !draft && scope && scope->target_moe_routing_permitted &&
+            telemetry_target_has_moe;
+        const bool target_moe = !draft && scope && scope->target_moe_routing_permitted &&
+            control.moe_routing && telemetry_target_has_moe;
+        return {
+            1,
+            control.generation,
+            snapshot.microbatch_generation,
+            telemetry_control_flags(control),
+            target_moe,
+            moe_applicable,
+            scope && scope->report_control_boundary,
+        };
+    }
+
+    static llama_context_dispatch_decision telemetry_dispatch_pre_callback(
+            void * user_data,
+            llama_context_dispatch_operation operation) {
+        const telemetry_dispatch_observer_binding * binding =
+            static_cast<const telemetry_dispatch_observer_binding *>(user_data);
+        return binding && binding->server
+            ? binding->server->telemetry_dispatch_pre(binding->draft, operation)
+            : llama_context_dispatch_decision {};
+    }
+
+    class telemetry_dispatch_scope_guard {
+    public:
+        telemetry_dispatch_scope_guard(
+                server_context_impl & server,
+                bool target_moe_routing_permitted,
+                bool report_control_boundary = true) : server(server) {
+            state.previous = server.telemetry_dispatch_scope;
+            state.target_moe_routing_permitted = target_moe_routing_permitted;
+            state.report_control_boundary = report_control_boundary;
+            server.telemetry_dispatch_scope = &state;
+        }
+
+        ~telemetry_dispatch_scope_guard() {
+            server.telemetry_dispatch_scope = state.previous;
+        }
+
+    private:
+        server_context_impl & server;
+        telemetry_dispatch_scope_state state;
+    };
+
+    void telemetry_flush_pending_moe_chunks() {
+        for (server_slot & slot : slots) {
+            if (!telemetry_flush_moe_pending_chunk(slot)) {
+                ++slot.telemetry_moe_chunk_unlocated_pending;
+            }
         }
     }
 
-    void telemetry_emit_control_boundary(uint64_t successful_ubatches_before_dispatch) {
-        if (!telemetry_control_boundary.pending) {
+    void telemetry_emit_control_boundary(
+            const llama_context_dispatch_notice & notice,
+            bool draft) {
+        if (!notice.decision.report_control_boundary) {
             return;
         }
-
-        const llama_ubatch_stats ubatches = llama_get_ubatch_stats(ctx_tgt);
-        GGML_ASSERT(ubatches.successful == successful_ubatches_before_dispatch + 1);
+        telemetry_control_context_state & context_state = draft
+            ? telemetry_control_draft : telemetry_control_target;
+        const uint8_t microbatch_flags = notice.decision.effective_flags &
+            (TELEMETRY_CONTROL_FLAG_MOE_ROUTING |
+             TELEMETRY_CONTROL_FLAG_KV_PRESSURE_DETAIL |
+             TELEMETRY_CONTROL_FLAG_NATIVE_GPU_GPM);
+        if (notice.decision.microbatch_generation == 0 ||
+                (microbatch_flags == context_state.applied_microbatch_flags &&
+                 (!context_state.has_application ||
+                  (notice.decision.native_moe_routing_enabled == context_state.native_moe_routing_enabled &&
+                   notice.decision.moe_routing_applicable == context_state.moe_routing_applicable &&
+                   notice.decision.application_epoch == context_state.application_epoch)))) {
+            return;
+        }
+        const telemetry_control_state control = telemetry_control_from_flags(
+            notice.decision.effective_flags, notice.decision.props_generation);
+        telemetry_flush_pending_moe_chunks();
+        if (!draft && !control.moe_routing && telemetry_target_has_moe) {
+            for (server_slot & slot : slots) {
+                if (slot.task && slot.task->params.moe_routing_telemetry_permitted &&
+                        slot.telemetry_moe_chunk_capture_started && !slot.telemetry_moe_chunk_capture_interrupted) {
+                    slot.telemetry_moe_chunk_capture_interrupted = true;
+                    ++slot.telemetry_moe_chunk_unlocated_pending;
+                }
+            }
+        }
         telemetry_append({
             {"schema_version", 1},
             {"event", "telemetry_control_boundary"},
             {"timestamp_unix_ms", telemetry_wall_unix_ms()},
-            {"props_generation", telemetry_control_boundary.effective.generation},
-            {"microbatch_generation", telemetry_control_boundary.microbatch_generation},
-            {"physical_step", ubatches.successful},
-            {"physical_microbatch", 0},
-            {"effective", telemetry_control_effective_json(telemetry_control_boundary.effective)},
-            {"native_moe_routing_enabled", telemetry_native_moe_routing_enabled},
-            {"moe_routing_applicable", llama_model_n_expert(model_tgt) > 0},
+            {"clock", telemetry_dispatch_clock_json()},
+            {"props_generation", notice.decision.props_generation},
+            {"microbatch_generation", notice.decision.microbatch_generation},
+            {"physical_context", draft ? "draft" : "target"},
+            {"operation", notice.operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode"},
+            {"physical_step", notice.physical_step},
+            {"physical_microbatch", notice.physical_microbatch},
+            {"dispatch_monotonic_us", notice.dispatch_monotonic_us},
+            {"effective", telemetry_control_effective_json(control)},
+            {"native_moe_routing_enabled", notice.decision.native_moe_routing_enabled},
+            {"moe_routing_applicable", notice.decision.moe_routing_applicable},
         });
-        telemetry_control_boundary.pending = false;
+        context_state.applied_microbatch_flags = microbatch_flags;
+        context_state.native_moe_routing_enabled = notice.decision.native_moe_routing_enabled;
+        context_state.moe_routing_applicable = notice.decision.moe_routing_applicable;
+        context_state.application_epoch = notice.decision.application_epoch;
+        context_state.has_application = true;
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -2084,6 +2267,24 @@ private:
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
+        }
+
+        telemetry_control_target = {};
+        telemetry_control_draft = {};
+        telemetry_target_has_moe = llama_model_n_expert(model_tgt) > 0;
+        telemetry_draft_has_moe = model_dft && llama_model_n_expert(model_dft) > 0;
+        telemetry_capture_dispatch_clock_anchor();
+        telemetry_target_dispatch_binding = { this, false };
+        ctx_tgt->set_dispatch_observer({
+            &telemetry_target_dispatch_binding,
+            telemetry_dispatch_pre_callback,
+        });
+        if (ctx_dft) {
+            telemetry_draft_dispatch_binding = { this, true };
+            ctx_dft->set_dispatch_observer({
+                &telemetry_draft_dispatch_binding,
+                telemetry_dispatch_pre_callback,
+            });
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -2514,7 +2715,7 @@ private:
     telemetry_kv_eviction_result clear_idle_slot(server_slot & slot) {
         telemetry_kv_eviction_result result;
         result.cleared = true;
-        if (!telemetry_kv_pressure_active) {
+        if (!telemetry_control_current().kv_pressure_detail) {
             slot.prompt_clear();
             return result;
         }
@@ -3833,7 +4034,7 @@ private:
 
         llama_batch batch_view;
         int32_t off_next = 0;
-        int32_t n_batch = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
+        int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -3850,8 +4051,7 @@ private:
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
-                    // on successful decode, restore the one-physical-ubatch limit
-                    n_batch = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
+                    n_batch = llama_n_batch(ctx_tgt);
                 } else {
                     // try again with the updated n_batch
                     continue;
@@ -4032,7 +4232,9 @@ private:
         if (!drafting.empty()) {
             const int64_t draft_started_us = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
+                telemetry_dispatch_scope_guard dispatch_scope(*this, false);
                 common_speculative_draft(spec.get());
+                telemetry_drain_dispatch(ctx_dft, true);
             });
             const int64_t draft_completed_us = ggml_time_us();
             for (const server_slot * slot : drafting) {
@@ -4107,7 +4309,7 @@ private:
         });
 
         // process in chunks that map one server dispatch to one physical ubatch
-        int32_t n_batch  = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
+        int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
         auto & alora_scale       = batch.alora_scale;
@@ -4517,7 +4719,11 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         queue_tasks.yield_to_queue([&]() {
+                            telemetry_dispatch_scope_guard dispatch_scope(
+                                *this, telemetry_moe_request_enabled(slot));
                             res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            telemetry_drain_dispatch(ctx_tgt, false, 0, 0, &slot);
+                            telemetry_drain_dispatch(ctx_dft, true);
                         });
 
                         if (res != 0) {
@@ -4719,65 +4925,15 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        telemetry_control_state control;
-        bool collect_moe_routing = false;
-        uint64_t successful_ubatches_before_dispatch = 0;
-        telemetry_moe_routing_readback_capture moe_routing_readback;
-        bool moe_routing_readback_copied = false;
         queue_tasks.yield_to_queue([&]() {
-            control = telemetry_control_current();
-            collect_moe_routing = control.moe_routing && has_moe_routing_request;
-            telemetry_apply_micro_controls(control, collect_moe_routing);
-            if (telemetry_control_boundary.pending) {
-                successful_ubatches_before_dispatch = llama_get_ubatch_stats(ctx_tgt).successful;
-            }
+            telemetry_dispatch_scope_guard dispatch_scope(*this, target_has_moe && has_moe_routing_request);
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
-            if (ret == 0 && collect_moe_routing) {
-                moe_routing_readback_copied = telemetry_copy_moe_routing_readback(moe_routing_readback);
-            }
+            telemetry_drain_dispatch(ctx_tgt, false, off, batch_view.n_tokens);
         });
         const int64_t decode_completed_us = ggml_time_us();
-
-        if (ret == 0) {
-            telemetry_emit_control_boundary(successful_ubatches_before_dispatch);
-        }
-
-        if (!control.moe_routing && target_has_moe) {
-            for (int i = off; i < off + batch_view.n_tokens; ++i) {
-                server_slot & slot = slots[batch.tokens[i].id_slot];
-                if (slot.task && slot.task->params.moe_routing_telemetry_permitted &&
-                        slot.telemetry_moe_chunk_capture_started && !slot.telemetry_moe_chunk_capture_interrupted) {
-                    slot.telemetry_moe_chunk_capture_interrupted = true;
-                    ++slot.telemetry_moe_chunk_unlocated_pending;
-                }
-            }
-        }
-
-        if (ret == 0 && collect_moe_routing) {
-            const bool readback_has_rows = moe_routing_readback_copied && !moe_routing_readback.rows.empty();
-            for (int i = off; i < off + batch_view.n_tokens; ++i) {
-                server_slot & slot = slots[batch.tokens[i].id_slot];
-                if (!telemetry_moe_request_enabled(slot)) {
-                    continue;
-                }
-                slot.telemetry_moe_chunk_capture_started = true;
-                if (!readback_has_rows) {
-                    slot.telemetry_moe_chunk_source_unavailable = true;
-                    ++slot.telemetry_moe_chunk_unlocated_pending;
-                }
-            }
-            if (moe_routing_readback_copied) {
-                telemetry_record_moe_routing_chunks(
-                    moe_routing_readback,
-                    off,
-                    batch_view.n_tokens,
-                    control.generation);
-                telemetry_record_moe_routing(moe_routing_readback, off, batch_view.n_tokens);
-            }
-        }
 
         if (ret == 0 && gpu_telemetry.is_collecting()) {
             std::fill(gpu_verify_proposal_positions.begin(), gpu_verify_proposal_positions.end(), 0);
@@ -4904,7 +5060,9 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                telemetry_dispatch_scope_guard dispatch_scope(*this, false);
                 ok = common_speculative_process(spec.get(), batch_view);
+                telemetry_drain_dispatch(ctx_dft, true);
             });
 
             if (!ok) {
@@ -5486,6 +5644,25 @@ private:
             std::chrono::system_clock::now().time_since_epoch()).count();
     }
 
+    void telemetry_capture_dispatch_clock_anchor() {
+        const int64_t before_us = ggml_time_us();
+        const int64_t wall_ms = telemetry_wall_unix_ms();
+        const int64_t after_us = ggml_time_us();
+        telemetry_clock_anchor_monotonic_us = before_us + (after_us - before_us)/2;
+        telemetry_clock_anchor_timestamp_unix_ms = wall_ms;
+        telemetry_clock_anchor_precision_us = after_us - before_us;
+    }
+
+    json telemetry_dispatch_clock_json() const {
+        return {
+            {"schema_version", 1},
+            {"clock_domain", "server_process_monotonic_microseconds"},
+            {"anchor_monotonic_us", telemetry_clock_anchor_monotonic_us},
+            {"anchor_timestamp_unix_ms", telemetry_clock_anchor_timestamp_unix_ms},
+            {"anchor_precision_us", telemetry_clock_anchor_precision_us},
+        };
+    }
+
     void telemetry_kv_snapshot_capture(bool include_diagnostics) {
         telemetry_kv_boundary_snapshot snapshot;
         snapshot.memory = llama_get_memory_snapshot(ctx_tgt, include_diagnostics);
@@ -5538,8 +5715,48 @@ private:
         }
     }
 
+    bool telemetry_kv_pressure_generation_current() const {
+        if (!telemetry_kv_pressure_active || telemetry_kv_pressure_applied_microbatch_generation == 0) {
+            return false;
+        }
+        const telemetry_microbatch_control_snapshot snapshot = telemetry_microbatch_control_current();
+        return snapshot.control.kv_pressure_detail &&
+            snapshot.microbatch_generation == telemetry_kv_pressure_applied_microbatch_generation;
+    }
+
+    void telemetry_kv_pressure_apply_pending_after_boundary(
+            uint64_t props_generation,
+            uint64_t microbatch_generation,
+            const telemetry_control_state & control) {
+        if (!control.kv_pressure_detail || !telemetry_kv_pressure_active ||
+                !telemetry_kv_pressure_pending_initialize ||
+                telemetry_kv_pressure_pending_generation != microbatch_generation) {
+            return;
+        }
+
+        const telemetry_microbatch_control_snapshot snapshot = telemetry_microbatch_control_current();
+        if (!snapshot.control.kv_pressure_detail ||
+                snapshot.microbatch_generation != microbatch_generation ||
+                snapshot.control.generation != props_generation) {
+            return;
+        }
+
+        telemetry_kv_pressure_applied_props_generation = props_generation;
+        telemetry_kv_pressure_applied_microbatch_generation = microbatch_generation;
+        telemetry_kv_pressure_pending_initialize = false;
+        telemetry_kv_pressure_pending_generation = 0;
+        llama_synchronize(ctx_tgt);
+        telemetry_kv_pressure_initialize();
+        telemetry_kv_pressure_sample(0, true);
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && slot.task) {
+                telemetry_kv_request_started(slot);
+            }
+        }
+    }
+
     void telemetry_kv_pressure_append(json event) {
-        if (!telemetry_kv_pressure_active) {
+        if (!telemetry_kv_pressure_generation_current()) {
             return;
         }
         if (!event.contains("timestamp_unix_ms")) {
@@ -5550,6 +5767,8 @@ private:
         }
         event["schema_version"] = 1;
         event["server_instance_id"] = telemetry_server_instance_id;
+        event["props_generation"] = telemetry_kv_pressure_applied_props_generation;
+        event["microbatch_generation"] = telemetry_kv_pressure_applied_microbatch_generation;
         event["sequence"] = telemetry_kv_pressure_next_sequence++;
         telemetry_kv_pressure_event_entry entry;
         entry.sequence = event.at("sequence").get<uint64_t>();
@@ -5581,7 +5800,7 @@ private:
     }
 
     void telemetry_kv_pressure_sample(int64_t monotonic_us, bool force) {
-        if (!telemetry_kv_pressure_active) {
+        if (!telemetry_kv_pressure_generation_current()) {
             return;
         }
         if (monotonic_us <= 0) {
@@ -6101,6 +6320,242 @@ private:
         return true;
     }
 
+    static telemetry_moe_routing_readback_capture telemetry_copy_moe_routing_span(
+            const llama_context_moe_routing_span & source) {
+        telemetry_moe_routing_readback_capture destination;
+        destination.version = LLAMA_MOE_ROUTING_READBACK_VERSION;
+        destination.capture_generation = source.capture_generation;
+        destination.operation = source.operation;
+        destination.first_physical_step = source.first_physical_step;
+        destination.last_physical_step = source.last_physical_step;
+        destination.first_physical_microbatch = source.first_physical_microbatch;
+        destination.last_physical_microbatch = source.last_physical_microbatch;
+        destination.physical_dispatches = source.physical_dispatches;
+        destination.rows.reserve(source.rows.size());
+        for (const llama_context_moe_routing_span_row & row : source.rows) {
+            telemetry_moe_routing_row_capture copied;
+            copied.layer_index = row.layer_index;
+            copied.graph_type = row.graph_type;
+            copied.physical_ubatch_index = row.physical_ubatch_index;
+            copied.row_index = row.row_index;
+            copied.ubatch_token_index = row.ubatch_token_index;
+            copied.token_index = row.token_index;
+            copied.token = row.token;
+            copied.position = row.position;
+            copied.row_identity_status = row.row_identity_status;
+            copied.selected_experts_status = row.selected_experts_status;
+            copied.selected_score = row.selected_score;
+            copied.rejected_score = row.rejected_score;
+            copied.selected_score_status = row.selected_score_status;
+            copied.rejected_score_status = row.rejected_score_status;
+            copied.selected_experts.reserve(row.selected_experts.size());
+            for (const llama_context_moe_routing_span_expert & expert : row.selected_experts) {
+                copied.selected_experts.push_back({
+                    expert.expert_index,
+                    expert.effective_weight,
+                    expert.expert_index_status,
+                    expert.effective_weight_status,
+                });
+            }
+            destination.rows.push_back(std::move(copied));
+        }
+        destination.shared_experts.reserve(source.shared_experts.size());
+        for (const llama_context_moe_routing_span_shared_expert & shared : source.shared_experts) {
+            destination.shared_experts.push_back({
+                shared.layer_index,
+                shared.graph_type,
+                shared.present,
+                shared.configured_count,
+                shared.ffn_size,
+            });
+        }
+        return destination;
+    }
+
+    static uint64_t telemetry_moe_physical_step(
+            const telemetry_moe_routing_readback_capture & readback,
+            uint32_t physical_microbatch) {
+        GGML_ASSERT(readback.first_physical_step > 0);
+        GGML_ASSERT(physical_microbatch >= readback.first_physical_microbatch);
+        return readback.first_physical_step + physical_microbatch - readback.first_physical_microbatch;
+    }
+
+    static int64_t telemetry_moe_dispatch_monotonic_us(
+            const telemetry_moe_routing_readback_capture & readback,
+            uint32_t physical_microbatch) {
+        for (const llama_context_dispatch_physical & physical : readback.physical_dispatches) {
+            if (physical.physical_microbatch == physical_microbatch) {
+                return physical.dispatch_monotonic_us;
+            }
+        }
+        return 0;
+    }
+
+    void telemetry_drain_dispatch(
+            llama_context * context,
+            bool draft,
+            int32_t batch_offset = 0,
+            int32_t batch_token_count = 0,
+            server_slot * media_slot = nullptr) {
+        if (!context) {
+            return;
+        }
+        llama_context_dispatch_drain drained = context->dispatch_drain();
+        const auto record_native_loss = [&](server_slot & slot, const llama_context_dispatch_loss & loss, bool ambiguous) {
+            if (!telemetry_moe_request_enabled(slot)) {
+                return;
+            }
+            slot.telemetry_moe_chunk_capture_started = true;
+            slot.telemetry_moe_chunk_source_unavailable = true;
+            slot.telemetry_moe_chunk_attribution_ambiguous |= ambiguous;
+            slot.telemetry_moe_chunk_native_losses.push_back({
+                loss.decision.props_generation,
+                loss.decision.microbatch_generation,
+                loss.decision.application_epoch,
+                loss.first_physical_step,
+                loss.next_physical_step,
+                loss.first_dispatch_monotonic_us,
+                loss.last_dispatch_monotonic_us,
+                loss.logical_call,
+                loss.operation,
+            });
+        };
+        if (!draft) {
+            for (const llama_context_dispatch_loss & loss : drained.losses) {
+                if (!loss.moe_routing_span || !loss.decision.native_moe_routing_enabled) {
+                    continue;
+                }
+                std::set<int32_t> candidate_slots;
+                if (media_slot != nullptr) {
+                    candidate_slots.insert(media_slot->id);
+                } else {
+                    for (int32_t i = batch_offset; i < batch_offset + batch_token_count; ++i) {
+                        candidate_slots.insert(batch.tokens[i].id_slot);
+                    }
+                }
+                const bool ambiguous = candidate_slots.size() != 1;
+                for (const int32_t id_slot : candidate_slots) {
+                    if (id_slot >= 0 && id_slot < (int32_t) slots.size()) {
+                        record_native_loss(slots[id_slot], loss, ambiguous);
+                    }
+                }
+            }
+        }
+        if (drained.dropped_notices > 0 || drained.dropped_moe_routing_spans > 0 ||
+                drained.dropped_loss_descriptors > 0) {
+            json losses = json::array();
+            for (const llama_context_dispatch_loss & loss : drained.losses) {
+                losses.push_back({
+                    {"kind", loss.moe_routing_span ? "moe_routing_span" : "control_boundary"},
+                    {"operation", loss.operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode"},
+                    {"logical_call", loss.logical_call},
+                    {"first_physical_step", loss.first_physical_step},
+                    {"next_physical_step", loss.next_physical_step},
+                    {"first_dispatch_monotonic_us", loss.first_dispatch_monotonic_us > 0
+                        ? json(loss.first_dispatch_monotonic_us) : json(nullptr)},
+                    {"last_dispatch_monotonic_us", loss.last_dispatch_monotonic_us > 0
+                        ? json(loss.last_dispatch_monotonic_us) : json(nullptr)},
+                    {"props_generation", loss.decision.props_generation},
+                    {"microbatch_generation", loss.decision.microbatch_generation},
+                    {"application_epoch", loss.decision.application_epoch},
+                    {"native_moe_routing_enabled", loss.decision.native_moe_routing_enabled},
+                });
+            }
+            telemetry_append({
+                {"event", "telemetry_dispatch_queue_loss"},
+                {"physical_context", draft ? "draft" : "target"},
+                {"clock", telemetry_dispatch_clock_json()},
+                {"dropped_notices", drained.dropped_notices},
+                {"dropped_moe_routing_spans", drained.dropped_moe_routing_spans},
+                {"dropped_loss_descriptors", drained.dropped_loss_descriptors},
+                {"losses", std::move(losses)},
+                {"reason", "The bounded native dispatch queue overflowed before its server scope drained it."},
+            });
+        }
+
+        const auto record_span = [&](const llama_context_moe_routing_span & span) {
+            if (draft || (batch_token_count <= 0 && media_slot == nullptr)) {
+                return;
+            }
+            if (!span.decision.native_moe_routing_enabled) {
+                return;
+            }
+            const telemetry_moe_routing_readback_capture readback = telemetry_copy_moe_routing_span(span);
+            const bool readback_has_rows = !readback.rows.empty();
+            std::vector<const server_batch::token *> token_map;
+            server_batch::token media_token = {};
+            if (media_slot) {
+                if (!telemetry_moe_request_enabled(*media_slot)) {
+                    return;
+                }
+                media_slot->telemetry_moe_chunk_capture_started = true;
+                if (!readback_has_rows) {
+                    media_slot->telemetry_moe_chunk_source_unavailable = true;
+                    ++media_slot->telemetry_moe_chunk_unlocated_pending;
+                }
+                int32_t token_count = 1;
+                for (const telemetry_moe_routing_row_capture & row : readback.rows) {
+                    token_count = std::max(token_count, row.token_index + 1);
+                }
+                media_token = {
+                    media_slot->id,
+                    LLAMA_TOKEN_NULL,
+                    media_slot->prompt.tokens.pos_next(),
+                    false,
+                    true,
+                };
+                token_map.assign((size_t) token_count, &media_token);
+            } else {
+                token_map.reserve((size_t) batch_token_count);
+                for (int32_t i = batch_offset; i < batch_offset + batch_token_count; ++i) {
+                    const server_batch::token & token = batch.tokens[i];
+                    token_map.push_back(&token);
+                    server_slot & slot = slots[token.id_slot];
+                    if (!telemetry_moe_request_enabled(slot)) {
+                        continue;
+                    }
+                    slot.telemetry_moe_chunk_capture_started = true;
+                    if (!readback_has_rows) {
+                        slot.telemetry_moe_chunk_source_unavailable = true;
+                        ++slot.telemetry_moe_chunk_unlocated_pending;
+                    }
+                }
+            }
+            telemetry_record_moe_routing_chunks(
+                readback,
+                token_map,
+                span.decision);
+            telemetry_record_moe_routing(readback, token_map);
+        };
+
+        size_t span_index = 0;
+        for (const llama_context_dispatch_notice & notice : drained.notices) {
+            while (span_index < drained.moe_routing_spans.size() &&
+                    drained.moe_routing_spans[span_index].last_physical_step < notice.physical_step) {
+                record_span(drained.moe_routing_spans[span_index]);
+                ++span_index;
+            }
+            telemetry_emit_control_boundary(notice, draft);
+            if (!draft) {
+                telemetry_kv_pressure_apply_pending_after_boundary(
+                    notice.decision.props_generation,
+                    notice.decision.microbatch_generation,
+                    telemetry_control_from_flags(
+                        notice.decision.effective_flags,
+                        notice.decision.props_generation));
+            }
+            while (span_index < drained.moe_routing_spans.size() &&
+                    drained.moe_routing_spans[span_index].last_physical_step <= notice.physical_step) {
+                record_span(drained.moe_routing_spans[span_index]);
+                ++span_index;
+            }
+        }
+        while (span_index < drained.moe_routing_spans.size()) {
+            record_span(drained.moe_routing_spans[span_index]);
+            ++span_index;
+        }
+    }
+
     static uint32_t telemetry_moe_value_status_number(llama_moe_routing_value_status status) {
         return (uint32_t) status;
     }
@@ -6210,9 +6665,10 @@ private:
     }
 
     std::string telemetry_serialize_moe_routing_chunk(json event, uint64_t sequence) const {
-        event["schema_version"] = 2;
+        event["schema_version"] = 3;
         event["event"] = "moe_routing_chunk";
         event["server_instance_id"] = telemetry_server_instance_id;
+        event["clock"] = telemetry_dispatch_clock_json();
         event["sequence"] = sequence;
         event["serialized_bytes"] = 0;
 
@@ -6260,7 +6716,7 @@ private:
         }
 
         return {
-            {"schema_version", 2},
+            {"schema_version", 3},
             {"server_instance_id", telemetry_server_instance_id},
             {"server_build", std::string(llama_build_info())},
             {"model_id", model_name},
@@ -6275,7 +6731,7 @@ private:
             {"shared_expert_count", shared_expert_count},
             {"weight_semantics", "exact effective routed coefficient"},
             {"score_semantics", "router score after selection bias and group masking"},
-            {"clock_domain", "utc_wall_clock"},
+            {"clock_domain", "server_process_monotonic_microseconds"},
         };
     }
 
@@ -6381,9 +6837,9 @@ private:
 
     void telemetry_record_moe_routing_chunks(
             const telemetry_moe_routing_readback_capture & readback,
-            int32_t batch_offset,
-            int32_t batch_token_count,
-            uint64_t control_generation) {
+            const std::vector<const server_batch::token *> & token_map,
+            const llama_context_dispatch_decision & decision) {
+        const uint64_t control_generation = decision.props_generation;
         if (readback.rows.empty()) {
             return;
         }
@@ -6423,24 +6879,24 @@ private:
 
         std::map<std::string, trace_capture> captures_by_trace;
         std::map<physical_event_id, physical_event_coverage> coverage_by_event;
-        std::vector<int64_t> proposal_positions((size_t) batch_token_count, -1);
+        std::vector<int64_t> proposal_positions(token_map.size(), -1);
         std::vector<int64_t> next_proposal_position(slots.size(), 0);
 
-        for (int32_t index = 0; index < batch_token_count; ++index) {
-            const server_batch::token & token = batch.tokens[batch_offset + index];
+        for (size_t index = 0; index < token_map.size(); ++index) {
+            const server_batch::token & token = *token_map[index];
             if (token.id_slot < 0 || token.id_slot >= (int32_t) slots.size()) {
                 continue;
             }
             const server_slot & slot = slots[token.id_slot];
             if (!token.is_prompt && slot.can_speculate() && !slot.spec_draft.empty()) {
-                proposal_positions[(size_t) index] = next_proposal_position[(size_t) token.id_slot]++;
+                proposal_positions[index] = next_proposal_position[(size_t) token.id_slot]++;
             }
         }
 
         const auto record_unmappable_row = [&]() {
             std::set<int32_t> candidate_slots;
-            for (int32_t index = 0; index < batch_token_count; ++index) {
-                const server_batch::token & candidate = batch.tokens[batch_offset + index];
+            for (const server_batch::token * candidate_ptr : token_map) {
+                const server_batch::token & candidate = *candidate_ptr;
                 if (candidate.id_slot < 0 || candidate.id_slot >= (int32_t) slots.size()) {
                     continue;
                 }
@@ -6467,11 +6923,11 @@ private:
 
         for (size_t row_index = 0; row_index < readback.rows.size(); ++row_index) {
             const telemetry_moe_routing_row_capture & row = readback.rows[row_index];
-            if (row.token_index < 0 || row.token_index >= batch_token_count) {
+            if (row.token_index < 0 || (size_t) row.token_index >= token_map.size()) {
                 record_unmappable_row();
                 continue;
             }
-            const server_batch::token & token = batch.tokens[batch_offset + row.token_index];
+            const server_batch::token & token = *token_map[(size_t) row.token_index];
             if (token.id_slot < 0 || token.id_slot >= (int32_t) slots.size()) {
                 record_unmappable_row();
                 continue;
@@ -6538,6 +6994,17 @@ private:
 
         const json descriptor = telemetry_moe_routing_descriptor();
 
+        const auto physical_step = [&](uint32_t physical_microbatch) {
+            return telemetry_moe_physical_step(readback, physical_microbatch);
+        };
+
+        const auto dispatch_monotonic_us = [&](uint32_t physical_microbatch) {
+            return telemetry_moe_dispatch_monotonic_us(readback, physical_microbatch);
+        };
+
+        const char * const operation = readback.operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE
+            ? "encode" : "decode";
+
         const auto shared_metadata = [&](const telemetry_moe_routing_row_capture & row) {
             for (const telemetry_moe_shared_expert_capture & shared : readback.shared_experts) {
                 if (shared.layer_index == row.layer_index && shared.graph_type == row.graph_type) {
@@ -6564,7 +7031,11 @@ private:
             return json {
                 {"server_instance_id", telemetry_server_instance_id},
                 {"physical_microbatch", record.event.microbatch},
-                {"physical_step", readback.capture_generation},
+                {"physical_step", physical_step(record.event.microbatch)},
+                {"physical_context", "target"},
+                {"operation", operation},
+                {"dispatch_monotonic_us", dispatch_monotonic_us(record.event.microbatch) > 0
+                    ? json(dispatch_monotonic_us(record.event.microbatch)) : json(nullptr)},
                 {"phase", record.event.phase},
                 {"layer_index", record.event.layer},
                 {"control_generation", control_generation},
@@ -6618,10 +7089,14 @@ private:
                     gaps.push_back({
                         {"first_sequence", record->sequence},
                         {"next_sequence", record->sequence + 1},
-                        {"first_physical_step", readback.capture_generation},
-                        {"last_physical_step", readback.capture_generation},
+                        {"first_physical_step", physical_step(record->event.microbatch)},
+                        {"last_physical_step", physical_step(record->event.microbatch)},
                         {"first_physical_microbatch", record->event.microbatch},
                         {"last_physical_microbatch", record->event.microbatch},
+                        {"dispatch_monotonic_us", dispatch_monotonic_us(record->event.microbatch) > 0
+                            ? json(dispatch_monotonic_us(record->event.microbatch)) : json(nullptr)},
+                        {"physical_context", "target"},
+                        {"operation", operation},
                         {"first_model_position", row.position},
                         {"last_model_position", row.position},
                         {"phase", record->event.phase},
@@ -6679,10 +7154,14 @@ private:
                 intervals.push_back({
                     {"first_sequence", record->sequence},
                     {"next_sequence", record->sequence + 1},
-                    {"first_physical_step", readback.capture_generation},
-                    {"last_physical_step", readback.capture_generation},
+                    {"first_physical_step", physical_step(record->event.microbatch)},
+                    {"last_physical_step", physical_step(record->event.microbatch)},
                     {"first_physical_microbatch", record->event.microbatch},
                     {"last_physical_microbatch", record->event.microbatch},
+                    {"dispatch_monotonic_us", dispatch_monotonic_us(record->event.microbatch) > 0
+                        ? json(dispatch_monotonic_us(record->event.microbatch)) : json(nullptr)},
+                    {"physical_context", "target"},
+                    {"operation", operation},
                     {"first_model_position", row.position},
                     {"last_model_position", row.position},
                     {"phase", record->event.phase},
@@ -6704,7 +7183,11 @@ private:
                     {"event_key", {
                         {"server_instance_id", telemetry_server_instance_id},
                         {"physical_microbatch", id.microbatch},
-                        {"physical_step", readback.capture_generation},
+                        {"physical_step", physical_step(id.microbatch)},
+                        {"physical_context", "target"},
+                        {"operation", operation},
+                        {"dispatch_monotonic_us", dispatch_monotonic_us(id.microbatch) > 0
+                            ? json(dispatch_monotonic_us(id.microbatch)) : json(nullptr)},
                         {"phase", id.phase},
                         {"layer_index", id.layer},
                         {"control_generation", control_generation},
@@ -6715,6 +7198,10 @@ private:
                     {"captured_request_trace_ids", trace_ids},
                     {"is_complete", complete},
                 };
+                if (dispatch_monotonic_us(id.microbatch) <= 0) {
+                    physical["timestamp_state"] = "unavailable";
+                    physical["reason"] = "The native physical dispatch did not retain a monotonic timestamp.";
+                }
                 if (!complete) {
                     physical["reason"] = "One or more request peers or router rows were not retained as valid routing decisions.";
                 }
@@ -6779,6 +7266,13 @@ private:
                     "moe-pending-18446744073709551615"));
                 if (one_record_upper_bound > telemetry_moe_chunk_limit_bytes() && !record.invalid) {
                     record.gap = true;
+                    capture.slot->telemetry_moe_chunk_capacity_loss = {
+                        true,
+                        decision.props_generation,
+                        decision.microbatch_generation,
+                        decision.application_epoch,
+                        readback.operation,
+                    };
                     physical_event_coverage & coverage = coverage_by_event.at(record.event);
                     if (coverage.captured_valid_decisions > 0) {
                         --coverage.captured_valid_decisions;
@@ -6794,6 +7288,13 @@ private:
                 }
                 if (chunk_base_upper_bound > telemetry_moe_chunk_limit_bytes()
                         || record_upper_bound > telemetry_moe_chunk_limit_bytes() - chunk_base_upper_bound) {
+                    capture.slot->telemetry_moe_chunk_capacity_loss = {
+                        true,
+                        decision.props_generation,
+                        decision.microbatch_generation,
+                        decision.application_epoch,
+                        readback.operation,
+                    };
                     ++capture.slot->telemetry_moe_chunk_unlocated_pending;
                     ++capture.slot->telemetry_moe_chunk_unlocated_rows;
                     continue;
@@ -6844,9 +7345,58 @@ private:
         if (!slot.task || (!slot.telemetry_moe_chunk_capture_started && !slot.telemetry_moe_chunk_source_unavailable)) {
             return;
         }
+        const auto annotate_capacity_loss = [&](json & event) {
+            const telemetry_moe_unlocated_capacity_loss & loss = slot.telemetry_moe_chunk_capacity_loss;
+            if (!loss.known || !event.contains("unlocated_coverage_loss")) {
+                return;
+            }
+            json & unlocated = event["unlocated_coverage_loss"];
+            unlocated["state"] = "loss";
+            unlocated["classification"] = "serialized_capacity_reservation";
+            unlocated["coordinate_state"] = "unavailable";
+            unlocated["physical_context"] = "target";
+            unlocated["operation"] = loss.operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode";
+            unlocated["props_generation"] = loss.props_generation;
+            unlocated["microbatch_generation"] = loss.microbatch_generation;
+            unlocated["application_epoch"] = loss.application_epoch;
+            unlocated["reason"] = "A routing record could not be retained with the configured serialized chunk-capacity finalization reservation.";
+        };
+        const auto append_native_loss_gaps = [&](json & event) {
+            if (slot.telemetry_moe_chunk_native_losses.empty()) {
+                return false;
+            }
+            json gaps = event.value("gaps", json::array());
+            for (const telemetry_moe_native_dispatch_loss & loss : slot.telemetry_moe_chunk_native_losses) {
+                json gap = {
+                    {"first_sequence", slot.telemetry_moe_chunk_decision_sequence},
+                    {"next_sequence", slot.telemetry_moe_chunk_decision_sequence},
+                    {"first_physical_step", loss.first_physical_step},
+                    {"next_physical_step", loss.next_physical_step},
+                    {"first_dispatch_monotonic_us", loss.first_dispatch_monotonic_us > 0
+                        ? json(loss.first_dispatch_monotonic_us) : json(nullptr)},
+                    {"last_dispatch_monotonic_us", loss.last_dispatch_monotonic_us > 0
+                        ? json(loss.last_dispatch_monotonic_us) : json(nullptr)},
+                    {"logical_call", loss.logical_call},
+                    {"operation", loss.operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode"},
+                    {"physical_context", "target"},
+                    {"props_generation", loss.props_generation},
+                    {"microbatch_generation", loss.microbatch_generation},
+                    {"application_epoch", loss.application_epoch},
+                    {"logical_sequence_known", false},
+                    {"cause", "native_dispatch_queue_overflow"},
+                    {"reason", "The bounded native dispatch queue dropped this exact routing span."},
+                };
+                gap["timestamp_state"] = loss.first_dispatch_monotonic_us > 0 &&
+                    loss.last_dispatch_monotonic_us > 0 ? "available" : "unavailable";
+                gaps.push_back(std::move(gap));
+            }
+            event["gaps"] = std::move(gaps);
+            return true;
+        };
         const uint64_t pending_unlocated_rows = slot.telemetry_moe_chunk_unlocated_pending;
         if (!slot.telemetry_moe_pending_chunk.is_null()) {
             slot.telemetry_moe_pending_chunk["is_final_for_trace"] = true;
+            const bool native_loss = append_native_loss_gaps(slot.telemetry_moe_pending_chunk);
             const uint64_t existing_unlocated_rows = telemetry_moe_chunk_unlocated_loss_count(slot.telemetry_moe_pending_chunk);
             uint64_t unlocated_rows = 0;
             GGML_ASSERT(server_moe_routing_combine_lost_population(
@@ -6859,15 +7409,18 @@ private:
                 slot.telemetry_moe_chunk_capture_interrupted,
                 slot.telemetry_moe_chunk_source_unavailable,
                 slot.telemetry_moe_chunk_attribution_ambiguous,
-                false,
+                native_loss,
             };
             server_moe_routing_apply_canonical_event_coverage(
                 slot.telemetry_moe_pending_chunk, routing_coverage, true,
                 "The request ended with partial routing coverage:",
                 "Routing capture lost rows before complete routing coordinates were retained.");
+            annotate_capacity_loss(slot.telemetry_moe_pending_chunk);
             slot.telemetry_moe_chunk_unlocated_pending = 0;
             GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(slot.telemetry_moe_pending_chunk));
             GGML_ASSERT(telemetry_flush_moe_pending_chunk(slot));
+            slot.telemetry_moe_chunk_native_losses.clear();
+            slot.telemetry_moe_chunk_capacity_loss = {};
             return;
         }
 
@@ -6876,6 +7429,7 @@ private:
             return;
         }
         const uint64_t unlocated_rows = pending_unlocated_rows;
+        const bool native_loss = !slot.telemetry_moe_chunk_native_losses.empty();
         const server_moe_routing_chunk_coverage routing_coverage = {
             slot.telemetry_moe_chunk_invalid_rows,
             slot.telemetry_moe_chunk_unavailable_rows,
@@ -6884,7 +7438,7 @@ private:
             slot.telemetry_moe_chunk_capture_interrupted,
             slot.telemetry_moe_chunk_source_unavailable,
             slot.telemetry_moe_chunk_attribution_ambiguous,
-            false,
+            native_loss,
         };
         json marker = {
             {"chunk_id", string_format("moe-%d-%" PRIu64, slot.id, ++slot.telemetry_moe_chunk_sequence)},
@@ -6895,13 +7449,17 @@ private:
             {"is_final_for_trace", true},
             {"descriptor", telemetry_moe_routing_descriptor()},
         };
+        GGML_ASSERT(append_native_loss_gaps(marker) == native_loss);
         server_moe_routing_apply_canonical_event_coverage(
             marker, routing_coverage, false,
             "The request ended with partial routing coverage:",
             "Routing capture ended after an unavailable native or control-boundary interval.",
             "No routable MoE records were retained for this request.");
+        annotate_capacity_loss(marker);
         GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(marker));
         GGML_ASSERT(telemetry_append_moe_routing_chunk(std::move(marker)));
+        slot.telemetry_moe_chunk_native_losses.clear();
+        slot.telemetry_moe_chunk_capacity_loss = {};
     }
 
     bool telemetry_moe_request_enabled(const server_slot & slot) const {
@@ -6922,8 +7480,7 @@ private:
 
     void telemetry_record_moe_routing(
             const telemetry_moe_routing_readback_capture & readback,
-            int32_t batch_offset,
-            int32_t batch_token_count) {
+            const std::vector<const server_batch::token *> & token_map) {
         std::vector<llama_moe_routing_entry> entries;
         for (const telemetry_moe_routing_row_capture & row : readback.rows) {
             for (const telemetry_moe_routing_expert_capture & expert : row.selected_experts) {
@@ -6941,16 +7498,16 @@ private:
 
         const int32_t configured_experts = llama_model_n_expert(model_tgt);
         const int32_t model_layers = llama_model_n_layer(model_tgt);
-        std::vector<bool> routed_tokens((size_t) batch_token_count, false);
+        std::vector<bool> routed_tokens(token_map.size(), false);
         int32_t previous_layer = -1;
         int32_t previous_token = -1;
 
         for (const llama_moe_routing_entry & entry : entries) {
-            if (entry.token_index < 0 || entry.token_index >= batch_token_count) {
+            if (entry.token_index < 0 || (size_t) entry.token_index >= token_map.size()) {
                 continue;
             }
 
-            const auto & token = batch.tokens[batch_offset + entry.token_index];
+            const auto & token = *token_map[(size_t) entry.token_index];
             server_slot & slot = slots[token.id_slot];
             if (!telemetry_moe_request_enabled(slot)) {
                 continue;
@@ -6985,8 +7542,8 @@ private:
         }
 
         bool has_mtp_verify = false;
-        for (int32_t i = 0; i < batch_token_count; ++i) {
-            const auto & token = batch.tokens[batch_offset + i];
+        for (size_t i = 0; i < token_map.size(); ++i) {
+            const auto & token = *token_map[i];
             const server_slot & slot = slots[token.id_slot];
             if (!token.is_prompt && slot.can_speculate() && !slot.spec_draft.empty()) {
                 has_mtp_verify = true;
@@ -6996,14 +7553,14 @@ private:
 
         std::vector<int64_t> proposal_positions;
         if (has_mtp_verify) {
-            proposal_positions.assign((size_t) batch_token_count, -1);
+            proposal_positions.assign(token_map.size(), -1);
             std::vector<int64_t> next_proposal_position(slots.size(), 0);
-            for (int32_t i = 0; i < batch_token_count; ++i) {
-                const auto & token = batch.tokens[batch_offset + i];
+            for (size_t i = 0; i < token_map.size(); ++i) {
+                const auto & token = *token_map[i];
                 const server_slot & slot = slots[token.id_slot];
                 const bool mtp_verify = !token.is_prompt && slot.can_speculate() && !slot.spec_draft.empty();
                 if (mtp_verify) {
-                    proposal_positions[(size_t) i] = next_proposal_position[(size_t) token.id_slot]++;
+                    proposal_positions[i] = next_proposal_position[(size_t) token.id_slot]++;
                 }
             }
         }
@@ -7019,12 +7576,12 @@ private:
                 group_end++;
             }
 
-            if (token_index < 0 || token_index >= batch_token_count) {
+            if (token_index < 0 || (size_t) token_index >= token_map.size()) {
                 group_start = group_end;
                 continue;
             }
 
-            const auto & token = batch.tokens[batch_offset + token_index];
+            const auto & token = *token_map[(size_t) token_index];
             server_slot & slot = slots[token.id_slot];
             if (!telemetry_moe_request_enabled(slot) || !token.output) {
                 group_start = group_end;
