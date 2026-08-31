@@ -2055,6 +2055,16 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         assert decisions
         assert [decision["sequence"] for decision in decisions] == list(range(len(decisions)))
         assert {decision["event_key"]["phase"] for decision in decisions} >= {1, 2}
+        assert all(
+            event_key["phase"] in {1, 2}
+            for chunk in chunks
+            for event_key in (
+                [decision["event_key"] for decision in chunk["decisions"]]
+                + [interval for interval in chunk["coverage_intervals"]]
+                + [gap for gap in chunk["gaps"]]
+                + [physical["event_key"] for physical in chunk["physical_events"]]
+            )
+        )
         assert all(chunk["serialized_bytes"] <= 1024 * 1024 for chunk in chunks)
         assert all(
             decision["event_key"]["layer_index"] in chunk["descriptor"]["moe_layer_indices"]
@@ -2408,6 +2418,11 @@ def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
             and event["trace_id"] == response.body["trace_id"]
             for decision in event["decisions"]
         ]
+        mtp_chunks = [
+            event
+            for event in events.body["events"]
+            if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
+        ]
         mtp_decisions = [decision for decision in decisions if decision["event_key"]["phase"] == 3]
         assert mtp_decisions
         assert boundary["sequence"] < min(
@@ -2420,6 +2435,24 @@ def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
         assert all(decision["speculative_pass"]["actual_target_pass"] is not None for decision in mtp_decisions)
         assert all(decision["speculative_pass"]["proposal_position"] is not None for decision in mtp_decisions)
         assert all(isinstance(decision["speculative_pass"]["is_replay_pass"], bool) for decision in mtp_decisions)
+        assert all(
+            event_key["phase"] in {1, 2, 3}
+            for chunk in mtp_chunks
+            for event_key in (
+                [decision["event_key"] for decision in chunk["decisions"]]
+                + [interval for interval in chunk["coverage_intervals"]]
+                + [gap for gap in chunk["gaps"]]
+                + [physical["event_key"] for physical in chunk["physical_events"]]
+            )
+        )
+        assert any(
+            interval["phase"] == 3
+            for chunk in mtp_chunks for interval in chunk["coverage_intervals"]
+        )
+        assert any(
+            physical["event_key"]["phase"] == 3
+            for chunk in mtp_chunks for physical in chunk["physical_events"]
+        )
     finally:
         mtp_server.stop()
 

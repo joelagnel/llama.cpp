@@ -308,11 +308,17 @@ static telemetry_control_state telemetry_control_from_flags(
     };
 }
 
-enum telemetry_moe_token_phase {
-    TELEMETRY_MOE_TOKEN_PHASE_PREFILL_OUTPUT,
-    TELEMETRY_MOE_TOKEN_PHASE_NORMAL_DECODE,
-    TELEMETRY_MOE_TOKEN_PHASE_MTP_VERIFY,
+enum telemetry_moe_token_phase : uint32_t {
+    TELEMETRY_MOE_TOKEN_PHASE_UNKNOWN = 0,
+    TELEMETRY_MOE_TOKEN_PHASE_PREFILL_OUTPUT = 1,
+    TELEMETRY_MOE_TOKEN_PHASE_NORMAL_DECODE = 2,
+    TELEMETRY_MOE_TOKEN_PHASE_MTP_VERIFY = 3,
 };
+
+static_assert(TELEMETRY_MOE_TOKEN_PHASE_UNKNOWN == 0);
+static_assert(TELEMETRY_MOE_TOKEN_PHASE_PREFILL_OUTPUT == 1);
+static_assert(TELEMETRY_MOE_TOKEN_PHASE_NORMAL_DECODE == 2);
+static_assert(TELEMETRY_MOE_TOKEN_PHASE_MTP_VERIFY == 3);
 
 struct telemetry_moe_token_activation_record {
     llama_pos model_position = -1;
@@ -6815,17 +6821,17 @@ private:
             const server_batch::token & token,
             const server_slot & slot) {
         if (graph_type == LLM_GRAPH_TYPE_DECODER_MTP) {
-            return 3; // MtpVerify
+            return TELEMETRY_MOE_TOKEN_PHASE_MTP_VERIFY;
         }
         if (graph_type == LLM_GRAPH_TYPE_ENCODER) {
-            return 1; // PrefillOutput
+            return TELEMETRY_MOE_TOKEN_PHASE_PREFILL_OUTPUT;
         }
         if (token.is_prompt) {
-            return 1; // PrefillOutput
+            return TELEMETRY_MOE_TOKEN_PHASE_PREFILL_OUTPUT;
         }
         return slot.can_speculate() && !slot.spec_draft.empty()
-            ? 3 // MtpVerify
-            : 2; // NormalDecode
+            ? TELEMETRY_MOE_TOKEN_PHASE_MTP_VERIFY
+            : TELEMETRY_MOE_TOKEN_PHASE_NORMAL_DECODE;
     }
 
     static const char * telemetry_moe_graph_type_name(uint32_t graph_type) {
@@ -7433,7 +7439,7 @@ private:
         };
 
         const auto speculative_pass = [&](const trace_record & record, const server_slot & slot) {
-            if (record.event.phase != 3) {
+            if (record.event.phase != TELEMETRY_MOE_TOKEN_PHASE_MTP_VERIFY) {
                 return json(nullptr);
             }
             return json {
