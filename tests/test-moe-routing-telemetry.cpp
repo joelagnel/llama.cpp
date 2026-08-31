@@ -295,7 +295,9 @@ static void test_streamed_native_dispatch_loss_finalization(testing & t) {
         t.assert_equal("moe_routing_chunk", event.at("event").get<std::string>());
         t.assert_true(event.at("serialized_bytes").get<uint64_t>() <= cap);
         t.assert_equal(1U, event.at("availability").get<uint32_t>());
-        t.assert_true(!event.contains("chunk_capacity_state"));
+        t.assert_true(event.contains("descriptor"));
+        t.assert_equal("server_process_monotonic_microseconds",
+            event.at("clock").at("clock_domain").get<std::string>());
         if (event.value("is_final_for_trace", false)) {
             ++final_marker_count;
             final_seen = true;
@@ -333,6 +335,97 @@ static void test_streamed_native_dispatch_loss_finalization(testing & t) {
     t.assert_equal(1ULL, saturation_count);
     t.assert_equal(1ULL, final_marker_count);
 }
+
+static void test_native_dispatch_loss_timeline(testing & t) {
+    const json timeline = server_test_moe_dispatch_loss_timeline_json();
+    const uint64_t cap = timeline.at("chunk_limit_bytes").get<uint64_t>();
+    const json & events = timeline.at("events");
+    t.assert_equal(4096ULL, cap);
+    t.assert_equal(0ULL, timeline.at("dropped_events").get<uint64_t>());
+
+    uint64_t expected_gap_step = 1;
+    std::vector<uint64_t> span_steps;
+    uint64_t control_boundaries = 0;
+    bool saw_first_boundary = false;
+    bool saw_second_boundary = false;
+    bool saw_routed_span = false;
+    bool saw_saturation = false;
+    bool saw_saturation_before_next_boundary = false;
+    for (const json & event : events) {
+        const std::string kind = event.at("event").get<std::string>();
+        if (kind == "telemetry_control_boundary") {
+            ++control_boundaries;
+            const uint64_t step = event.at("physical_step").get<uint64_t>();
+            if (step == 256) {
+                saw_first_boundary = true;
+            }
+            if (step == 259) {
+                saw_second_boundary = true;
+            }
+            if (step == 260) {
+                saw_saturation_before_next_boundary = saw_saturation;
+            }
+            continue;
+        }
+        t.assert_equal("moe_routing_chunk", kind);
+        t.assert_equal(3U, event.at("schema_version").get<uint32_t>());
+        t.assert_true(event.at("serialized_bytes").get<uint64_t>() <= cap);
+        t.assert_true(event.contains("descriptor"));
+        t.assert_equal("server_process_monotonic_microseconds",
+            event.at("clock").at("clock_domain").get<std::string>());
+        for (const json & gap : event.at("gaps")) {
+            const uint64_t first_step = gap.at("first_physical_step").get<uint64_t>();
+            const uint64_t next_step = gap.at("next_physical_step").get<uint64_t>();
+            if (gap.at("saturation").get<bool>()) {
+                t.assert_equal(258ULL, first_step);
+                t.assert_equal(260ULL, next_step);
+                t.assert_true(saw_second_boundary);
+                t.assert_equal(2U, (uint32_t) span_steps.size());
+                if (span_steps.size() == 2) {
+                    t.assert_equal(256ULL, span_steps[0]);
+                    t.assert_equal(257ULL, span_steps[1]);
+                }
+                saw_saturation = true;
+            } else {
+                t.assert_true(!saw_saturation);
+                t.assert_true(!saw_routed_span);
+                t.assert_equal(expected_gap_step, first_step);
+                t.assert_equal(expected_gap_step + 1, next_step);
+                ++expected_gap_step;
+            }
+        }
+        for (const json & decision : event.value("decisions", json::array())) {
+            t.assert_true(!saw_saturation);
+            t.assert_true(saw_first_boundary);
+            t.assert_equal(256ULL, expected_gap_step);
+            saw_routed_span = true;
+            span_steps.push_back(decision.at("event_key").at("physical_step").get<uint64_t>());
+        }
+    }
+    t.assert_equal(256ULL, expected_gap_step);
+    t.assert_equal(3ULL, control_boundaries);
+    t.assert_equal(2U, (uint32_t) span_steps.size());
+    t.assert_true(saw_saturation);
+    t.assert_true(saw_saturation_before_next_boundary);
+}
+
+static void test_native_dispatch_loss_small_cap_fails_closed(testing & t) {
+    const json result = server_test_moe_dispatch_loss_small_cap_json();
+    const json & events = result.at("events");
+    t.assert_equal(1024ULL, result.at("chunk_limit_bytes").get<uint64_t>());
+    t.assert_equal(1U, (uint32_t) events.size());
+    const json & event = events.at(0);
+    t.assert_equal("telemetry_dispatch_queue_loss", event.at("event").get<std::string>());
+    t.assert_equal("exact_unavailable", event.at("routing_coverage_state").get<std::string>());
+    t.assert_equal("target", event.at("physical_context").get<std::string>());
+    t.assert_equal(1U, (uint32_t) event.at("losses").size());
+    const json & loss = event.at("losses").at(0);
+    t.assert_equal("moe_routing_span", loss.at("kind").get<std::string>());
+    t.assert_equal(1ULL, loss.at("first_physical_step").get<uint64_t>());
+    t.assert_equal(2ULL, loss.at("next_physical_step").get<uint64_t>());
+    t.assert_equal("target", loss.at("physical_context").get<std::string>());
+    t.assert_equal("decode", loss.at("operation").get<std::string>());
+}
 #endif
 
 #if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
@@ -363,6 +456,8 @@ int main() {
 #if defined(LLAMA_SERVER_TEST_HOOKS)
     t.test("saturated native dispatch loss serialization", test_saturated_native_dispatch_loss_serialization);
     t.test("streamed native dispatch loss finalization", test_streamed_native_dispatch_loss_finalization);
+    t.test("native dispatch loss timeline", test_native_dispatch_loss_timeline);
+    t.test("native dispatch loss small cap fails closed", test_native_dispatch_loss_small_cap_fails_closed);
 #endif
 #if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
     t.test("router child API key file security", test_router_child_api_key_file_security);
