@@ -276,6 +276,63 @@ static void test_saturated_native_dispatch_loss_serialization(testing & t) {
     t.assert_equal(288ULL, chunk.at("gaps").at(1).at("first_physical_step").get<uint64_t>());
     t.assert_equal(311ULL, chunk.at("gaps").at(1).at("next_physical_step").get<uint64_t>());
 }
+
+static void test_streamed_native_dispatch_loss_finalization(testing & t) {
+    const json stream = server_test_moe_dispatch_loss_stream_finalization_json();
+    const uint64_t cap = stream.at("chunk_limit_bytes").get<uint64_t>();
+    const json & events = stream.at("events");
+    t.assert_equal(4096ULL, cap);
+    t.assert_equal(0ULL, stream.at("dropped_events").get<uint64_t>());
+    t.assert_true(events.size() > 2);
+
+    uint64_t expected_first_step = 1;
+    uint64_t exact_gap_count = 0;
+    uint64_t saturation_count = 0;
+    uint64_t final_marker_count = 0;
+    bool final_seen = false;
+    for (const json & event : events) {
+        t.assert_equal(3U, event.at("schema_version").get<uint32_t>());
+        t.assert_equal("moe_routing_chunk", event.at("event").get<std::string>());
+        t.assert_true(event.at("serialized_bytes").get<uint64_t>() <= cap);
+        t.assert_equal(1U, event.at("availability").get<uint32_t>());
+        t.assert_true(!event.contains("chunk_capacity_state"));
+        if (event.value("is_final_for_trace", false)) {
+            ++final_marker_count;
+            final_seen = true;
+            t.assert_true(!event.contains("gaps") || event.at("gaps").empty());
+            continue;
+        }
+        t.assert_true(!final_seen);
+        const json & gaps = event.at("gaps");
+        t.assert_true(!gaps.empty());
+        for (const json & gap : gaps) {
+            t.assert_equal(expected_first_step, gap.at("first_physical_step").get<uint64_t>());
+            const uint64_t next_step = gap.at("next_physical_step").get<uint64_t>();
+            t.assert_true(next_step > expected_first_step);
+            t.assert_equal("target", gap.at("physical_context").get<std::string>());
+            t.assert_equal("decode", gap.at("operation").get<std::string>());
+            t.assert_equal(1U, event.at("availability").get<uint32_t>());
+            if (exact_gap_count < 255) {
+                t.assert_equal(expected_first_step + 1, next_step);
+                t.assert_equal("detailed_exact", gap.at("loss_descriptor_state").get<std::string>());
+                t.assert_true(!gap.at("saturation").get<bool>());
+            } else {
+                t.assert_equal(256ULL, expected_first_step);
+                t.assert_equal(280ULL, next_step);
+                t.assert_equal(24ULL, gap.at("physical_dispatch_count").get<uint64_t>());
+                t.assert_equal("saturated_exact", gap.at("loss_descriptor_state").get<std::string>());
+                t.assert_true(gap.at("saturation").get<bool>());
+                ++saturation_count;
+            }
+            ++exact_gap_count;
+            expected_first_step = next_step;
+        }
+    }
+    t.assert_equal(256ULL, exact_gap_count);
+    t.assert_equal(280ULL, expected_first_step);
+    t.assert_equal(1ULL, saturation_count);
+    t.assert_equal(1ULL, final_marker_count);
+}
 #endif
 
 #if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
@@ -305,6 +362,7 @@ int main() {
     t.test("finalization loss combines event and pending", test_finalization_loss_combines_event_and_pending);
 #if defined(LLAMA_SERVER_TEST_HOOKS)
     t.test("saturated native dispatch loss serialization", test_saturated_native_dispatch_loss_serialization);
+    t.test("streamed native dispatch loss finalization", test_streamed_native_dispatch_loss_finalization);
 #endif
 #if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
     t.test("router child API key file security", test_router_child_api_key_file_security);

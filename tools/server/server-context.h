@@ -115,6 +115,7 @@ struct server_context {
 #ifdef LLAMA_SERVER_TEST_HOOKS
 json server_test_moe_dispatch_saturation_gap_json();
 json server_test_moe_dispatch_saturation_chunk_json();
+json server_test_moe_dispatch_loss_stream_finalization_json();
 #endif
 
 
