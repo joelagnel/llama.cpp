@@ -2,18 +2,21 @@
 
 The private-fork telemetry API exposes bounded, local inference events and low-cardinality aggregate metrics. It is independent of the Prometheus endpoint and is available without `--metrics`.
 
-On Windows, run `build-telemetry.ps1` from the repository root to configure and build a native x64 or ARM64 Release server. CUDA is enabled automatically when `nvcc.exe` is available; use `-Cuda On` to require it or `-Cuda Off` for a CPU build. Windows ARM64 uses `clang-cl` for llama.cpp's ARM CPU backend and the Visual Studio ARM64 compiler as nvcc's host compiler. Pass `-LlvmPath` when LLVM is not installed in a standard location and `-CudaArchitecture 121` for an RTX Spark/compute 12.1 build. `run-llama-telemetry.ps1` starts the matching native build with model, context, batching, speculative/MTP, Prometheus, and content-policy options.
+On Windows, run `build-telemetry.ps1` from the repository root to configure and build a native x64 or ARM64 Release server. CUDA is enabled automatically when `nvcc.exe` is available; use `-Cuda On` to require it or `-Cuda Off` for a CPU build. Windows ARM64 uses `clang-cl` for llama.cpp's ARM CPU backend and the Visual Studio ARM64 compiler as nvcc's host compiler. Pass `-LlvmPath` when LLVM is not installed in a standard location and `-CudaArchitecture 121` for an RTX Spark/compute 12.1 build. `run-llama-telemetry.ps1` starts the matching native build with model, context, batching, speculative/MTP, Prometheus, and authenticated telemetry-control options.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-telemetry.ps1 -Cuda Auto
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-telemetry.ps1 `
   -Architecture ARM64 -Cuda On -CudaArchitecture 121
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-llama-telemetry.ps1 `
-  -ModelPath C:\models\model.gguf -Port 8080 -ContextLength 8192 `
+  -ModelPath C:\models\model.gguf -ApiKeyFile C:\secure\llama-server.key `
+  -Port 8080 -ContextLength 8192 `
   -GpuLayers all -ParallelSlots 4 -BatchSize 2048 -UBatchSize 512
 ```
 
-Use `-SpecType` with `-SpecModelPath` for a draft backend, or `-MtpModelPath` to select `draft-mtp`. Add `-ContentLogging` only when local prompt and response retention is intended. `-Background` starts a hidden process and waits for `/health`.
+`-ApiKeyFile` is required. It must be an absolute existing local file owned by the current Windows user with a protected ACL containing exactly current user, `SYSTEM`, and `BUILTIN\Administrators` full-control rules. The launcher verifies only its path and ACL: it never reads, prints, hashes, or places the key value in a URI or command line. It starts llama-server with the protected `--api-key-file` path and `--props`; the launcher rejects non-loopback hosts and extra arguments that could override `--host`, `--api-key-file`, or `--props`.
+
+Use `-SpecType` with `-SpecModelPath` for a draft backend, or `-MtpModelPath` to select `draft-mtp`. `-Background` starts a hidden process and waits for `/health`. `-ContentLogging` is deprecated and fails closed. Content retention and every optional producer are controlled only by authenticated `POST /props` from LlamaScope; inherited telemetry activation variables are cleared before launch. Buffer and cap variables remain available for bounded retention tuning.
 
 ## Endpoints
 
