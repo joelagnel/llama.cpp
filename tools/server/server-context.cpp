@@ -6308,6 +6308,16 @@ private:
             && slot.task->params.moe_routing_telemetry_permitted;
     }
 
+    void telemetry_prepare_moe_storage(server_slot & slot) {
+        const size_t histogram_size = (size_t) llama_model_n_layer(model_tgt)*(size_t) llama_model_n_expert(model_tgt);
+        if (slot.telemetry_moe_expert_activations.size() != histogram_size) {
+            slot.telemetry_moe_expert_activations.assign(histogram_size, 0);
+        }
+        if (slot.telemetry_moe_token_activations.capacity() == 0) {
+            slot.telemetry_moe_token_activations.reserve(telemetry_moe_activation_limit);
+        }
+    }
+
     void telemetry_record_moe_routing(
             const telemetry_moe_routing_readback_capture & readback,
             int32_t batch_offset,
@@ -6366,10 +6376,7 @@ private:
                 continue;
             }
 
-            const size_t histogram_size = (size_t) model_layers*(size_t) configured_experts;
-            if (slot.telemetry_moe_expert_activations.size() != histogram_size) {
-                slot.telemetry_moe_expert_activations.assign(histogram_size, 0);
-            }
+            telemetry_prepare_moe_storage(slot);
             const size_t histogram_index = (size_t) entry.layer_index*(size_t) configured_experts
                 + (size_t) entry.expert_index;
             slot.telemetry_moe_expert_activations[histogram_index]++;
@@ -7549,11 +7556,6 @@ private:
         if (telemetry_token_candidate_request_enabled(slot)) {
             slot.telemetry_token_candidate_decisions.reserve(
                 std::min<size_t>(telemetry_token_candidate_decision_limit, 64));
-        }
-        if (telemetry_moe_request_enabled(slot)) {
-            slot.telemetry_moe_expert_activations.assign(
-                (size_t) llama_model_n_layer(model_tgt)*(size_t) llama_model_n_expert(model_tgt), 0);
-            slot.telemetry_moe_token_activations.reserve(telemetry_moe_activation_limit);
         }
         telemetry_append({
             {"event", "request_started"},

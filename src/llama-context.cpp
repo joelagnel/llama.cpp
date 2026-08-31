@@ -2600,7 +2600,15 @@ void llama_context::extract_moe_routing(
 
     for (const auto & output : outputs) {
         if (moe_routing_capture_count == moe_routing_captures.size()) {
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+            const size_t capture_capacity = moe_routing_captures.capacity();
+#endif
             moe_routing_captures.emplace_back();
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+            if (moe_routing_captures.capacity() > capture_capacity) {
+                ++moe_routing_test_observer.capture_slot_allocations;
+            }
+#endif
         }
 
         auto & capture = moe_routing_captures[moe_routing_capture_count++];

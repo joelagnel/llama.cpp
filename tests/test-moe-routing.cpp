@@ -32,7 +32,7 @@ static bool expect_empty_moe_routing_observer(llama_context * ctx, const char * 
     const auto observer = llama_moe_routing_test_observer_get(ctx);
     if (observer.enabled || observer.reserve_pending || observer.graph_reserve_invalidations != 0 ||
             observer.graph_reserves != 0 || observer.graph_output_extractions != 0 ||
-            observer.readback_allocations != 0 || observer.readback_copies != 0 ||
+            observer.capture_slot_allocations != 0 || observer.readback_allocations != 0 || observer.readback_copies != 0 ||
             observer.synchronizations != 0 || observer.batch_peer_reads != 0) {
         fprintf(stderr, "%s: unexpected MoE work in %s\n", __func__, phase);
         return false;
@@ -49,7 +49,7 @@ static bool expect_empty_moe_routing_observer(llama_context * ctx, const char * 
 static bool expect_enabled_moe_routing_observer(llama_context * ctx) {
     const auto observer = llama_moe_routing_test_observer_get(ctx);
     if (!observer.enabled || observer.reserve_pending || observer.graph_reserves == 0 ||
-            observer.graph_output_extractions == 0 || observer.readback_allocations == 0 ||
+            observer.graph_output_extractions == 0 || observer.capture_slot_allocations == 0 || observer.readback_allocations == 0 ||
             observer.readback_copies == 0 || observer.synchronizations == 0 ||
             observer.batch_peer_reads == 0) {
         fprintf(stderr, "%s: missing enabled MoE work\n", __func__);

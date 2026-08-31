@@ -207,6 +207,7 @@ struct llama_moe_routing_test_observer {
     uint64_t graph_reserve_invalidations = 0;
     uint64_t graph_reserves = 0;
     uint64_t graph_output_extractions = 0;
+    uint64_t capture_slot_allocations = 0;
     uint64_t readback_allocations = 0;
     uint64_t readback_copies = 0;
     uint64_t device_to_host_copies = 0;
