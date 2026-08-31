@@ -124,6 +124,40 @@ def test_props_telemetry_control_replaces_state_and_resets_on_restart():
     assert all(value is False for value in reset["effective"].values())
 
 
+def test_rejected_props_writes_leave_the_control_snapshot_unchanged():
+    server = _controlled_server()
+    server.start()
+
+    enabled = server.make_request(
+        "POST",
+        "/props",
+        data={"telemetry_control": {"output_token_detail": True}},
+        headers=AUTH,
+    )
+    assert enabled.status_code == 200
+    expected = _snapshot(server)
+    assert expected["generation"] == 1
+
+    rejected_bodies = (
+        {},
+        {"telemetry_control": []},
+        {"telemetry_control": {"output_token_detail": "true"}},
+        {"telemetry_control": {"unknown_control": True}},
+    )
+    for body in rejected_bodies:
+        rejected = server.make_request("POST", "/props", data=body, headers=AUTH)
+        assert rejected.status_code == 400
+        assert _snapshot(server) == expected
+
+    unauthorized = server.make_request(
+        "POST",
+        "/props",
+        data={"telemetry_control": {}},
+    )
+    assert unauthorized.status_code == 401
+    assert _snapshot(server) == expected
+
+
 def test_request_and_environment_values_cannot_enable_global_control():
     server = _controlled_server()
     server.extra_env = {
@@ -193,6 +227,170 @@ def test_request_and_environment_values_cannot_enable_global_control():
         "reason": "content_logging_disabled",
     }
     assert "response" not in event
+
+
+def test_all_request_opt_ins_are_inert_until_props_enables_their_controls():
+    server = ServerPreset.stories15m_moe()
+    server.server_props = True
+    server.api_key = API_KEY
+    server.n_batch = 4
+    server.n_ubatch = 2
+    server.start()
+
+    try:
+        request_opt_ins = {
+            "moe_routing_telemetry": True,
+            "output_token_telemetry": True,
+            "output_token_candidate_telemetry": True,
+            "prompt_perplexity": True,
+            "request_content": True,
+        }
+        disabled = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": "Request booleans cannot bypass disabled telemetry controls.",
+                "n_predict": 1,
+                **request_opt_ins,
+            },
+            headers=AUTH,
+        )
+        assert disabled.status_code == 200
+        disabled_event = _completed_event(server, disabled.body["trace_id"])
+        assert disabled_event["moe_routing"]["state"] == "not_enabled_for_request"
+        assert disabled_event["output_token_telemetry"]["state"] == "not_enabled_for_request"
+        assert disabled_event["prompt_probability"]["state"] == "disabled"
+        assert disabled_event["request"] == {
+            "content_omitted": True,
+            "reason": "content_logging_disabled",
+        }
+        assert not any(
+            event["event"] == "moe_routing_chunk" and event["trace_id"] == disabled.body["trace_id"]
+            for event in _telemetry_events(server)
+        )
+
+        enabled = server.make_request(
+            "POST",
+            "/props",
+            data={
+                "telemetry_control": {
+                    "moe_routing": True,
+                    "output_token_detail": True,
+                    "token_candidates": True,
+                    "prompt_perplexity": True,
+                    "request_content": True,
+                },
+            },
+            headers=AUTH,
+        )
+        assert enabled.status_code == 200
+
+        opted_out = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": "Explicit false remains an opt out for every request feature.",
+                "n_predict": 1,
+                **{name: False for name in request_opt_ins},
+            },
+            headers=AUTH,
+        )
+        assert opted_out.status_code == 200
+        opted_out_event = _completed_event(server, opted_out.body["trace_id"])
+        assert opted_out_event["moe_routing"]["state"] == "not_enabled_for_request"
+        assert opted_out_event["output_token_telemetry"]["state"] == "not_enabled_for_request"
+        assert opted_out_event["prompt_probability"]["state"] == "disabled"
+        assert opted_out_event["request"] == {
+            "content_omitted": True,
+            "reason": "content_logging_disabled",
+        }
+        assert not any(
+            event["event"] == "moe_routing_chunk" and event["trace_id"] == opted_out.body["trace_id"]
+            for event in _telemetry_events(server)
+        )
+    finally:
+        server.stop()
+
+
+def test_moe_event_ring_overrun_reports_exact_transport_gaps():
+    server = ServerPreset.stories15m_moe()
+    server.server_props = True
+    server.api_key = API_KEY
+    server.n_batch = 4
+    server.n_ubatch = 2
+    server.extra_env = {"LLAMA_TELEMETRY_EVENT_BUFFER_MIB": "1"}
+    server.start()
+
+    try:
+        enabled = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"moe_routing": True, "request_content": True}},
+            headers=AUTH,
+        )
+        assert enabled.status_code == 200
+
+        lost = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": "The event ring must report when this routing trace is no longer retained.",
+                "n_predict": 1,
+            },
+            headers=AUTH,
+        )
+        assert lost.status_code == 200
+        assert any(
+            event["event"] == "moe_routing_chunk" and event["trace_id"] == lost.body["trace_id"]
+            for event in _telemetry_events(server)
+        )
+
+        for ordinal in range(2):
+            filler = server.make_request(
+                "POST",
+                "/completion",
+                data={
+                    "prompt": f"filler request {ordinal}",
+                    "n_predict": 1,
+                    "moe_routing_telemetry": False,
+                    "unused_payload": "x" * 600_000,
+                },
+                headers=AUTH,
+            )
+            assert filler.status_code == 200
+
+        retained = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": "A retained routing trace follows the observable event-ring gap.",
+                "n_predict": 1,
+            },
+            headers=AUTH,
+        )
+        assert retained.status_code == 200
+
+        events = server.make_request(
+            "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=AUTH
+        )
+        assert events.status_code == 200
+        body = events.body
+        assert body["gap"] is True
+        assert body["dropped_events"] > 0
+        assert body["last_dropped_sequence"] == body["oldest_sequence"] - 1
+        assert body["gap_ranges"] == [{
+            "first_sequence": 1,
+            "last_sequence": body["oldest_sequence"] - 1,
+        }]
+        assert body["dropped_events"] == body["oldest_sequence"] - 1
+        assert all(event["sequence"] >= body["oldest_sequence"] for event in body["events"])
+        assert not any(event["trace_id"] == lost.body["trace_id"] for event in body["events"])
+        assert any(
+            event["event"] == "moe_routing_chunk" and event["trace_id"] == retained.body["trace_id"]
+            for event in body["events"]
+        )
+    finally:
+        server.stop()
 
 
 def test_dense_model_never_emits_moe_routing_chunks():
