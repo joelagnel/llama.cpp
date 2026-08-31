@@ -88,6 +88,14 @@ static void test_serialization_loss_counts_pending_and_incoming(testing & t) {
     t.assert_equal(10ULL, lost_population);
 }
 
+static void test_finalization_loss_combines_event_and_pending(testing & t) {
+    uint64_t unlocated_rows = 11;
+    t.assert_true(server_moe_routing_add_lost_population(7, unlocated_rows));
+    t.assert_equal(18ULL, unlocated_rows);
+    t.assert_true(!server_moe_routing_add_lost_population(std::numeric_limits<uint64_t>::max(), unlocated_rows));
+    t.assert_equal(18ULL, unlocated_rows);
+}
+
 int main() {
     testing t;
 
@@ -97,6 +105,7 @@ int main() {
     t.test("cap and invalid records remain distinct", test_cap_and_invalid_records_remain_distinct);
     t.test("producer coverage requires valid linked rows", test_producer_coverage_requires_valid_linked_rows);
     t.test("serialization loss counts pending and incoming", test_serialization_loss_counts_pending_and_incoming);
+    t.test("finalization loss combines event and pending", test_finalization_loss_combines_event_and_pending);
 
     return t.summary();
 }
