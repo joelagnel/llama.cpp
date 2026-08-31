@@ -2132,7 +2132,6 @@ def test_moe_routing_chunk_byte_cap_splits_canonical_envelopes(monkeypatch):
             gap["cause"] == 8
             for chunk in chunks for gap in chunk["gaps"]
         )
-    finally:
         for chunk in chunks:
             represented = sorted(
                 [decision["sequence"] for decision in chunk["decisions"]]
@@ -2140,10 +2139,10 @@ def test_moe_routing_chunk_byte_cap_splits_canonical_envelopes(monkeypatch):
                 + [sequence for gap in chunk["gaps"] for sequence in range(gap["first_sequence"], gap["next_sequence"])]
             )
             assert represented == list(range(chunk["first_sequence"], chunk["next_sequence"]))
+    finally:
         server.stop()
 
 
-def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
 def test_moe_routing_chunks_pack_large_prefill_near_byte_cap():
     global server
 
@@ -2205,6 +2204,7 @@ def test_moe_routing_chunks_pack_large_prefill_near_byte_cap():
         server.stop()
 
 
+def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
     api_key = "moe-routing-mtp-test-key"
     auth = {"Authorization": f"Bearer {api_key}"}
     mtp_server = ServerPreset.stories15m_moe()
