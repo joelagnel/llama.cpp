@@ -80,6 +80,14 @@ static void test_producer_coverage_requires_valid_linked_rows(testing & t) {
     t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, false, true));
 }
 
+static void test_serialization_loss_counts_pending_and_incoming(testing & t) {
+    uint64_t lost_population = 3;
+    t.assert_true(server_moe_routing_add_lost_population(7, lost_population));
+    t.assert_equal(10ULL, lost_population);
+    t.assert_true(!server_moe_routing_add_lost_population(std::numeric_limits<uint64_t>::max(), lost_population));
+    t.assert_equal(10ULL, lost_population);
+}
+
 int main() {
     testing t;
 
@@ -88,6 +96,7 @@ int main() {
     t.test("cap truncation", test_cap_truncation);
     t.test("cap and invalid records remain distinct", test_cap_and_invalid_records_remain_distinct);
     t.test("producer coverage requires valid linked rows", test_producer_coverage_requires_valid_linked_rows);
+    t.test("serialization loss counts pending and incoming", test_serialization_loss_counts_pending_and_incoming);
 
     return t.summary();
 }

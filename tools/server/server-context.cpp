@@ -540,7 +540,6 @@ struct server_slot {
     bool telemetry_moe_chunk_capture_started = false;
     bool telemetry_moe_chunk_capture_interrupted = false;
     bool telemetry_moe_chunk_source_unavailable = false;
-    bool telemetry_moe_chunk_serialization_dropped = false;
     json telemetry_moe_pending_chunk;
 
     bool has_next_token = true;
@@ -693,7 +692,6 @@ struct server_slot {
         telemetry_moe_chunk_capture_started = false;
         telemetry_moe_chunk_capture_interrupted = false;
         telemetry_moe_chunk_source_unavailable = false;
-        telemetry_moe_chunk_serialization_dropped = false;
         telemetry_moe_pending_chunk = json();
         json_schema = json();
 
@@ -6137,7 +6135,7 @@ private:
         };
     }
 
-    bool telemetry_moe_chunk_can_be_finalized(const json & event) const {
+    size_t telemetry_moe_chunk_finalized_size(json event) const {
         // The one pending chunk becomes the substantive final chunk. Reserve
         // the bounded, coordinate-free interruption evidence it may need at
         // completion; never replace an oversized substantive chunk with an
@@ -6147,10 +6145,15 @@ private:
         final_event["availability"] = 1;
         final_event["reason"] = "The request ended after routing capture lost an interval without complete routing coordinates.";
         final_event["unlocated_coverage_loss"] = {
-            {"count", 65536},
+            {"count", std::numeric_limits<uint64_t>::max()},
             {"reason", "Routing capture ended after an unavailable native or control-boundary interval."},
         };
-        return telemetry_moe_chunk_fits_limit(final_event);
+        return telemetry_serialize_moe_routing_chunk(
+            std::move(final_event), std::numeric_limits<uint64_t>::max()).size();
+    }
+
+    bool telemetry_moe_chunk_can_be_finalized(const json & event) const {
+        return telemetry_moe_chunk_finalized_size(event) <= telemetry_moe_chunk_limit_bytes();
     }
 
     bool telemetry_append_moe_routing_chunk(json event) {
@@ -6175,11 +6178,53 @@ private:
         return true;
     }
 
+    static uint64_t telemetry_moe_chunk_population_count(const json & event) {
+        uint64_t result = 0;
+        const auto add = [&](uint64_t count) {
+            GGML_ASSERT(count <= std::numeric_limits<uint64_t>::max() - result);
+            result += count;
+        };
+        const auto add_array_size = [&](const char * name) {
+            if (event.contains(name) && event.at(name).is_array()) {
+                add((uint64_t) event.at(name).size());
+            }
+        };
+
+        add_array_size("decisions");
+        add_array_size("invalid_records");
+        if (event.contains("gaps") && event.at("gaps").is_array()) {
+            for (const json & gap : event.at("gaps")) {
+                if (!gap.contains("first_sequence") || !gap.contains("next_sequence")) {
+                    continue;
+                }
+                const uint64_t first = gap.at("first_sequence").get<uint64_t>();
+                const uint64_t next = gap.at("next_sequence").get<uint64_t>();
+                if (next > first) {
+                    add(next - first);
+                }
+            }
+        }
+        if (event.contains("unlocated_coverage_loss")) {
+            const json & loss = event.at("unlocated_coverage_loss");
+            if (loss.contains("count") && loss.at("count").is_number_integer()) {
+                add(loss.at("count").get<uint64_t>());
+            }
+        }
+        return result;
+    }
+
     void telemetry_queue_moe_routing_chunk(server_slot & slot, json event) {
         GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(event));
         if (!telemetry_flush_moe_pending_chunk(slot)) {
-            slot.telemetry_moe_chunk_serialization_dropped = true;
-            ++slot.telemetry_moe_chunk_unlocated_pending;
+            const uint64_t pending_population = telemetry_moe_chunk_population_count(slot.telemetry_moe_pending_chunk);
+            const uint64_t incoming_population = telemetry_moe_chunk_population_count(event);
+            uint64_t lost_population = pending_population;
+            GGML_ASSERT(server_moe_routing_add_lost_population(incoming_population, lost_population));
+            GGML_ASSERT(server_moe_routing_add_lost_population(
+                lost_population, slot.telemetry_moe_chunk_unlocated_pending));
+            GGML_ASSERT(server_moe_routing_add_lost_population(
+                lost_population, slot.telemetry_moe_chunk_unlocated_rows));
+            slot.telemetry_moe_pending_chunk = json();
             return;
         }
         slot.telemetry_moe_pending_chunk = std::move(event);
@@ -6509,7 +6554,7 @@ private:
             }
             if (unlocated_rows > 0) {
                 event["unlocated_coverage_loss"] = {
-                    {"count", std::min<uint64_t>(unlocated_rows, 65536)},
+                    {"count", unlocated_rows},
                     {"reason", "Native routing rows were lost before complete routing coordinates were available."},
                 };
             }
@@ -6581,22 +6626,20 @@ private:
         if (!slot.task || (!slot.telemetry_moe_chunk_capture_started && !slot.telemetry_moe_chunk_source_unavailable)) {
             return;
         }
-        const uint64_t unlocated_rows = slot.telemetry_moe_chunk_unlocated_pending
-            + (slot.telemetry_moe_chunk_serialization_dropped ? 1 : 0);
+        const uint64_t unlocated_rows = slot.telemetry_moe_chunk_unlocated_pending;
         if (!slot.telemetry_moe_pending_chunk.is_null()) {
             slot.telemetry_moe_pending_chunk["is_final_for_trace"] = true;
             if (unlocated_rows > 0) {
                 slot.telemetry_moe_pending_chunk["availability"] = 1;
                 slot.telemetry_moe_pending_chunk["reason"] = "The request ended after routing capture lost an interval without complete routing coordinates.";
                 slot.telemetry_moe_pending_chunk["unlocated_coverage_loss"] = {
-                    {"count", std::min<uint64_t>(unlocated_rows, 65536)},
+                    {"count", unlocated_rows},
                     {"reason", "Routing capture ended after an unavailable native or control-boundary interval."},
                 };
             }
             slot.telemetry_moe_chunk_unlocated_pending = 0;
-            if (!telemetry_flush_moe_pending_chunk(slot)) {
-                slot.telemetry_moe_chunk_serialization_dropped = true;
-            }
+            GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(slot.telemetry_moe_pending_chunk));
+            GGML_ASSERT(telemetry_flush_moe_pending_chunk(slot));
             return;
         }
 
@@ -6611,11 +6654,20 @@ private:
             {"first_sequence", slot.telemetry_moe_chunk_decision_sequence},
             {"next_sequence", slot.telemetry_moe_chunk_decision_sequence},
             {"is_final_for_trace", true},
-            {"availability", 10},
-            {"reason", "No routable MoE records were retained for this request."},
+            {"availability", unlocated_rows > 0 ? 1 : 10},
+            {"reason", unlocated_rows > 0
+                ? "The request ended after routing capture lost an interval without complete routing coordinates."
+                : "No routable MoE records were retained for this request."},
             {"descriptor", telemetry_moe_routing_descriptor()},
         };
-        telemetry_append_moe_routing_chunk(std::move(marker));
+        if (unlocated_rows > 0) {
+            marker["unlocated_coverage_loss"] = {
+                {"count", unlocated_rows},
+                {"reason", "Routing capture ended after an unavailable native or control-boundary interval."},
+            };
+        }
+        GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(marker));
+        GGML_ASSERT(telemetry_append_moe_routing_chunk(std::move(marker)));
     }
 
     bool telemetry_moe_request_enabled(const server_slot & slot) const {

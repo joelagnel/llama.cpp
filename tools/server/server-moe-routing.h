@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 enum server_moe_routing_capture_result {
     SERVER_MOE_ROUTING_CAPTURED,
@@ -60,6 +61,14 @@ inline bool server_moe_routing_producer_coverage_is_partial(
         bool interrupted,
         bool source_unavailable) {
     return invalid_rows > 0 || unavailable_rows > 0 || unlinked_rows > 0 || unlocated_rows > 0 || interrupted || source_unavailable;
+}
+
+inline bool server_moe_routing_add_lost_population(uint64_t count, uint64_t & total) {
+    if (count > std::numeric_limits<uint64_t>::max() - total) {
+        return false;
+    }
+    total += count;
+    return true;
 }
 
 inline const char * server_moe_routing_capture_state(
