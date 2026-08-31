@@ -11770,6 +11770,12 @@ void server_routes::init_routes() {
         next.request_content = value("request_content");
         next.kv_pressure_detail = value("kv_pressure_detail");
         next.native_gpu_gpm = value("native_gpu_gpm");
+        if (next.token_candidates && !next.output_token_detail) {
+            res->error(format_error_response(
+                "telemetry_control.token_candidates requires telemetry_control.output_token_detail=true",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         const telemetry_control_application application = ctx_server.telemetry_control_apply(next);
         json telemetry_control = ctx_server.telemetry_control_state_json(application.effective);
         telemetry_control["effective_from"] = application.effective_from;

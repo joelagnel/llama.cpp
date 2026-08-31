@@ -173,6 +173,7 @@ def test_rejected_props_writes_leave_the_control_snapshot_unchanged():
         {"telemetry_control": []},
         {"telemetry_control": {"output_token_detail": "true"}},
         {"telemetry_control": {"unknown_control": True}},
+        {"telemetry_control": {"output_token_detail": False, "token_candidates": True}},
     )
     for body in rejected_bodies:
         rejected = server.make_request("POST", "/props", data=body, headers=AUTH)
