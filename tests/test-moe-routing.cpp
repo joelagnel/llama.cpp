@@ -50,7 +50,9 @@ static bool decode_interleaved_prefill(
     const int32_t n_tokens = n_sequences*n_tokens_per_sequence;
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     for (int32_t token = 0; token < n_tokens; ++token) {
-        common_batch_add(batch, first_token + token, token, { token % n_sequences }, true);
+        const int32_t sequence = token % n_sequences;
+        const llama_pos position = sequence*n_tokens_per_sequence + token/n_sequences;
+        common_batch_add(batch, first_token + token, position, { sequence }, true);
     }
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
@@ -289,10 +291,12 @@ static bool test_interleaved_prefill_row_positions(llama_model * model, const co
     std::map<int32_t, std::set<llama_pos>> positions_by_layer;
     for (size_t index = 0; index < readback->row_count; ++index) {
         const llama_moe_routing_row & row = readback->rows[index];
+        const llama_pos expected_position = (row.token_index % n_sequences)*n_tokens_per_sequence
+            + row.token_index/n_sequences;
         if (row.layer_index < 0 || row.physical_ubatch_index != 0 ||
                 row.row_index < 0 || row.ubatch_token_index < 0 || row.token_index < 0 ||
                 row.row_index != row.ubatch_token_index || row.row_index != row.token_index ||
-                row.token_index >= n_tokens || row.position != row.token_index) {
+                row.token_index >= n_tokens || row.position != expected_position) {
             fprintf(stderr, "%s: invalid interleaved prefill identity layer=%d physical=%u row=%d ubatch=%d token=%d position=%d\n",
                     __func__, row.layer_index, row.physical_ubatch_index, row.row_index,
                     row.ubatch_token_index, row.token_index, row.position);
