@@ -89,6 +89,13 @@ using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory
 
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_expert_used(const struct llama_model * model);
+LLAMA_API int32_t llama_model_n_expert_shared(const struct llama_model * model);
+
+// Physical transformer-layer indexes with a routed MoE gate. The indexes are
+// sorted and remain valid for the lifetime of the model.
+LLAMA_API int32_t llama_model_n_moe_layer(const struct llama_model * model);
+LLAMA_API int32_t llama_model_moe_layer_index(const struct llama_model * model, int32_t moe_layer_index);
+
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);

@@ -72,7 +72,12 @@ static bool expect_no_moe_routing(llama_context * ctx) {
     return true;
 }
 
-static bool expect_moe_routing(llama_context * ctx, int32_t n_expert, int32_t n_expert_used, int32_t n_tokens) {
+static bool expect_moe_routing(
+        llama_context * ctx,
+        llama_model * model,
+        int32_t n_expert,
+        int32_t n_expert_used,
+        int32_t n_tokens) {
     const llama_moe_routing_readback * readback = llama_get_moe_routing_readback(ctx);
     if (readback == nullptr || readback->version != LLAMA_MOE_ROUTING_READBACK_VERSION ||
             readback->struct_size < sizeof(*readback) || readback->row_count == 0 || readback->rows == nullptr) {
@@ -81,6 +86,18 @@ static bool expect_moe_routing(llama_context * ctx, int32_t n_expert, int32_t n_
     }
 
     std::map<int32_t, std::set<int32_t>> rows_by_layer;
+    std::set<int32_t> moe_layers;
+    for (int32_t index = 0; index < llama_model_n_moe_layer(model); ++index) {
+        const int32_t layer = llama_model_moe_layer_index(model, index);
+        if (layer < 0 || layer >= llama_model_n_layer(model) || !moe_layers.insert(layer).second) {
+            fprintf(stderr, "%s: invalid MoE layer topology\n", __func__);
+            return false;
+        }
+    }
+    if (moe_layers.empty() || llama_model_moe_layer_index(model, (int32_t) moe_layers.size()) != -1) {
+        fprintf(stderr, "%s: incomplete MoE layer topology\n", __func__);
+        return false;
+    }
     std::set<uint32_t> physical_ubatches;
     std::set<std::pair<int32_t, uint32_t>> shared_metadata;
     for (size_t i = 0; i < readback->shared_expert_count; ++i) {
@@ -118,6 +135,10 @@ static bool expect_moe_routing(llama_context * ctx, int32_t n_expert, int32_t n_
         }
 
         rows_by_layer[row.layer_index].insert(row.token_index);
+        if (moe_layers.count(row.layer_index) == 0) {
+            fprintf(stderr, "%s: routing row outside MoE topology\n", __func__);
+            return false;
+        }
         physical_ubatches.insert(row.physical_ubatch_index);
     }
 
@@ -126,6 +147,10 @@ static bool expect_moe_routing(llama_context * ctx, int32_t n_expert, int32_t n_
             fprintf(stderr, "%s: missing routed rows for layer %d\n", __func__, item.first);
             return false;
         }
+    }
+    if (rows_by_layer.size() != moe_layers.size()) {
+        fprintf(stderr, "%s: incomplete routed MoE topology\n", __func__);
+        return false;
     }
     if (n_tokens > 1 && physical_ubatches.size() < 2) {
         fprintf(stderr, "%s: missing physical microbatch routing rows\n", __func__);
@@ -178,7 +203,8 @@ static llama_context_ptr make_context(llama_model * model, const common_params &
 }
 
 static bool test_dense_model(llama_model * model, const common_params & params) {
-    if (llama_model_n_expert(model) != 0) {
+    if (llama_model_n_expert(model) != 0 || llama_model_n_expert_shared(model) != 0 ||
+            llama_model_n_moe_layer(model) != 0 || llama_model_moe_layer_index(model, 0) != -1) {
         fprintf(stderr, "%s: expected a dense model\n", __func__);
         return false;
     }
@@ -259,7 +285,7 @@ static bool test_moe_model(llama_model * model, const common_params & params) {
         }
     }
     llama_moe_routing_test_observer_reset(ctx.get());
-    if (!decode_many(ctx.get(), 2, 1, 3) || !expect_moe_routing(ctx.get(), n_expert, n_expert_used, 3)) {
+    if (!decode_many(ctx.get(), 2, 1, 3) || !expect_moe_routing(ctx.get(), model, n_expert, n_expert_used, 3)) {
         return false;
     }
     if (!expect_enabled_moe_routing_observer(ctx.get())) {
@@ -278,7 +304,7 @@ static bool test_moe_model(llama_model * model, const common_params & params) {
     }
 
     llama_set_moe_routing(ctx.get(), true);
-    if (!decode_one(ctx.get(), 7, 6) || !expect_moe_routing(ctx.get(), n_expert, n_expert_used, 1)) {
+    if (!decode_one(ctx.get(), 7, 6) || !expect_moe_routing(ctx.get(), model, n_expert, n_expert_used, 1)) {
         return false;
     }
 
