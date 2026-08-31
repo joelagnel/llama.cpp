@@ -386,6 +386,38 @@ def test_props_requires_auth_props_api_key_and_loopback_listener():
     server.start()
     non_loopback = server.make_request("POST", "/props", data={"model": "unused", "telemetry_control": {}}, headers=AUTH)
     assert non_loopback.status_code == 403
+    server.stop()
+
+
+def test_props_uses_the_actual_bound_listener_address():
+    server = _controlled_server()
+    server.server_host = "127.0.0.2"
+    server.start()
+    try:
+        accepted = server.make_request("POST", "/props", data={"telemetry_control": {}}, headers=AUTH)
+        assert accepted.status_code == 200
+    finally:
+        server.stop()
+
+    server = _controlled_server()
+    server.server_host = "localhost"
+    server.request_host = "localhost"
+    server.start()
+    try:
+        accepted = server.make_request("POST", "/props", data={"telemetry_control": {}}, headers=AUTH)
+        assert accepted.status_code == 200
+    finally:
+        server.stop()
+
+    server = _controlled_server()
+    server.server_host = "0.0.0.0"
+    server.request_host = "127.0.0.1"
+    server.start()
+    try:
+        rejected = server.make_request("POST", "/props", data={"telemetry_control": {}}, headers=AUTH)
+        assert rejected.status_code == 403
+    finally:
+        server.stop()
 
 
 def test_router_model_targeted_last_apply_isolated_between_configured_children():

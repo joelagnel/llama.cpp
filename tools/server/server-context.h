@@ -117,7 +117,7 @@ struct server_context {
 struct server_res_generator;
 
 struct server_routes {
-    server_routes(const common_params & params, server_context & ctx_server);
+    server_routes(const common_params & params, server_context & ctx_server, const server_http_context & ctx_http);
 
     void init_routes();
 
@@ -190,6 +190,7 @@ private:
 
     const common_params & params;
     server_context_impl & ctx_server;
+    const server_http_context & ctx_http;
 
     server_queue & queue_tasks;
     server_response & queue_results;

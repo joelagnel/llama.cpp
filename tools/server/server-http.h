@@ -89,6 +89,10 @@ struct server_http_context {
     bool start();
     void stop() const;
 
+    bool telemetry_control_is_loopback_listener() const {
+        return telemetry_control_loopback_listener.load();
+    }
+
     void get(const std::string & path, const handler_t & handler) const;
     void post(const std::string & path, const handler_t & handler) const;
     void del(const std::string & path, const handler_t & handler) const;
@@ -99,4 +103,7 @@ struct server_http_context {
 
     // for debugging
     std::string listening_address;
+
+private:
+    std::atomic<bool> telemetry_control_loopback_listener = false;
 };

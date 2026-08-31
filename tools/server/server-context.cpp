@@ -9510,9 +9510,13 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
     return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
 }
 
-server_routes::server_routes(const common_params & params, server_context & ctx_server)
+server_routes::server_routes(
+        const common_params & params,
+        server_context & ctx_server,
+        const server_http_context & ctx_http)
         : params(params),
           ctx_server(*ctx_server.impl),
+          ctx_http(ctx_http),
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
     init_routes();
@@ -10126,11 +10130,7 @@ void server_routes::init_routes() {
             res->error(format_error_response("Telemetry control requires a configured API key.", ERROR_TYPE_PERMISSION));
             return res;
         }
-        std::string hostname = params.hostname;
-        std::transform(hostname.begin(), hostname.end(), hostname.begin(), [](unsigned char c) {
-            return (char) std::tolower(c);
-        });
-        if (hostname != "127.0.0.1" && hostname != "::1" && hostname != "localhost") {
+        if (!ctx_http.telemetry_control_is_loopback_listener()) {
             res->error(format_error_response("Telemetry control requires a loopback listener.", ERROR_TYPE_PERMISSION));
             return res;
         }

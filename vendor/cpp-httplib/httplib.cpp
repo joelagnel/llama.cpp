@@ -8446,6 +8446,16 @@ int Server::bind_to_any_port(const std::string &host, int socket_flags) {
 
 bool Server::listen_after_bind() { return listen_internal(); }
 
+bool Server::get_bound_address(std::string &ip, int &port) const {
+  const auto sock = svr_sock_.load();
+  if (sock == INVALID_SOCKET) { return false; }
+
+  ip.clear();
+  port = -1;
+  detail::get_local_ip_and_port(sock, ip, port);
+  return !ip.empty() && port >= 0;
+}
+
 bool Server::listen(const std::string &host, int port,
                            int socket_flags) {
   return bind_to_port(host, port, socket_flags) && listen_internal();

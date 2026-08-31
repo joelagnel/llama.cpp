@@ -2238,6 +2238,9 @@ public:
   int bind_to_any_port(const std::string &host, int socket_flags = 0);
   bool listen_after_bind();
 
+  // Returns the numeric address of the currently bound listening socket.
+  bool get_bound_address(std::string &ip, int &port) const;
+
   bool listen(const std::string &host, int port, int socket_flags = 0);
 
   bool is_running() const;

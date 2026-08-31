@@ -87,16 +87,9 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
-static bool telemetry_control_loopback_listener(const std::string & hostname) {
-    std::string value = hostname;
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return (char) std::tolower(c);
-    });
-    return value == "127.0.0.1" || value == "::1" || value == "localhost";
-}
-
 static server_http_res_ptr telemetry_control_router_guard(
         const common_params & params,
+        const server_http_context & ctx_http,
         const server_http_req & req,
         const server_http_context::handler_t & proxy) {
     if (!params.endpoint_props) {
@@ -113,7 +106,7 @@ static server_http_res_ptr telemetry_control_router_guard(
             "Telemetry control requires a configured API key.", ERROR_TYPE_PERMISSION)}});
         return res;
     }
-    if (!telemetry_control_loopback_listener(params.hostname)) {
+    if (!ctx_http.telemetry_control_is_loopback_listener()) {
         auto res = std::make_unique<server_http_res>();
         res->status = 403;
         res->data = safe_json_to_str({{"error", format_error_response(
@@ -231,7 +224,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     // register API routes
     server_child child; // only used in non-router mode
-    server_routes routes(params, ctx_server);
+    server_routes routes(params, ctx_server, ctx_http);
     server_tools tools;
 
     std::optional<server_models_routes> models_routes{};
@@ -254,8 +247,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.get_telemetry_kv            = models_routes->proxy_get;
         routes.get_telemetry_kv_pressure   = models_routes->proxy_get;
         routes.get_telemetry_gpu           = models_routes->proxy_get;
-        routes.post_props                  = [&params, proxy = models_routes->proxy_post](const server_http_req & req) {
-            return telemetry_control_router_guard(params, req, proxy);
+        routes.post_props                  = [&params, &ctx_http, proxy = models_routes->proxy_post](const server_http_req & req) {
+            return telemetry_control_router_guard(params, ctx_http, req, proxy);
         };
         routes.post_completions            = models_routes->proxy_post;
         routes.post_completions_oai        = models_routes->proxy_post;

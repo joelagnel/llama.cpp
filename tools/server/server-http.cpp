@@ -21,6 +21,24 @@ public:
     std::unique_ptr<httplib::Server> srv;
 };
 
+static bool is_loopback_address(const std::string & address) {
+    in_addr address_v4;
+    if (inet_pton(AF_INET, address.c_str(), &address_v4) == 1) {
+        return (ntohl(address_v4.s_addr) & 0xff000000U) == 0x7f000000U;
+    }
+
+    in6_addr address_v6;
+    if (inet_pton(AF_INET6, address.c_str(), &address_v6) != 1) {
+        return false;
+    }
+    for (size_t index = 0; index < 15; ++index) {
+        if (address_v6.s6_addr[index] != 0) {
+            return false;
+        }
+    }
+    return address_v6.s6_addr[15] == 1;
+}
+
 server_http_context::server_http_context()
     : pimpl(std::make_unique<Impl>())
 {}
@@ -431,6 +449,7 @@ bool server_http_context::start() {
     // Bind and listen
 
     const auto & srv = pimpl->srv;
+    telemetry_control_loopback_listener.store(false);
     auto was_bound = false;
     auto is_sock = false;
     if (string_ends_with(std::string(hostname), ".sock")) {
@@ -457,6 +476,17 @@ bool server_http_context::start() {
     if (!was_bound) {
         SRV_ERR("couldn't bind HTTP server socket, hostname: %s, port: %d\n", hostname.c_str(), port);
         return false;
+    }
+
+    if (!is_sock) {
+        // The bound socket is authoritative; a configured hostname can resolve differently.
+        std::string bound_address;
+        int bound_port = -1;
+        if (srv->get_bound_address(bound_address, bound_port)) {
+            telemetry_control_loopback_listener.store(is_loopback_address(bound_address));
+        } else {
+            SRV_WRN("couldn't inspect the bound HTTP listener; telemetry control remains disabled\n");
+        }
     }
 
     // run the HTTP server in a thread
