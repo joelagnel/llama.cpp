@@ -1,5 +1,7 @@
 #pragma once
 
+#include "json.h"
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -90,6 +92,15 @@ inline uint32_t server_moe_routing_chunk_availability(
         bool has_routable_records) {
     return server_moe_routing_chunk_is_partial(coverage) ? 1 : has_routable_records ? 0 : 10;
 }
+
+// Applies the canonical coverage fields emitted by routing chunks and final markers.
+void server_moe_routing_apply_canonical_event_coverage(
+        common_json & event,
+        const server_moe_routing_chunk_coverage & coverage,
+        bool has_routable_records,
+        const char * partial_reason_prefix,
+        const char * unlocated_loss_reason,
+        const char * no_records_reason = nullptr);
 
 inline bool server_moe_routing_add_lost_population(uint64_t count, uint64_t & total) {
     if (count > std::numeric_limits<uint64_t>::max() - total) {

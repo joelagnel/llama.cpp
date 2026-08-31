@@ -1160,6 +1160,65 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // server_context_impl (private implementation)
 //
 
+static std::string server_moe_routing_partial_reason(
+        const server_moe_routing_chunk_coverage & coverage,
+        const char * prefix) {
+    std::string result = prefix;
+    bool first = true;
+    const auto append = [&](const char * cause) {
+        result += first ? " " : "; ";
+        result += cause;
+        first = false;
+    };
+    if (coverage.invalid_rows > 0) {
+        append("invalid router rows");
+    }
+    if (coverage.unavailable_rows > 0) {
+        append("unavailable native routing values");
+    }
+    if (coverage.unlinked_rows > 0) {
+        append("unlinked routing rows");
+    }
+    if (coverage.unlocated_rows > 0) {
+        append("rows lost before complete routing coordinates were retained");
+    }
+    if (coverage.interrupted) {
+        append("routing capture was interrupted");
+    }
+    if (coverage.source_unavailable) {
+        append("the native routing source was unavailable");
+    }
+    if (coverage.attribution_ambiguous) {
+        append("unmappable routing rows could not be attributed to this request");
+    }
+    if (coverage.serialization_gaps) {
+        append("serialized routing records could not be retained");
+    }
+    return result + ".";
+}
+
+void server_moe_routing_apply_canonical_event_coverage(
+        json & event,
+        const server_moe_routing_chunk_coverage & coverage,
+        bool has_routable_records,
+        const char * partial_reason_prefix,
+        const char * unlocated_loss_reason,
+        const char * no_records_reason) {
+    const bool partial = server_moe_routing_chunk_is_partial(coverage);
+    event["availability"] = server_moe_routing_chunk_availability(coverage, has_routable_records);
+    if (partial) {
+        event["reason"] = server_moe_routing_partial_reason(coverage, partial_reason_prefix);
+    } else if (no_records_reason != nullptr) {
+        event["reason"] = no_records_reason;
+    }
+    if (coverage.unlocated_rows > 0) {
+        event["unlocated_coverage_loss"] = {
+            {"count", coverage.unlocated_rows},
+            {"reason", unlocated_loss_reason},
+        };
+    }
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -6058,50 +6117,6 @@ private:
         return false;
     }
 
-    static std::string telemetry_moe_routing_partial_reason(
-            uint64_t invalid_rows,
-            uint64_t unavailable_rows,
-            uint64_t unlinked_rows,
-            uint64_t unlocated_rows,
-            bool interrupted,
-            bool source_unavailable,
-            bool attribution_ambiguous,
-            bool serialization_gaps,
-            const char * prefix) {
-        std::string result = prefix;
-        bool first = true;
-        const auto append = [&](const char * cause) {
-            result += first ? " " : "; ";
-            result += cause;
-            first = false;
-        };
-        if (invalid_rows > 0) {
-            append("invalid router rows");
-        }
-        if (unavailable_rows > 0) {
-            append("unavailable native routing values");
-        }
-        if (unlinked_rows > 0) {
-            append("unlinked routing rows");
-        }
-        if (unlocated_rows > 0) {
-            append("rows lost before complete routing coordinates were retained");
-        }
-        if (interrupted) {
-            append("routing capture was interrupted");
-        }
-        if (source_unavailable) {
-            append("the native routing source was unavailable");
-        }
-        if (attribution_ambiguous) {
-            append("unmappable routing rows could not be attributed to this request");
-        }
-        if (serialization_gaps) {
-            append("serialized routing records could not be retained");
-        }
-        return result + ".";
-    }
-
     size_t telemetry_moe_chunk_limit_bytes() const {
         return std::min(telemetry_moe_chunk_max_bytes, telemetry_event_max_bytes);
     }
@@ -6199,8 +6214,8 @@ private:
         json final_event = event;
         final_event["is_final_for_trace"] = true;
         final_event["availability"] = 1;
-        final_event["reason"] = telemetry_moe_routing_partial_reason(
-            1, 1, 1, 1, true, true, true, true, "The request ended with partial routing coverage:");
+        final_event["reason"] = server_moe_routing_partial_reason(
+            { 1, 1, 1, 1, true, true, true, true }, "The request ended with partial routing coverage:");
         final_event["unlocated_coverage_loss"] = {
             {"count", std::numeric_limits<uint64_t>::max()},
             {"reason", "Routing capture ended after an unavailable native or control-boundary interval."},
@@ -6643,7 +6658,6 @@ private:
                 capture.slot->telemetry_moe_chunk_attribution_ambiguous,
                 !gaps.empty(),
             };
-            const bool partial = server_moe_routing_chunk_is_partial(routing_coverage);
             json event = {
                 {"chunk_id", chunk_id},
                 {"trace_id", trace_id},
@@ -6651,7 +6665,6 @@ private:
                 {"first_sequence", records.empty() ? uint64_t(0) : records.front()->sequence},
                 {"next_sequence", records.empty() ? uint64_t(0) : records.back()->sequence + 1},
                 {"is_final_for_trace", false},
-                {"availability", server_moe_routing_chunk_availability(routing_coverage, !records.empty())},
                 {"descriptor", descriptor},
                 {"coverage_intervals", intervals},
                 {"gaps", gaps},
@@ -6659,24 +6672,10 @@ private:
                 {"physical_events", physical_events},
                 {"decisions", decisions},
             };
-            if (partial) {
-                event["reason"] = telemetry_moe_routing_partial_reason(
-                    routing_coverage.invalid_rows,
-                    routing_coverage.unavailable_rows,
-                    routing_coverage.unlinked_rows,
-                    routing_coverage.unlocated_rows,
-                    routing_coverage.interrupted,
-                    routing_coverage.source_unavailable,
-                    routing_coverage.attribution_ambiguous,
-                    routing_coverage.serialization_gaps,
-                    "The producer retained a partial routing population:");
-            }
-            if (unlocated_rows > 0) {
-                event["unlocated_coverage_loss"] = {
-                    {"count", unlocated_rows},
-                    {"reason", "Routing rows were lost before complete routing coordinates were retained."},
-                };
-            }
+            server_moe_routing_apply_canonical_event_coverage(
+                event, routing_coverage, !records.empty(),
+                "The producer retained a partial routing population:",
+                "Routing rows were lost before complete routing coordinates were retained.");
             return event;
         };
 
@@ -6789,26 +6788,10 @@ private:
                 slot.telemetry_moe_chunk_attribution_ambiguous,
                 false,
             };
-            const bool partial = server_moe_routing_chunk_is_partial(routing_coverage);
-            if (partial) {
-                slot.telemetry_moe_pending_chunk["availability"] = 1;
-                slot.telemetry_moe_pending_chunk["reason"] = telemetry_moe_routing_partial_reason(
-                    routing_coverage.invalid_rows,
-                    routing_coverage.unavailable_rows,
-                    routing_coverage.unlinked_rows,
-                    routing_coverage.unlocated_rows,
-                    routing_coverage.interrupted,
-                    routing_coverage.source_unavailable,
-                    routing_coverage.attribution_ambiguous,
-                    routing_coverage.serialization_gaps,
-                    "The request ended with partial routing coverage:");
-            }
-            if (unlocated_rows > 0) {
-                slot.telemetry_moe_pending_chunk["unlocated_coverage_loss"] = {
-                    {"count", unlocated_rows},
-                    {"reason", "Routing capture lost rows before complete routing coordinates were retained."},
-                };
-            }
+            server_moe_routing_apply_canonical_event_coverage(
+                slot.telemetry_moe_pending_chunk, routing_coverage, true,
+                "The request ended with partial routing coverage:",
+                "Routing capture lost rows before complete routing coordinates were retained.");
             slot.telemetry_moe_chunk_unlocated_pending = 0;
             GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(slot.telemetry_moe_pending_chunk));
             GGML_ASSERT(telemetry_flush_moe_pending_chunk(slot));
@@ -6830,7 +6813,6 @@ private:
             slot.telemetry_moe_chunk_attribution_ambiguous,
             false,
         };
-        const bool partial = server_moe_routing_chunk_is_partial(routing_coverage);
         json marker = {
             {"chunk_id", string_format("moe-%d-%" PRIu64, slot.id, ++slot.telemetry_moe_chunk_sequence)},
             {"trace_id", slot.task->trace_id},
@@ -6838,27 +6820,13 @@ private:
             {"first_sequence", slot.telemetry_moe_chunk_decision_sequence},
             {"next_sequence", slot.telemetry_moe_chunk_decision_sequence},
             {"is_final_for_trace", true},
-            {"availability", server_moe_routing_chunk_availability(routing_coverage, false)},
-            {"reason", partial
-                ? telemetry_moe_routing_partial_reason(
-                    routing_coverage.invalid_rows,
-                    routing_coverage.unavailable_rows,
-                    routing_coverage.unlinked_rows,
-                    routing_coverage.unlocated_rows,
-                    routing_coverage.interrupted,
-                    routing_coverage.source_unavailable,
-                    routing_coverage.attribution_ambiguous,
-                    routing_coverage.serialization_gaps,
-                    "The request ended with partial routing coverage:")
-                : "No routable MoE records were retained for this request."},
             {"descriptor", telemetry_moe_routing_descriptor()},
         };
-        if (unlocated_rows > 0) {
-            marker["unlocated_coverage_loss"] = {
-                {"count", unlocated_rows},
-                {"reason", "Routing capture ended after an unavailable native or control-boundary interval."},
-            };
-        }
+        server_moe_routing_apply_canonical_event_coverage(
+            marker, routing_coverage, false,
+            "The request ended with partial routing coverage:",
+            "Routing capture ended after an unavailable native or control-boundary interval.",
+            "No routable MoE records were retained for this request.");
         GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(marker));
         GGML_ASSERT(telemetry_append_moe_routing_chunk(std::move(marker)));
     }

@@ -5,6 +5,36 @@
 #include <cstring>
 #include <limits>
 
+using json = common_json;
+
+static json serialize_moe_routing_event_coverage(
+        const server_moe_routing_chunk_coverage & coverage,
+        bool has_routable_records) {
+    json event = {
+        {"event", "moe_routing_chunk"},
+        {"is_final_for_trace", false},
+    };
+    server_moe_routing_apply_canonical_event_coverage(
+        event, coverage, has_routable_records,
+        "The producer retained a partial routing population:",
+        "Routing rows were lost before complete routing coordinates were retained.");
+    return json::parse(event.dump());
+}
+
+static json serialize_moe_routing_final_coverage(
+        const server_moe_routing_chunk_coverage & coverage) {
+    json event = {
+        {"event", "moe_routing_chunk"},
+        {"is_final_for_trace", true},
+    };
+    server_moe_routing_apply_canonical_event_coverage(
+        event, coverage, false,
+        "The request ended with partial routing coverage:",
+        "Routing capture ended after an unavailable native or control-boundary interval.",
+        "No routable MoE records were retained for this request.");
+    return json::parse(event.dump());
+}
+
 static void test_record_validation(testing & t) {
     t.test("valid assignment", [](testing & t) {
         t.assert_true(server_moe_routing_assignment_is_valid(2, 3, 4, 4));
@@ -117,6 +147,74 @@ static void test_canonical_event_coverage(testing & t) {
     });
 }
 
+static void test_canonical_event_coverage_serialization(testing & t) {
+    t.test("dense routing remains a complete serialized event", [](testing & t) {
+        const json event = serialize_moe_routing_event_coverage({}, true);
+        t.assert_equal(0U, event.at("availability").get<uint32_t>());
+        t.assert_true(!event.contains("reason"));
+        t.assert_true(!event.contains("unlocated_coverage_loss"));
+    });
+
+    t.test("invalid router rows serialize partial producer coverage", [](testing & t) {
+        server_moe_routing_chunk_coverage coverage;
+        coverage.invalid_rows = 1;
+        const json event = serialize_moe_routing_event_coverage(coverage, true);
+        t.assert_equal(1U, event.at("availability").get<uint32_t>());
+        t.assert_true(event.at("reason").get<std::string>().find("invalid router rows") != std::string::npos);
+        t.assert_true(!event.contains("unlocated_coverage_loss"));
+    });
+
+    t.test("unavailable K plus one when K equals N serializes source loss", [](testing & t) {
+        server_moe_routing_chunk_coverage coverage;
+        coverage.unavailable_rows = 1;
+        coverage.source_unavailable = true;
+        const json event = serialize_moe_routing_event_coverage(coverage, true);
+        t.assert_equal(1U, event.at("availability").get<uint32_t>());
+        const std::string reason = event.at("reason").get<std::string>();
+        t.assert_true(reason.find("unavailable native routing values") != std::string::npos);
+        t.assert_true(reason.find("native routing source was unavailable") != std::string::npos);
+    });
+
+    t.test("uniquely unmappable rows serialize exact coordinate-free loss", [](testing & t) {
+        server_moe_routing_chunk_coverage coverage;
+        coverage.unlinked_rows = 1;
+        coverage.unlocated_rows = 1;
+        const json event = serialize_moe_routing_event_coverage(coverage, true);
+        t.assert_equal(1U, event.at("availability").get<uint32_t>());
+        t.assert_equal(1ULL, event.at("unlocated_coverage_loss").at("count").get<uint64_t>());
+        t.assert_equal("Routing rows were lost before complete routing coordinates were retained.",
+            event.at("unlocated_coverage_loss").at("reason").get<std::string>());
+    });
+
+    t.test("ambiguously unmappable rows serialize partial coverage without exact loss", [](testing & t) {
+        server_moe_routing_chunk_coverage coverage;
+        coverage.attribution_ambiguous = true;
+        const json event = serialize_moe_routing_event_coverage(coverage, true);
+        t.assert_equal(1U, event.at("availability").get<uint32_t>());
+        t.assert_true(event.at("reason").get<std::string>().find("could not be attributed") != std::string::npos);
+        t.assert_true(!event.contains("unlocated_coverage_loss"));
+    });
+
+    t.test("interrupted and source-unavailable final events retain distinct evidence", [](testing & t) {
+        server_moe_routing_chunk_coverage interrupted;
+        interrupted.interrupted = true;
+        const json interrupted_event = serialize_moe_routing_final_coverage(interrupted);
+        t.assert_equal(1U, interrupted_event.at("availability").get<uint32_t>());
+        t.assert_true(interrupted_event.at("reason").get<std::string>().find("routing capture was interrupted") != std::string::npos);
+        t.assert_true(!interrupted_event.contains("unlocated_coverage_loss"));
+
+        server_moe_routing_chunk_coverage source_unavailable;
+        source_unavailable.source_unavailable = true;
+        source_unavailable.unlocated_rows = 3;
+        const json unavailable_event = serialize_moe_routing_final_coverage(source_unavailable);
+        t.assert_equal(1U, unavailable_event.at("availability").get<uint32_t>());
+        t.assert_true(unavailable_event.at("reason").get<std::string>().find("native routing source was unavailable") != std::string::npos);
+        t.assert_equal(3ULL, unavailable_event.at("unlocated_coverage_loss").at("count").get<uint64_t>());
+        t.assert_equal("Routing capture ended after an unavailable native or control-boundary interval.",
+            unavailable_event.at("unlocated_coverage_loss").at("reason").get<std::string>());
+    });
+}
+
 static void test_serialization_loss_counts_pending_and_incoming(testing & t) {
     uint64_t lost_population = 3;
     t.assert_true(server_moe_routing_add_lost_population(7, lost_population));
@@ -143,6 +241,7 @@ int main() {
     t.test("cap truncation", test_cap_truncation);
     t.test("cap and invalid records remain distinct", test_cap_and_invalid_records_remain_distinct);
     t.test("canonical event coverage", test_canonical_event_coverage);
+    t.test("canonical event coverage serialization", test_canonical_event_coverage_serialization);
     t.test("serialization loss counts pending and incoming", test_serialization_loss_counts_pending_and_incoming);
     t.test("finalization loss combines event and pending", test_finalization_loss_combines_event_and_pending);
 
