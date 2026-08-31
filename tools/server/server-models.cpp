@@ -30,6 +30,11 @@
 #include <cstring>
 #include <limits>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <sddl.h>
+#endif
+
 #ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
@@ -386,6 +391,56 @@ static std::vector<std::string> get_child_environment() {
     return env;
 }
 
+#ifdef _WIN32
+static std::wstring child_api_key_file_dacl_sddl(const std::wstring & user_sid) {
+    return L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + user_sid + L")";
+}
+
+struct child_api_key_file_security_attributes {
+    SECURITY_ATTRIBUTES attributes = { sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE };
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+
+    ~child_api_key_file_security_attributes() {
+        if (descriptor != nullptr) {
+            LocalFree(descriptor);
+        }
+    }
+
+    bool initialize() {
+        HANDLE token = INVALID_HANDLE_VALUE;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+            return false;
+        }
+
+        DWORD token_user_size = 0;
+        const bool sized = GetTokenInformation(token, TokenUser, nullptr, 0, &token_user_size) == 0
+            && GetLastError() == ERROR_INSUFFICIENT_BUFFER;
+        std::vector<BYTE> token_user(sized ? token_user_size : 0);
+        const bool read = sized && GetTokenInformation(token, TokenUser, token_user.data(), token_user_size, &token_user_size) != 0;
+        CloseHandle(token);
+        if (!read) {
+            return false;
+        }
+
+        LPWSTR user_sid_value = nullptr;
+        const bool converted = ConvertSidToStringSidW(
+            reinterpret_cast<TOKEN_USER *>(token_user.data())->User.Sid, &user_sid_value) != 0;
+        if (!converted) {
+            return false;
+        }
+
+        const std::wstring sddl = child_api_key_file_dacl_sddl(user_sid_value);
+        LocalFree(user_sid_value);
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) {
+            return false;
+        }
+        attributes.lpSecurityDescriptor = descriptor;
+        return true;
+    }
+};
+#endif
+
 static std::string create_child_api_key_file(const std::vector<std::string> & api_keys) {
     std::string contents;
     for (const std::string & key : api_keys) {
@@ -408,17 +463,32 @@ static std::string create_child_api_key_file(const std::vector<std::string> & ap
     if (contents.size() > std::numeric_limits<DWORD>::max()) {
         throw std::runtime_error("temporary child API key file is too large");
     }
-    std::wstring temp_file(MAX_PATH, L'\0');
-    const std::wstring temp_dir_w = temp_dir.wstring();
-    if (GetTempFileNameW(temp_dir_w.c_str(), L"lsk", 0, temp_file.data()) == 0) {
-        throw std::runtime_error("failed to create a temporary child API key file");
+    child_api_key_file_security_attributes security_attributes;
+    if (!security_attributes.initialize()) {
+        throw std::runtime_error("failed to protect a temporary child API key file");
     }
-    temp_file.resize(wcslen(temp_file.c_str()));
 
-    HANDLE handle = CreateFileW(temp_file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    std::random_device random;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    std::wstring temp_file;
+    for (uint32_t attempt = 0; attempt < 128; ++attempt) {
+        const uint64_t nonce = (uint64_t(random()) << 32) | random();
+        const std::filesystem::path candidate = temp_dir / (
+            "llama-router-api-key-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(nonce));
+        temp_file = candidate.wstring();
+        handle = CreateFileW(
+            temp_file.c_str(), GENERIC_WRITE, 0, &security_attributes.attributes, CREATE_NEW,
+            FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) {
+            break;
+        }
+        const DWORD error = GetLastError();
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) {
+            throw std::runtime_error("failed to create a protected temporary child API key file");
+        }
+    }
     if (handle == INVALID_HANDLE_VALUE) {
-        std::filesystem::remove(temp_file, ec);
-        throw std::runtime_error("failed to open a temporary child API key file");
+        throw std::runtime_error("failed to create a unique protected temporary child API key file");
     }
 
     DWORD written = 0;
