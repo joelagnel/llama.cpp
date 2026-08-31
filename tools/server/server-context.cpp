@@ -11343,7 +11343,7 @@ void server_routes::init_routes() {
                         {"enable_with", "POST /props telemetry_control.moe_routing=true; request moe_routing_telemetry=false permanently opts a request out"},
                         {"endpoint", "/telemetry/v1/events"},
                         {"chunk_event", "moe_routing_chunk"},
-                        {"chunk_schema_version", 2},
+                        {"chunk_schema_version", 3},
                         {"chunk_max_serialized_bytes", 1024 * 1024},
                         {"full_request_capture", true},
                         {"transport_gap_ranges", "response gap_ranges report only missing global event-sequence intervals"},

@@ -2588,6 +2588,7 @@ def test_moe_routing_states_and_bounded_histogram(monkeypatch):
     assert capability["state"] == "conditional"
     assert capability["maximum_captured_activations"] == 1024
     assert "POST /props telemetry_control.moe_routing=true" in capability["enable_with"]
+    assert capability["chunk_schema_version"] == 3
     assert capability["token_detail_schema_version"] == 2
     assert capability["token_detail_population"] == "target_model_output_logit_rows_by_layer"
     assert capability["routing_weights_state"] == "conditional"
