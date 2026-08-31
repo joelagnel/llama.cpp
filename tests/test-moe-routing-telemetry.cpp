@@ -269,12 +269,30 @@ static void test_saturated_native_dispatch_loss_serialization(testing & t) {
     t.assert_equal("available", gap.at("timestamp_state").get<std::string>());
     t.assert_equal("native_dispatch_queue_overflow", gap.at("cause").get<std::string>());
     t.assert_equal(1U, chunk.at("availability").get<uint32_t>());
-    t.assert_true(!chunk.contains("unlocated_coverage_loss"));
-    t.assert_equal(2U, (uint32_t) chunk.at("gaps").size());
-    t.assert_equal(239ULL, chunk.at("gaps").at(0).at("first_physical_step").get<uint64_t>());
-    t.assert_equal(240ULL, chunk.at("gaps").at(0).at("next_physical_step").get<uint64_t>());
-    t.assert_equal(288ULL, chunk.at("gaps").at(1).at("first_physical_step").get<uint64_t>());
-    t.assert_equal(311ULL, chunk.at("gaps").at(1).at("next_physical_step").get<uint64_t>());
+    t.assert_true(chunk.at("gaps").empty());
+    const json & unlocated = chunk.at("unlocated_coverage_loss");
+    t.assert_equal(23ULL, unlocated.at("count").get<uint64_t>());
+    t.assert_equal("loss", unlocated.at("state").get<std::string>());
+    t.assert_equal("native_dispatch_queue_overflow", unlocated.at("classification").get<std::string>());
+    t.assert_equal("unavailable", unlocated.at("coordinate_state").get<std::string>());
+    t.assert_equal("target", unlocated.at("physical_context").get<std::string>());
+    t.assert_equal(288ULL, unlocated.at("first_physical_step").get<uint64_t>());
+    t.assert_equal(311ULL, unlocated.at("next_physical_step").get<uint64_t>());
+    t.assert_equal(287U, unlocated.at("first_physical_microbatch").get<uint32_t>());
+    t.assert_equal(0U, unlocated.at("last_physical_microbatch").get<uint32_t>());
+    t.assert_equal("decode", unlocated.at("operation").get<std::string>());
+    t.assert_equal("encode", unlocated.at("last_operation").get<std::string>());
+    t.assert_equal("mixed", unlocated.at("operation_state").get<std::string>());
+    t.assert_equal("saturated_exact", unlocated.at("loss_descriptor_state").get<std::string>());
+    t.assert_equal("mixed", unlocated.at("generation_state").get<std::string>());
+    t.assert_equal(101LL, unlocated.at("first_dispatch_monotonic_us").get<int64_t>());
+    t.assert_equal(123LL, unlocated.at("last_dispatch_monotonic_us").get<int64_t>());
+    t.assert_true(!unlocated.contains("first_sequence"));
+    t.assert_true(!unlocated.contains("next_sequence"));
+    t.assert_true(!unlocated.contains("first_model_position"));
+    t.assert_true(!unlocated.contains("last_model_position"));
+    t.assert_true(!unlocated.contains("phase"));
+    t.assert_true(!unlocated.contains("layer_index"));
 }
 
 static void test_streamed_native_dispatch_loss_finalization(testing & t) {
@@ -286,7 +304,7 @@ static void test_streamed_native_dispatch_loss_finalization(testing & t) {
     t.assert_true(events.size() > 2);
 
     uint64_t expected_first_step = 1;
-    uint64_t exact_gap_count = 0;
+    uint64_t exact_loss_count = 0;
     uint64_t saturation_count = 0;
     uint64_t final_marker_count = 0;
     bool final_seen = false;
@@ -305,32 +323,37 @@ static void test_streamed_native_dispatch_loss_finalization(testing & t) {
             continue;
         }
         t.assert_true(!final_seen);
-        const json & gaps = event.at("gaps");
-        t.assert_true(!gaps.empty());
-        for (const json & gap : gaps) {
-            t.assert_equal(expected_first_step, gap.at("first_physical_step").get<uint64_t>());
-            const uint64_t next_step = gap.at("next_physical_step").get<uint64_t>();
-            t.assert_true(next_step > expected_first_step);
-            t.assert_equal("target", gap.at("physical_context").get<std::string>());
-            t.assert_equal("decode", gap.at("operation").get<std::string>());
-            t.assert_equal(1U, event.at("availability").get<uint32_t>());
-            if (exact_gap_count < 255) {
-                t.assert_equal(expected_first_step + 1, next_step);
-                t.assert_equal("detailed_exact", gap.at("loss_descriptor_state").get<std::string>());
-                t.assert_true(!gap.at("saturation").get<bool>());
-            } else {
-                t.assert_equal(256ULL, expected_first_step);
-                t.assert_equal(280ULL, next_step);
-                t.assert_equal(24ULL, gap.at("physical_dispatch_count").get<uint64_t>());
-                t.assert_equal("saturated_exact", gap.at("loss_descriptor_state").get<std::string>());
-                t.assert_true(gap.at("saturation").get<bool>());
-                ++saturation_count;
-            }
-            ++exact_gap_count;
-            expected_first_step = next_step;
+        t.assert_true(event.at("gaps").empty());
+        const json & unlocated = event.at("unlocated_coverage_loss");
+        t.assert_equal(expected_first_step, unlocated.at("first_physical_step").get<uint64_t>());
+        const uint64_t next_step = unlocated.at("next_physical_step").get<uint64_t>();
+        t.assert_true(next_step > expected_first_step);
+        t.assert_equal("native_dispatch_queue_overflow", unlocated.at("classification").get<std::string>());
+        t.assert_equal("unavailable", unlocated.at("coordinate_state").get<std::string>());
+        t.assert_equal("target", unlocated.at("physical_context").get<std::string>());
+        t.assert_equal("decode", unlocated.at("operation").get<std::string>());
+        t.assert_equal(1U, event.at("availability").get<uint32_t>());
+        t.assert_true(!unlocated.contains("first_sequence"));
+        t.assert_true(!unlocated.contains("phase"));
+        t.assert_true(!unlocated.contains("layer_index"));
+        if (exact_loss_count < 255) {
+            t.assert_equal(expected_first_step + 1, next_step);
+            t.assert_equal(1ULL, unlocated.at("count").get<uint64_t>());
+            t.assert_equal("detailed_exact", unlocated.at("loss_descriptor_state").get<std::string>());
+            t.assert_true(!unlocated.at("saturation").get<bool>());
+        } else {
+            t.assert_equal(256ULL, expected_first_step);
+            t.assert_equal(280ULL, next_step);
+            t.assert_equal(24ULL, unlocated.at("count").get<uint64_t>());
+            t.assert_equal(24ULL, unlocated.at("physical_dispatch_count").get<uint64_t>());
+            t.assert_equal("saturated_exact", unlocated.at("loss_descriptor_state").get<std::string>());
+            t.assert_true(unlocated.at("saturation").get<bool>());
+            ++saturation_count;
         }
+        ++exact_loss_count;
+        expected_first_step = next_step;
     }
-    t.assert_equal(256ULL, exact_gap_count);
+    t.assert_equal(256ULL, exact_loss_count);
     t.assert_equal(280ULL, expected_first_step);
     t.assert_equal(1ULL, saturation_count);
     t.assert_equal(1ULL, final_marker_count);
@@ -343,7 +366,7 @@ static void test_native_dispatch_loss_timeline(testing & t) {
     t.assert_equal(4096ULL, cap);
     t.assert_equal(0ULL, timeline.at("dropped_events").get<uint64_t>());
 
-    uint64_t expected_gap_step = 1;
+    uint64_t expected_loss_step = 1;
     std::vector<uint64_t> span_steps;
     uint64_t control_boundaries = 0;
     bool saw_first_boundary = false;
@@ -374,10 +397,17 @@ static void test_native_dispatch_loss_timeline(testing & t) {
         t.assert_true(event.contains("descriptor"));
         t.assert_equal("server_process_monotonic_microseconds",
             event.at("clock").at("clock_domain").get<std::string>());
-        for (const json & gap : event.at("gaps")) {
-            const uint64_t first_step = gap.at("first_physical_step").get<uint64_t>();
-            const uint64_t next_step = gap.at("next_physical_step").get<uint64_t>();
-            if (gap.at("saturation").get<bool>()) {
+        if (event.contains("unlocated_coverage_loss")) {
+            t.assert_true(event.at("gaps").empty());
+            const json & unlocated = event.at("unlocated_coverage_loss");
+            const uint64_t first_step = unlocated.at("first_physical_step").get<uint64_t>();
+            const uint64_t next_step = unlocated.at("next_physical_step").get<uint64_t>();
+            t.assert_equal("native_dispatch_queue_overflow", unlocated.at("classification").get<std::string>());
+            t.assert_equal("unavailable", unlocated.at("coordinate_state").get<std::string>());
+            t.assert_true(!unlocated.contains("first_sequence"));
+            t.assert_true(!unlocated.contains("phase"));
+            t.assert_true(!unlocated.contains("layer_index"));
+            if (unlocated.at("saturation").get<bool>()) {
                 t.assert_equal(258ULL, first_step);
                 t.assert_equal(260ULL, next_step);
                 t.assert_true(saw_second_boundary);
@@ -390,20 +420,20 @@ static void test_native_dispatch_loss_timeline(testing & t) {
             } else {
                 t.assert_true(!saw_saturation);
                 t.assert_true(!saw_routed_span);
-                t.assert_equal(expected_gap_step, first_step);
-                t.assert_equal(expected_gap_step + 1, next_step);
-                ++expected_gap_step;
+                t.assert_equal(expected_loss_step, first_step);
+                t.assert_equal(expected_loss_step + 1, next_step);
+                ++expected_loss_step;
             }
         }
         for (const json & decision : event.value("decisions", json::array())) {
             t.assert_true(!saw_saturation);
             t.assert_true(saw_first_boundary);
-            t.assert_equal(256ULL, expected_gap_step);
+            t.assert_equal(256ULL, expected_loss_step);
             saw_routed_span = true;
             span_steps.push_back(decision.at("event_key").at("physical_step").get<uint64_t>());
         }
     }
-    t.assert_equal(256ULL, expected_gap_step);
+    t.assert_equal(256ULL, expected_loss_step);
     t.assert_equal(3ULL, control_boundaries);
     t.assert_equal(2U, (uint32_t) span_steps.size());
     t.assert_true(saw_saturation);

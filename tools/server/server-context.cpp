@@ -406,7 +406,10 @@ struct telemetry_moe_native_dispatch_loss {
     bool operation_mixed = false;
 };
 
-static json telemetry_moe_native_dispatch_loss_gap_json(
+// This is a standalone diagnostic payload, not a MoeRoutingCoverageGap.  It
+// deliberately retains the dispatcher-specific fields that are useful when a
+// self-describing routing chunk cannot be emitted.
+static json telemetry_moe_native_dispatch_loss_diagnostic_json(
         uint64_t decision_sequence,
         const telemetry_moe_native_dispatch_loss & loss) {
     json gap = {
@@ -448,26 +451,52 @@ static json telemetry_moe_native_dispatch_loss_gap_json(
     return gap;
 }
 
-static void telemetry_moe_sort_physical_gaps(json & gaps) {
-    std::vector<json> sorted;
-    sorted.reserve(gaps.size());
-    for (const json & gap : gaps) {
-        sorted.push_back(gap);
-    }
-    std::stable_sort(sorted.begin(), sorted.end(), [](const json & left, const json & right) {
-        const uint64_t left_step = left.value("first_physical_step", std::numeric_limits<uint64_t>::max());
-        const uint64_t right_step = right.value("first_physical_step", std::numeric_limits<uint64_t>::max());
-        return left_step < right_step;
-    });
-    gaps = json::array();
-    for (json & gap : sorted) {
-        gaps.push_back(std::move(gap));
-    }
+// Native dispatch overflow retains a physical interval, but not the routing
+// sequence, model position, layer, or phase that schema-v3 coverage gaps
+// require.  Keep it under unlocated_coverage_loss rather than fabricating a
+// located gap or a zero-width decision interval.
+static json telemetry_moe_native_dispatch_loss_unlocated_json(
+        const telemetry_moe_native_dispatch_loss & loss) {
+    json unlocated_loss = {
+        {"count", loss.physical_dispatch_count},
+        {"state", "loss"},
+        {"classification", "native_dispatch_queue_overflow"},
+        {"coordinate_state", "unavailable"},
+        {"physical_context", "target"},
+        {"first_physical_step", loss.first_physical_step},
+        {"next_physical_step", loss.next_physical_step},
+        {"first_physical_microbatch", loss.first_physical_microbatch},
+        {"last_physical_microbatch", loss.last_physical_microbatch},
+        {"operation", loss.operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode"},
+        {"last_operation", loss.last_operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode"},
+        {"operation_state", loss.operation_mixed ? "mixed" : "exact"},
+        {"props_generation", loss.props_generation},
+        {"microbatch_generation", loss.microbatch_generation},
+        {"application_epoch", loss.application_epoch},
+        {"last_props_generation", loss.last_props_generation},
+        {"last_microbatch_generation", loss.last_microbatch_generation},
+        {"last_application_epoch", loss.last_application_epoch},
+        {"physical_dispatch_count", loss.physical_dispatch_count},
+        {"encode_physical_dispatch_count", loss.encode_physical_dispatch_count},
+        {"decode_physical_dispatch_count", loss.decode_physical_dispatch_count},
+        {"saturation", loss.saturation},
+        {"loss_descriptor_state", loss.saturation ? "saturated_exact" : "detailed_exact"},
+        {"generation_state", loss.generation_mixed ? "mixed" : "exact"},
+        {"native_moe_routing_state", loss.native_moe_routing_mixed ? "mixed" : "enabled"},
+        {"reason", "The bounded native dispatch queue suppressed routing evidence before routing coordinates were retained."},
+    };
+    unlocated_loss["first_dispatch_monotonic_us"] = loss.first_dispatch_monotonic_us > 0
+        ? json(loss.first_dispatch_monotonic_us) : json(nullptr);
+    unlocated_loss["last_dispatch_monotonic_us"] = loss.last_dispatch_monotonic_us > 0
+        ? json(loss.last_dispatch_monotonic_us) : json(nullptr);
+    unlocated_loss["timestamp_state"] = loss.first_dispatch_monotonic_us > 0 &&
+        loss.last_dispatch_monotonic_us > 0 ? "available" : "unavailable";
+    return unlocated_loss;
 }
 
 #ifdef LLAMA_SERVER_TEST_HOOKS
 json server_test_moe_dispatch_saturation_gap_json() {
-    return telemetry_moe_native_dispatch_loss_gap_json(17, {
+    return telemetry_moe_native_dispatch_loss_diagnostic_json(17, {
         5, 288, 9, 288, 311, 101, 123, 44,
         LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE,
         LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE,
@@ -477,25 +506,22 @@ json server_test_moe_dispatch_saturation_gap_json() {
 }
 
 json server_test_moe_dispatch_saturation_chunk_json() {
-    const telemetry_moe_native_dispatch_loss prefix = {
-        4, 287, 8, 239, 240, 99, 100, 43,
+    const telemetry_moe_native_dispatch_loss saturation = {
+        5, 288, 9, 288, 311, 101, 123, 44,
         LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE,
-        LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE,
-        238, 238, 43, 4, 287, 8, 1, false, false, false,
-        0, 1, false,
+        LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE,
+        287, 0, 45, 8, 310, 12, 23, true, true, false,
+        1, 22, true,
     };
     json event = {
         {"event", "moe_routing_chunk"},
-        {"gaps", json::array({
-            telemetry_moe_native_dispatch_loss_gap_json(16, prefix),
-            server_test_moe_dispatch_saturation_gap_json(),
-        })},
+        {"gaps", json::array()},
     };
-    telemetry_moe_sort_physical_gaps(event["gaps"]);
     server_moe_routing_apply_canonical_event_coverage(
-        event, { 0, 0, 0, 0, false, false, false, true }, true,
+        event, { 0, 0, 0, saturation.physical_dispatch_count, false, false, false, false }, false,
         "The producer retained a partial routing population:",
         "Routing rows were lost before complete routing coordinates were retained.");
+    event["unlocated_coverage_loss"] = telemetry_moe_native_dispatch_loss_unlocated_json(saturation);
     return event;
 }
 #endif
@@ -7098,7 +7124,7 @@ private:
             server_slot & slot,
             const telemetry_moe_native_dispatch_loss & loss,
             bool terminal) {
-        json exact_loss = telemetry_moe_native_dispatch_loss_gap_json(
+        json exact_loss = telemetry_moe_native_dispatch_loss_diagnostic_json(
             slot.telemetry_moe_chunk_decision_sequence, loss);
         exact_loss["kind"] = "moe_routing_span";
         telemetry_append({
@@ -7170,34 +7196,14 @@ private:
         // interval.  Flush it before emitting a loss-only chunk so ring order
         // remains physical/causal rather than completion-time order.
         const bool pending_flushed = telemetry_flush_moe_pending_chunk(slot);
-        std::vector<const telemetry_moe_native_dispatch_loss *> current;
-
-        const auto make_event = [&]() {
+        const auto make_event = [&](const telemetry_moe_native_dispatch_loss & loss) {
             json event = telemetry_make_native_dispatch_loss_chunk(slot);
-            json & gaps = event["gaps"];
-            for (const telemetry_moe_native_dispatch_loss * loss : current) {
-                gaps.push_back(telemetry_moe_native_dispatch_loss_gap_json(
-                    slot.telemetry_moe_chunk_decision_sequence, *loss));
-            }
-            telemetry_moe_sort_physical_gaps(gaps);
             server_moe_routing_apply_canonical_event_coverage(
-                event, { 0, 0, 0, 0, false, true, false, true }, false,
+                event, { 0, 0, 0, loss.physical_dispatch_count, false, false, false, false }, false,
                 "The producer retained an exact native dispatch-loss interval:",
                 "Routing capture lost rows before complete routing coordinates were retained.");
+            event["unlocated_coverage_loss"] = telemetry_moe_native_dispatch_loss_unlocated_json(loss);
             return event;
-        };
-        const auto flush_current = [&]() {
-            if (current.empty()) {
-                return true;
-            }
-            json event = make_event();
-            if (!telemetry_moe_chunk_can_be_finalized(event) ||
-                    !telemetry_append_moe_routing_chunk(std::move(event))) {
-                return false;
-            }
-            ++slot.telemetry_moe_chunk_sequence;
-            current.clear();
-            return true;
         };
 
         for (const telemetry_moe_native_dispatch_loss & loss : losses) {
@@ -7206,28 +7212,13 @@ private:
                 continue;
             }
 
-            current.push_back(&loss);
-            if (telemetry_moe_chunk_can_be_finalized(make_event())) {
+            json event = make_event(loss);
+            if (!telemetry_moe_chunk_can_be_finalized(event) ||
+                    !telemetry_append_moe_routing_chunk(std::move(event))) {
+                telemetry_append_native_dispatch_loss_unavailable(slot, loss, true);
                 continue;
             }
-            current.pop_back();
-            if (!flush_current()) {
-                for (const telemetry_moe_native_dispatch_loss * retained : current) {
-                    telemetry_append_native_dispatch_loss_unavailable(slot, *retained, false);
-                }
-                current.clear();
-            }
-
-            current.push_back(&loss);
-            if (!telemetry_moe_chunk_can_be_finalized(make_event())) {
-                current.clear();
-                telemetry_append_native_dispatch_loss_unavailable(slot, loss, true);
-            }
-        }
-        if (!flush_current()) {
-            for (const telemetry_moe_native_dispatch_loss * retained : current) {
-                telemetry_append_native_dispatch_loss_unavailable(slot, *retained, false);
-            }
+            ++slot.telemetry_moe_chunk_sequence;
         }
     }
 
