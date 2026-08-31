@@ -59,9 +59,10 @@ To run a single test:
 
 ### Focused LlamaScope telemetry checks
 
-The private-fork telemetry contract has a native MoE unit test and authenticated server scenarios. Build the server and native test targets first, then run the focused CTest selection:
+The private-fork telemetry contract has native MoE tests and authenticated server scenarios. Configure and build the server and native test targets first, then run the focused CTest selection:
 
 ```shell
+cmake -S . -B build -DLLAMA_BUILD_TESTS=ON
 cmake --build build --target llama-server test-moe-routing test-moe-routing-telemetry
 ctest --test-dir build --output-on-failure -R "^(test-moe-routing-telemetry|test-moe-routing-dense|test-moe-routing-dsv4)$"
 ```
@@ -80,7 +81,18 @@ $env:LLAMA_SERVER_BIN_PATH = (Resolve-Path ..\..\..\build\bin\llama-server.exe)
 py -m pytest -q .\unit\test_telemetry_control.py .\unit\test_telemetry.py
 ```
 
-These checks cover full-replacement `/props` control, authentication, environment/request non-activation, restart reset, dense-path behavior, and generic telemetry behavior. They do not replace the release-only focused gates for raw schema-v2 bytes consumed by the managed mapper, CUDA routing readback, MTP verification, exact transport overrun gaps, or forced unavailable and unlocated producer loss. A CPU pass is not evidence of CUDA capture; run that gate only with an explicitly CUDA-enabled build and model fixture, never by silently falling back to CPU.
+These checks cover full-replacement `/props` control, authentication, actual-listener loopback enforcement, environment/request non-activation, restart reset, dense-path behavior, canonical schema-v2 bytes, sparse topology, chunk boundaries, loss/gaps, peer coverage, MTP linkage, and generic telemetry behavior.
+
+The CUDA routing-readback gate is separate and Windows-only. It requires a static CUDA build and proves that enabled MoE capture performs device-to-host readback while disabled and dense paths do not. Configure it explicitly; the configuration rejects a CPU build, a shared build, or a non-Windows build:
+
+```powershell
+cmake -S . -B build-cuda-routing -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF `
+  -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TESTS=ON `
+  -DLLAMA_MOE_ROUTING_CUDA_READBACK_TESTS=ON
+cmake --build build-cuda-routing --target test-moe-routing
+ctest --test-dir build-cuda-routing --output-on-failure `
+  -R "^test-moe-routing-dsv4-cuda-readback$"
+```
 
 Hint: You can compile and run test in single command, useful for local development:
 

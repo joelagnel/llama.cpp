@@ -936,12 +936,12 @@ Telemetry control requires all of the following:
 
 - `--props`;
 - a non-empty API-key configuration, preferably `--api-key-file` so the secret is not a command-line value;
-- a loopback-bound listener; use literal `127.0.0.1` or `::1` for control; and
+- a listener whose actual bound numeric address is loopback; and
 - normal API-key authentication on the request.
 
 Use environment variables only for documented bounds and storage sizes. They cannot activate an optional telemetry producer, and request booleans can only opt out of a globally enabled producer. In router mode, include the target `model` in the JSON request body; the router applies the same control guard before forwarding it.
 
-At this source revision, the loopback guard checks configured listener text. The pending hardening correction verifies the actual numeric bind address; it is required before treating a control-capable release as loopback-only.
+The listener guard reads the bound socket address after bind, not the configured host string. `localhost` is acceptable only if it binds to a loopback address; an uninspectable or non-loopback bind rejects telemetry control. The Windows telemetry launcher requires a protected `-ApiKeyFile`, passes its path as `--api-key-file`, and enables `--props`; see [Telemetry control](README-telemetry.md#runtime-telemetry-control).
 
 *Options:*
 
