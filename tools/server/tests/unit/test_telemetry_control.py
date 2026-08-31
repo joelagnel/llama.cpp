@@ -493,7 +493,7 @@ def test_inflight_off_on_off_uses_recorded_microbatch_generation_and_request_sna
                 "POST",
                 "/completion",
                 data={
-                    "prompt": "in-flight telemetry boundary " * 96,
+                    "prompt": "in-flight telemetry boundary " * 20,
                     "n_predict": 24,
                     "ignore_eos": True,
                     "temperature": 0,

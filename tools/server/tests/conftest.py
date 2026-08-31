@@ -1,5 +1,17 @@
+import os
+import socket
+
 import pytest
 from utils import *
+
+
+def pytest_configure(config):
+    if "PORT" in os.environ or "DEBUG_EXTERNAL" in os.environ:
+        return
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        os.environ["PORT"] = str(sock.getsockname()[1])
 
 
 # ref: https://stackoverflow.com/questions/22627659/run-code-before-and-after-each-test-in-py-test

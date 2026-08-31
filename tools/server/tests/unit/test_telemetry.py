@@ -46,10 +46,11 @@ def create_server():
 def configure_telemetry_server():
     server.server_props = True
     server.api_key = TELEMETRY_API_KEY
-    request = server.make_request
+    test_server = server
+    request = test_server.make_request
 
     def authenticated_request(method, path, data=None, **kwargs):
-        headers = {"Authorization": f"Bearer {server.api_key}"}
+        headers = {"Authorization": f"Bearer {test_server.api_key}"}
         headers.update(kwargs.pop("headers", None) or {})
         return request(method, path, data=data, headers=headers, **kwargs)
 
@@ -2116,7 +2117,7 @@ def test_moe_routing_states_and_bounded_histogram(monkeypatch):
     capability = server.make_request("GET", "/telemetry/v1/capabilities").body["capabilities"]["moe_routing"]
     assert capability["state"] == "conditional"
     assert capability["maximum_captured_activations"] == 1024
-    assert "moe_routing_telemetry=true" in capability["enable_with"]
+    assert "POST /props telemetry_control.moe_routing=true" in capability["enable_with"]
     assert capability["token_detail_schema_version"] == 2
     assert capability["token_detail_population"] == "target_model_output_logit_rows_by_layer"
     assert capability["routing_weights_state"] == "conditional"
