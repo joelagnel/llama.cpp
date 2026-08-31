@@ -413,9 +413,15 @@ static void test_native_dispatch_loss_small_cap_fails_closed(testing & t) {
     const json result = server_test_moe_dispatch_loss_small_cap_json();
     const json & events = result.at("events");
     t.assert_equal(1024ULL, result.at("chunk_limit_bytes").get<uint64_t>());
+    t.assert_true(result.at("terminal_after_finalize").get<bool>());
+    t.assert_true(!result.at("terminal_after_reset").get<bool>());
+    t.assert_true(!result.at("capture_started_after_reset").get<bool>());
+    t.assert_true(!result.at("source_unavailable_after_reset").get<bool>());
+    t.assert_equal(2ULL, result.at("next_sequence").get<uint64_t>());
     t.assert_equal(1U, (uint32_t) events.size());
     const json & event = events.at(0);
     t.assert_equal("telemetry_dispatch_queue_loss", event.at("event").get<std::string>());
+    t.assert_equal(1ULL, event.at("sequence").get<uint64_t>());
     t.assert_equal("exact_unavailable", event.at("routing_coverage_state").get<std::string>());
     t.assert_equal("target", event.at("physical_context").get<std::string>());
     t.assert_equal(1U, (uint32_t) event.at("losses").size());
