@@ -115,6 +115,58 @@ def trace_events(trace_id):
     return [event for event in response.body["events"] if event["trace_id"] == trace_id]
 
 
+def raw_telemetry_event_envelopes(body):
+    marker = b'"events":['
+    index = body.find(marker)
+    assert index >= 0
+    index += len(marker)
+    envelopes = []
+
+    while True:
+        while index < len(body) and body[index] in b" \t\r\n":
+            index += 1
+        assert index < len(body)
+        if body[index] == ord("]"):
+            return envelopes
+
+        assert body[index] == ord("{")
+        start = index
+        depth = 0
+        in_string = False
+        escaped = False
+        while index < len(body):
+            value = body[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif value == ord("\\"):
+                    escaped = True
+                elif value == ord('"'):
+                    in_string = False
+            elif value == ord('"'):
+                in_string = True
+            elif value in (ord("{"), ord("[")):
+                depth += 1
+            elif value in (ord("}"), ord("]")):
+                depth -= 1
+                if depth == 0:
+                    index += 1
+                    envelopes.append(body[start:index])
+                    break
+            index += 1
+        else:
+            raise AssertionError("unterminated telemetry event envelope")
+
+        while index < len(body) and body[index] in b" \t\r\n":
+            index += 1
+        assert index < len(body)
+        if body[index] == ord(","):
+            index += 1
+            continue
+        assert body[index] == ord("]")
+        return envelopes
+
+
 def test_event_ring_reuses_serialized_payload_bytes_for_retention_and_response():
     api_key = "serialized-event-test-key"
     auth = {"Authorization": f"Bearer {api_key}"}
@@ -1868,7 +1920,15 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
             event for event in events_response["events"]
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == trace_id
         ]
+        raw_chunks = [
+            raw
+            for raw in raw_telemetry_event_envelopes(events_http.content)
+            if (event := json.loads(raw)).get("event") == "moe_routing_chunk"
+            and event.get("trace_id") == trace_id
+        ]
         assert chunks
+        assert raw_chunks
+        assert [json.loads(raw)["sequence"] for raw in raw_chunks] == [chunk["sequence"] for chunk in chunks]
         assert all(chunk["schema_version"] == 2 for chunk in chunks)
         assert chunks[-1]["is_final_for_trace"] is True
         assert chunks[-1]["decisions"]
@@ -1877,6 +1937,66 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         assert all(chunk["descriptor"]["model_fingerprint"] is None for chunk in chunks)
         assert all(chunk["descriptor"]["model_fingerprint_availability"] == 10 for chunk in chunks)
         assert all("moe_routing_schema_version" not in chunk and "final" not in chunk for chunk in chunks)
+
+        legacy_envelope_fields = {
+            "moe_routing_schema_version",
+            "trace_chunk_sequence",
+            "final",
+            "control_generation",
+            "physical_step_id",
+            "native_capture_generation",
+            "task_id",
+            "slot_id",
+            "slot_assignment_ordinal",
+            "producer_coverage",
+            "physical_peer_coverage",
+            "physical_peer_trace_ids",
+            "position_coverage",
+            "shared_experts",
+        }
+        legacy_decision_fields = {
+            "trace_decision_sequence",
+            "physical_step_id",
+            "physical_ubatch_index",
+            "physical_ubatch_token_index",
+            "row_index",
+            "graph_type",
+            "layer_index",
+            "control_generation",
+            "logical_step",
+            "actual_target_pass",
+            "proposal_position",
+            "replay_pass",
+            "row_identity_status",
+            "selected_experts_status",
+            "decision_valid",
+            "physical_peer_coverage",
+        }
+        for raw, chunk in zip(raw_chunks, chunks):
+            assert raw == json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            assert chunk["serialized_bytes"] == len(raw)
+            assert chunk["schema_version"] == 2
+            assert chunk["event"] == "moe_routing_chunk"
+            assert legacy_envelope_fields.isdisjoint(chunk)
+            assert isinstance(chunk["availability"], int) and not isinstance(chunk["availability"], bool)
+            assert chunk["descriptor"]["model_fingerprint"] is None
+            assert isinstance(chunk["descriptor"]["model_fingerprint_availability"], int)
+            for decision in chunk["decisions"]:
+                assert legacy_decision_fields.isdisjoint(decision)
+                assert isinstance(decision["event_key"], dict)
+                assert isinstance(decision["native_row"], dict)
+                assert isinstance(decision["shared_experts"], dict)
+                assert decision["speculative_pass"] is None
+                assert all(
+                    isinstance(decision["event_key"][field], int)
+                    for field in ("physical_microbatch", "physical_step", "phase", "layer_index", "control_generation")
+                )
+                assert isinstance(decision["native_row"]["row_identity_status"], int)
+                for selected in decision["selected_experts"]:
+                    assert isinstance(selected["expert_id_status"], int)
+                    assert isinstance(selected["effective_weight_status"], int)
+                    if selected["effective_weight_status"] != 0:
+                        assert selected["effective_weight"] is None
 
         decisions = [decision for chunk in chunks for decision in chunk["decisions"]]
         assert decisions
