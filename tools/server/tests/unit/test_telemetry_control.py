@@ -47,7 +47,7 @@ def _completed_event(server, trace_id):
     assert response.status_code == 200
     return next(
         event for event in response.body["events"]
-        if event["trace_id"] == trace_id and event["event"] == "request_completed"
+        if event.get("trace_id") == trace_id and event["event"] == "request_completed"
     )
 
 
@@ -57,6 +57,13 @@ def _telemetry_events(server, limit=512):
     )
     assert response.status_code == 200
     return response.body["events"]
+
+
+def _control_boundaries(server):
+    return [
+        event for event in _telemetry_events(server)
+        if event["event"] == "telemetry_control_boundary"
+    ]
 
 
 def test_props_telemetry_control_replaces_state_and_resets_on_restart():
@@ -135,8 +142,15 @@ def test_rejected_props_writes_leave_the_control_snapshot_unchanged():
         headers=AUTH,
     )
     assert enabled.status_code == 200
+    microbatch_enabled = server.make_request(
+        "POST",
+        "/props",
+        data={"telemetry_control": {"kv_pressure_detail": True}},
+        headers=AUTH,
+    )
+    assert microbatch_enabled.status_code == 200
     expected = _snapshot(server)
-    assert expected["generation"] == 1
+    assert expected["generation"] == 2
 
     rejected_bodies = (
         {},
@@ -156,6 +170,64 @@ def test_rejected_props_writes_leave_the_control_snapshot_unchanged():
     )
     assert unauthorized.status_code == 401
     assert _snapshot(server) == expected
+
+    completion = server.make_request(
+        "POST",
+        "/completion",
+        data={"prompt": "only accepted controls create a boundary", "n_predict": 1},
+        headers=AUTH,
+    )
+    assert completion.status_code == 200
+    boundaries = _control_boundaries(server)
+    assert len(boundaries) == 1
+    boundary = boundaries[0]
+    assert boundary["schema_version"] == 1
+    assert boundary["props_generation"] == 2
+    assert boundary["microbatch_generation"] == 1
+    assert boundary["timestamp_unix_ms"] >= 0
+    assert boundary["physical_step"] >= 1
+    assert boundary["physical_microbatch"] == 0
+    assert boundary["effective"] == expected["effective"]
+    assert boundary["native_moe_routing_enabled"] is False
+    assert boundary["moe_routing_applicable"] is False
+    assert "server_instance_id" in boundary
+    assert "sequence" in boundary
+    assert "trace_id" not in boundary
+
+
+def test_overwritten_microbatch_controls_do_not_emit_a_fake_boundary():
+    server = _controlled_server()
+    server.start()
+    try:
+        enabled = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"kv_pressure_detail": True}},
+            headers=AUTH,
+        )
+        assert enabled.status_code == 200
+        assert enabled.body["telemetry_control"]["generation"] == 1
+
+        overwritten = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"request_content": True}},
+            headers=AUTH,
+        )
+        assert overwritten.status_code == 200
+        assert overwritten.body["telemetry_control"]["generation"] == 2
+        assert overwritten.body["telemetry_control"]["effective"]["kv_pressure_detail"] is False
+
+        completion = server.make_request(
+            "POST",
+            "/completion",
+            data={"prompt": "the latest desired state wins", "n_predict": 1},
+            headers=AUTH,
+        )
+        assert completion.status_code == 200
+        assert _control_boundaries(server) == []
+    finally:
+        server.stop()
 
 
 def test_request_and_environment_values_cannot_enable_global_control():
@@ -265,7 +337,7 @@ def test_all_request_opt_ins_are_inert_until_props_enables_their_controls():
             "reason": "content_logging_disabled",
         }
         assert not any(
-            event["event"] == "moe_routing_chunk" and event["trace_id"] == disabled.body["trace_id"]
+            event["event"] == "moe_routing_chunk" and event.get("trace_id") == disabled.body["trace_id"]
             for event in _telemetry_events(server)
         )
 
@@ -305,7 +377,7 @@ def test_all_request_opt_ins_are_inert_until_props_enables_their_controls():
             "reason": "content_logging_disabled",
         }
         assert not any(
-            event["event"] == "moe_routing_chunk" and event["trace_id"] == opted_out.body["trace_id"]
+            event["event"] == "moe_routing_chunk" and event.get("trace_id") == opted_out.body["trace_id"]
             for event in _telemetry_events(server)
         )
     finally:
@@ -341,7 +413,7 @@ def test_moe_event_ring_overrun_reports_exact_transport_gaps():
         )
         assert lost.status_code == 200
         assert any(
-            event["event"] == "moe_routing_chunk" and event["trace_id"] == lost.body["trace_id"]
+            event["event"] == "moe_routing_chunk" and event.get("trace_id") == lost.body["trace_id"]
             for event in _telemetry_events(server)
         )
 
@@ -384,9 +456,9 @@ def test_moe_event_ring_overrun_reports_exact_transport_gaps():
         }]
         assert body["dropped_events"] == body["oldest_sequence"] - 1
         assert all(event["sequence"] >= body["oldest_sequence"] for event in body["events"])
-        assert not any(event["trace_id"] == lost.body["trace_id"] for event in body["events"])
+        assert not any(event.get("trace_id") == lost.body["trace_id"] for event in body["events"])
         assert any(
-            event["event"] == "moe_routing_chunk" and event["trace_id"] == retained.body["trace_id"]
+            event["event"] == "moe_routing_chunk" and event.get("trace_id") == retained.body["trace_id"]
             for event in body["events"]
         )
     finally:
@@ -801,7 +873,7 @@ def test_inflight_off_on_off_uses_recorded_microbatch_generation_and_request_sna
         events = _telemetry_events(server)
         chunks = [
             event for event in events
-            if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
+            if event["event"] == "moe_routing_chunk" and event.get("trace_id") == response.body["trace_id"]
         ]
         assert chunks[-1]["is_final_for_trace"] is True
         partial_chunks = [chunk for chunk in chunks if chunk["availability"] == 1]

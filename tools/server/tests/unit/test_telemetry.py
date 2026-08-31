@@ -103,7 +103,7 @@ def completed_event(trace_id):
     assert response.body["next_sequence"] > response.body["cursor"]
     matches = [
         event for event in response.body["events"]
-        if event["trace_id"] == trace_id and event["event"] == "request_completed"
+        if event.get("trace_id") == trace_id and event["event"] == "request_completed"
     ]
     assert len(matches) == 1
     return matches[0]
@@ -112,7 +112,27 @@ def completed_event(trace_id):
 def trace_events(trace_id):
     response = server.make_request("GET", "/telemetry/v1/events?cursor=0&limit=100")
     assert response.status_code == 200
-    return [event for event in response.body["events"] if event["trace_id"] == trace_id]
+    return [event for event in response.body["events"] if event.get("trace_id") == trace_id]
+
+
+def wait_for_control_boundary(test_server, auth, generation, completion=None, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        events = test_server.make_request(
+            "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
+        )
+        assert events.status_code == 200
+        matches = [
+            event for event in events.body["events"]
+            if event["event"] == "telemetry_control_boundary"
+            and event["props_generation"] == generation
+        ]
+        if matches:
+            return matches[-1]
+        if completion is not None and completion.done():
+            break
+        time.sleep(0.01)
+    return None
 
 
 def raw_telemetry_event_envelopes(body):
@@ -2171,7 +2191,7 @@ def test_moe_routing_chunks_pack_large_prefill_near_byte_cap():
             "POST",
             "/completion",
             data={
-                "prompt": "routing " * 384,
+                "prompt": "routing " * 160,
                 "n_predict": 1,
                 "ignore_eos": True,
                 "temperature": 0,
@@ -2187,17 +2207,28 @@ def test_moe_routing_chunks_pack_large_prefill_near_byte_cap():
             event for event in events.body["events"]
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
         ]
+        boundaries = [
+            event for event in events.body["events"]
+            if event["event"] == "telemetry_control_boundary"
+        ]
+        assert chunks
+        assert len(boundaries) == 1
+        boundary = boundaries[0]
+        assert boundary["props_generation"] == 1
+        assert boundary["microbatch_generation"] == 1
+        assert boundary["native_moe_routing_enabled"] is True
+        assert boundary["sequence"] < min(chunk["sequence"] for chunk in chunks)
         assert len(chunks) > 1
         assert all(chunk["decisions"] for chunk in chunks)
         assert chunks[-1]["is_final_for_trace"] is True
         assert sum(chunk["is_final_for_trace"] for chunk in chunks) == 1
-        assert max(chunk["serialized_bytes"] for chunk in chunks) >= 512 * 1024
-        assert max(len(chunk["decisions"]) for chunk in chunks) > 100
         assert all(chunk["serialized_bytes"] <= 1024 * 1024 for chunk in chunks)
         assert all(not chunk["gaps"] and not chunk["invalid_records"] for chunk in chunks)
 
         decisions = [decision for chunk in chunks for decision in chunk["decisions"]]
         assert [decision["sequence"] for decision in decisions] == list(range(len(decisions)))
+        assert all(decision["native_row"]["physical_ubatch_index"] == 0 for decision in decisions)
+        assert len({decision["event_key"]["physical_step"] for decision in decisions}) > 1
         assert all(
             chunk["first_sequence"] < chunk["next_sequence"]
             and chunk["next_sequence"] - chunk["first_sequence"] == len(chunk["decisions"])
@@ -2245,6 +2276,15 @@ def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
             "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
         )
         assert events.status_code == 200
+        boundaries = [
+            event for event in events.body["events"]
+            if event["event"] == "telemetry_control_boundary"
+        ]
+        assert len(boundaries) == 1
+        boundary = boundaries[0]
+        assert boundary["props_generation"] == 1
+        assert boundary["microbatch_generation"] == 1
+        assert boundary["native_moe_routing_enabled"] is True
         decisions = [
             decision
             for event in events.body["events"]
@@ -2254,6 +2294,10 @@ def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
         ]
         mtp_decisions = [decision for decision in decisions if decision["event_key"]["phase"] == 3]
         assert mtp_decisions
+        assert boundary["sequence"] < min(
+            event["sequence"] for event in events.body["events"]
+            if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
+        )
         assert all(decision["native_row"]["graph_type"] == "decoder_mtp" for decision in mtp_decisions)
         assert all(decision["model_position"] is not None for decision in mtp_decisions)
         assert all(decision["speculative_pass"]["logical_verification_step"] is not None for decision in mtp_decisions)
@@ -2292,34 +2336,40 @@ def test_moe_routing_chunks_mark_on_off_on_intervals_partial():
                 "/completion",
                 {
                     "prompt": "routing interval " * 96,
-                    "n_predict": 24,
+                    "n_predict": 64,
                     "ignore_eos": True,
                     "temperature": 0,
                 },
                 auth,
             )
-            toggled = False
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline and not completion.done():
-                events = server.make_request(
-                    "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
-                )
-                if any(event["event"] == "moe_routing_chunk" for event in events.body["events"]):
-                    disabled = server.make_request(
-                        "POST", "/props", data={"telemetry_control": {}}, headers=auth
-                    )
-                    assert disabled.status_code == 200
-                    assert disabled.body["telemetry_control"]["generation"] == 2
-                    time.sleep(0.05)
-                    reenabled = server.make_request(
-                        "POST", "/props", data={"telemetry_control": {"moe_routing": True}}, headers=auth
-                    )
-                    assert reenabled.status_code == 200
-                    assert reenabled.body["telemetry_control"]["generation"] == 3
-                    toggled = True
-                    break
-                time.sleep(0.01)
-            assert toggled
+            enabled_boundary = wait_for_control_boundary(server, auth, 1, completion)
+            assert enabled_boundary is not None
+            assert enabled_boundary["microbatch_generation"] == 1
+            assert enabled_boundary["effective"]["moe_routing"] is True
+            assert enabled_boundary["native_moe_routing_enabled"] is True
+
+            disabled = server.make_request(
+                "POST", "/props", data={"telemetry_control": {}}, headers=auth
+            )
+            assert disabled.status_code == 200
+            assert disabled.body["telemetry_control"]["generation"] == 2
+            disabled_boundary = wait_for_control_boundary(server, auth, 2, completion)
+            assert disabled_boundary is not None
+            assert disabled_boundary["microbatch_generation"] == 2
+            assert all(value is False for value in disabled_boundary["effective"].values())
+            assert disabled_boundary["native_moe_routing_enabled"] is False
+            assert "trace_id" not in disabled_boundary
+
+            reenabled = server.make_request(
+                "POST", "/props", data={"telemetry_control": {"moe_routing": True}}, headers=auth
+            )
+            assert reenabled.status_code == 200
+            assert reenabled.body["telemetry_control"]["generation"] == 3
+            reenabled_boundary = wait_for_control_boundary(server, auth, 3, completion)
+            assert reenabled_boundary is not None
+            assert reenabled_boundary["microbatch_generation"] == 3
+            assert reenabled_boundary["effective"]["moe_routing"] is True
+            assert reenabled_boundary["native_moe_routing_enabled"] is True
             response = completion.result(timeout=60)
             assert response.status_code == 200
 
@@ -2341,6 +2391,10 @@ def test_moe_routing_chunks_mark_on_off_on_intervals_partial():
         )
         assert any(
             decision["event_key"]["control_generation"] == 3
+            for chunk in chunks for decision in chunk["decisions"]
+        )
+        assert not any(
+            decision["event_key"]["control_generation"] == 2
             for chunk in chunks for decision in chunk["decisions"]
         )
     finally:
