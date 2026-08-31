@@ -28,6 +28,12 @@
 #include <random>
 #include <sstream>
 #include <cstring>
+#include <limits>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #ifndef _WIN32
 extern char **environ;
@@ -301,6 +307,8 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
     preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
     preset.unset_option("LLAMA_API_KEY");
+    preset.unset_option("LLAMA_ARG_API_KEY_FILE");
+    preset.unset_option("LLAMA_ARG_ENDPOINT_PROPS");
     preset.unset_option("LLAMA_ARG_MODELS_DIR");
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
@@ -354,6 +362,102 @@ static std::vector<std::string> get_environment() {
 #endif
 
     return env;
+}
+
+static bool is_env_var(const std::string & entry, const char * name) {
+    const size_t equals = entry.find('=');
+    if (equals == std::string::npos || equals != std::strlen(name)) {
+        return false;
+    }
+#ifdef _WIN32
+    return _strnicmp(entry.c_str(), name, equals) == 0;
+#else
+    return entry.compare(0, equals, name) == 0;
+#endif
+}
+
+static std::vector<std::string> get_child_environment() {
+    std::vector<std::string> env = get_environment();
+    env.erase(std::remove_if(env.begin(), env.end(), [](const std::string & entry) {
+        return is_env_var(entry, "LLAMA_API_KEY")
+            || is_env_var(entry, "LLAMA_ARG_API_KEY_FILE")
+            || is_env_var(entry, "LLAMA_ARG_ENDPOINT_PROPS");
+    }), env.end());
+    return env;
+}
+
+static std::string create_child_api_key_file(const std::vector<std::string> & api_keys) {
+    std::string contents;
+    for (const std::string & key : api_keys) {
+        if (!key.empty()) {
+            contents += key;
+            contents += '\n';
+        }
+    }
+    if (contents.empty()) {
+        throw std::runtime_error("cannot create an empty child API key file");
+    }
+
+    std::error_code ec;
+    const std::filesystem::path temp_dir = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        throw std::runtime_error("failed to find a temporary directory for child API keys: " + ec.message());
+    }
+
+#ifdef _WIN32
+    if (contents.size() > std::numeric_limits<DWORD>::max()) {
+        throw std::runtime_error("temporary child API key file is too large");
+    }
+    std::wstring temp_file(MAX_PATH, L'\0');
+    const std::wstring temp_dir_w = temp_dir.wstring();
+    if (GetTempFileNameW(temp_dir_w.c_str(), L"lsk", 0, temp_file.data()) == 0) {
+        throw std::runtime_error("failed to create a temporary child API key file");
+    }
+    temp_file.resize(wcslen(temp_file.c_str()));
+
+    HANDLE handle = CreateFileW(temp_file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        std::filesystem::remove(temp_file, ec);
+        throw std::runtime_error("failed to open a temporary child API key file");
+    }
+
+    DWORD written = 0;
+    bool wrote = WriteFile(handle, contents.data(), static_cast<DWORD>(contents.size()), &written, nullptr) != 0
+        && written == contents.size();
+    wrote = CloseHandle(handle) != 0 && wrote;
+    if (!wrote) {
+        std::filesystem::remove(temp_file, ec);
+        throw std::runtime_error("failed to write a temporary child API key file");
+    }
+    return wide_to_utf8(temp_file.c_str());
+#else
+    std::string pattern = (temp_dir / "llama-router-api-key-XXXXXX").string();
+    std::vector<char> path(pattern.begin(), pattern.end());
+    path.push_back('\0');
+    const int fd = mkstemp(path.data());
+    if (fd < 0) {
+        throw std::runtime_error("failed to create a temporary child API key file");
+    }
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        close(fd);
+        std::filesystem::remove(path.data(), ec);
+        throw std::runtime_error("failed to protect a temporary child API key file");
+    }
+    FILE * file = fdopen(fd, "wb");
+    if (file == nullptr) {
+        close(fd);
+        std::filesystem::remove(path.data(), ec);
+        throw std::runtime_error("failed to open a temporary child API key file");
+    }
+    bool wrote = fwrite(contents.data(), 1, contents.size(), file) == contents.size();
+    wrote = fflush(file) == 0 && wrote;
+    wrote = fclose(file) == 0 && wrote;
+    if (!wrote) {
+        std::filesystem::remove(path.data(), ec);
+        throw std::runtime_error("failed to write a temporary child API key file");
+    }
+    return path.data();
+#endif
 }
 
 void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
@@ -410,7 +514,7 @@ server_models::server_models(
         char ** argv)
             : ctx_preset(LLAMA_EXAMPLE_SERVER),
               base_params(params),
-              base_env(get_environment()),
+              base_env(get_child_environment()),
               base_preset(ctx_preset.load_from_args(argc, argv)),
               sched(std::make_unique<server_lru_sched>(*this)) {
     // clean up base preset
@@ -427,7 +531,16 @@ server_models::server_models(
     debug_fake_timing = !common_get_env("LLAMA_SERVER_DEBUG_FAKE_TIMING").empty();
 }
 
-server_models::~server_models() = default;
+server_models::~server_models() {
+    unload_all();
+    if (!child_api_key_file.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(child_api_key_file, ec);
+        if (ec) {
+            SRV_WRN("failed to remove child API key file: %s\n", ec.message().c_str());
+        }
+    }
+}
 
 void server_models::add_model(server_model_meta && meta) {
     if (mapping.find(meta.name) != mapping.end()) {
@@ -1027,22 +1140,14 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
         if (base_params.endpoint_props && !base_params.api_keys.empty()) {
-            std::string api_keys;
-            for (const std::string & key : base_params.api_keys) {
-                if (key.empty()) {
-                    continue;
-                }
-                if (!api_keys.empty()) {
-                    api_keys += ',';
-                }
-                api_keys += key;
+            if (child_api_key_file.empty()) {
+                child_api_key_file = create_child_api_key_file(base_params.api_keys);
             }
-            if (!api_keys.empty()) {
-                // Child servers are loopback-only, but retain the same guard and
-                // auth middleware for model-targeted POST /props requests.
-                child_env.push_back("LLAMA_ARG_ENDPOINT_PROPS=1");
-                child_env.push_back("LLAMA_API_KEY=" + api_keys);
-            }
+            // Child servers are loopback-only, but retain the same guard and
+            // auth middleware for model-targeted POST /props requests.
+            child_args.push_back("--props");
+            child_args.push_back("--api-key-file");
+            child_args.push_back(child_api_key_file);
         }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {

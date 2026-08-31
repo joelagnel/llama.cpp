@@ -1,4 +1,5 @@
 import threading
+from pathlib import Path
 import pytest
 from utils import *
 
@@ -364,6 +365,15 @@ def test_router_api_key_required():
     )
     assert authed.status_code == 200
     assert "error" not in authed.body
+
+
+def test_router_child_api_key_is_file_backed():
+    source = Path(__file__).parents[2] / "server-models.cpp"
+    text = source.read_text(encoding="utf-8")
+
+    assert 'child_env.push_back("LLAMA_API_KEY="' not in text
+    assert 'child_args.push_back("--api-key-file")' in text
+    assert 'is_env_var(entry, "LLAMA_API_KEY")' in text
 
 
 def test_router_reload_models():

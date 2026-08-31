@@ -200,6 +200,7 @@ private:
     common_params base_params;
     std::string bin_path;
     std::vector<std::string> base_env;
+    std::string child_api_key_file;
     common_preset base_preset; // base preset from llama-server CLI args
 
     // queue of requests waiting for a models_max slot
