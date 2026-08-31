@@ -307,10 +307,21 @@ def test_event_ring_reports_singleton_trailing_gap_for_dropped_completion():
     )
     assert completion.status_code == 200
 
-    response = server.make_request("GET", "/telemetry/v1/events?cursor=0&limit=100", headers=auth)
+    limited = server.make_request("GET", "/telemetry/v1/events?cursor=0&limit=1", headers=auth)
+    assert limited.status_code == 200
+    limited_body = limited.body
+    assert len(limited_body["events"]) == 1
+    assert limited_body["cursor"] == limited_body["events"][-1]["sequence"]
+    assert limited_body["gap"] is False
+    assert limited_body["gap_ranges"] == []
+
+    response = server.make_request(
+        "GET", f"/telemetry/v1/events?cursor={limited_body['cursor']}&limit=100", headers=auth
+    )
     assert response.status_code == 200
     body = response.body
     final_sequence = body["next_sequence"] - 1
+    assert limited_body["cursor"] < final_sequence
     assert body["dropped_events"] == 1
     assert body["last_dropped_sequence"] == final_sequence
     assert body["events"][-1]["sequence"] == final_sequence - 1

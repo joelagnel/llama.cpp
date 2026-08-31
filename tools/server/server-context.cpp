@@ -9419,26 +9419,6 @@ private:
         const uint64_t effective_cursor = future_cursor ? latest : cursor;
         std::string events = "[";
         const uint64_t oldest = telemetry_events.empty() ? telemetry_next_sequence : telemetry_events.front().sequence;
-        json gap_ranges = json::array();
-        uint64_t previous_sequence = effective_cursor;
-        for (const auto & entry : telemetry_events) {
-            if (entry.sequence <= effective_cursor) {
-                continue;
-            }
-            if (previous_sequence + 1 < entry.sequence) {
-                gap_ranges.push_back({
-                    {"first_sequence", previous_sequence + 1},
-                    {"last_sequence", entry.sequence - 1},
-                });
-            }
-            previous_sequence = entry.sequence;
-        }
-        if (previous_sequence < latest) {
-            gap_ranges.push_back({
-                {"first_sequence", previous_sequence + 1},
-                {"last_sequence", latest},
-            });
-        }
         size_t event_count = 0;
         uint64_t next_cursor = effective_cursor;
         for (const auto & entry : telemetry_events) {
@@ -9456,6 +9436,24 @@ private:
             }
         }
         events += ']';
+
+        json gap_ranges = json::array();
+        uint64_t previous_sequence = effective_cursor;
+        for (const auto & entry : telemetry_events) {
+            if (entry.sequence <= effective_cursor) {
+                continue;
+            }
+            if (entry.sequence > next_cursor) {
+                break;
+            }
+            if (previous_sequence + 1 < entry.sequence) {
+                gap_ranges.push_back({
+                    {"first_sequence", previous_sequence + 1},
+                    {"last_sequence", entry.sequence - 1},
+                });
+            }
+            previous_sequence = entry.sequence;
+        }
         return telemetry_response_with_serialized_events({
             {"schema_version", 1},
             {"server_instance_id", telemetry_server_instance_id},
