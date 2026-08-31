@@ -6117,10 +6117,12 @@ private:
         GGML_ASSERT(routed_expert_count > 0 && experts_per_token > 0 && model_layer_count > 0 && moe_layer_count > 0);
 
         json moe_layer_indices = json::array();
+        int32_t previous_layer_index = -1;
         for (int32_t index = 0; index < moe_layer_count; ++index) {
             const int32_t layer_index = llama_model_moe_layer_index(model_tgt, index);
-            GGML_ASSERT(layer_index >= 0 && layer_index < model_layer_count);
+            GGML_ASSERT(layer_index > previous_layer_index && layer_index < model_layer_count);
             moe_layer_indices.push_back(layer_index);
+            previous_layer_index = layer_index;
         }
 
         return {
@@ -6133,7 +6135,7 @@ private:
             {"model_fingerprint_reason", "llama-server does not expose a stable model digest."},
             {"routed_expert_count", routed_expert_count},
             {"experts_per_token", experts_per_token},
-            {"moe_layer_count", model_layer_count},
+            {"moe_layer_count", moe_layer_count},
             {"model_layer_count", model_layer_count},
             {"moe_layer_indices", std::move(moe_layer_indices)},
             {"shared_expert_count", shared_expert_count},
