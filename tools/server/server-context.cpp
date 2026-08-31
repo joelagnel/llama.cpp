@@ -528,12 +528,15 @@ struct server_slot {
     uint64_t telemetry_moe_chunk_sequence = 0;
     uint64_t telemetry_moe_chunk_decision_sequence = 0;
     uint64_t telemetry_moe_chunk_rows = 0;
+    uint64_t telemetry_moe_chunk_trace_rows = 0;
     uint64_t telemetry_moe_chunk_invalid_rows = 0;
     uint64_t telemetry_moe_chunk_unavailable_rows = 0;
     uint64_t telemetry_moe_chunk_unlinked_rows = 0;
+    uint64_t telemetry_moe_chunk_unlocated_rows = 0;
     bool telemetry_moe_chunk_capture_started = false;
     bool telemetry_moe_chunk_capture_interrupted = false;
     bool telemetry_moe_chunk_source_unavailable = false;
+    bool telemetry_moe_chunk_serialization_dropped = false;
 
     bool has_next_token = true;
     bool has_new_line   = false;
@@ -676,12 +679,15 @@ struct server_slot {
         telemetry_moe_chunk_sequence = 0;
         telemetry_moe_chunk_decision_sequence = 0;
         telemetry_moe_chunk_rows = 0;
+        telemetry_moe_chunk_trace_rows = 0;
         telemetry_moe_chunk_invalid_rows = 0;
         telemetry_moe_chunk_unavailable_rows = 0;
         telemetry_moe_chunk_unlinked_rows = 0;
+        telemetry_moe_chunk_unlocated_rows = 0;
         telemetry_moe_chunk_capture_started = false;
         telemetry_moe_chunk_capture_interrupted = false;
         telemetry_moe_chunk_source_unavailable = false;
+        telemetry_moe_chunk_serialization_dropped = false;
         json_schema = json();
 
         task_prev = std::move(task);
@@ -1520,6 +1526,7 @@ private:
     uint64_t telemetry_last_dropped_sequence = 0;
     size_t telemetry_event_bytes = 0;
     size_t telemetry_event_max_bytes = 64 * 1024 * 1024;
+    size_t telemetry_moe_chunk_max_bytes = 1024 * 1024;
     uint64_t telemetry_kv_pressure_next_sequence = 1;
     uint64_t telemetry_kv_pressure_dropped_events = 0;
     uint64_t telemetry_kv_pressure_last_dropped_sequence = 0;
@@ -2113,6 +2120,10 @@ private:
         const char * telemetry_moe_activation_limit_env = getenv("LLAMA_TELEMETRY_MOE_ACTIVATION_LIMIT");
         if (telemetry_moe_activation_limit_env) {
             telemetry_moe_activation_limit = (size_t) std::max(1024, std::min(1048576, atoi(telemetry_moe_activation_limit_env)));
+        }
+        const char * telemetry_moe_chunk_max_bytes_env = getenv("LLAMA_TELEMETRY_MOE_CHUNK_MAX_BYTES");
+        if (telemetry_moe_chunk_max_bytes_env) {
+            telemetry_moe_chunk_max_bytes = (size_t) std::max(1024, std::min(1024 * 1024, atoi(telemetry_moe_chunk_max_bytes_env)));
         }
         const char * telemetry_buffer_env = getenv("LLAMA_TELEMETRY_EVENT_BUFFER_MIB");
         if (telemetry_buffer_env) {
@@ -5295,10 +5306,9 @@ private:
         telemetry_append_serialized(sequence, event.dump());
     }
 
-    void telemetry_append_with_serialized_bytes(json event) {
+    std::string telemetry_serialize_with_serialized_bytes(json event, uint64_t sequence) const {
         event["schema_version"] = 1;
         event["server_instance_id"] = telemetry_server_instance_id;
-        const uint64_t sequence = telemetry_next_sequence++;
         event["sequence"] = sequence;
         event["serialized_bytes"] = 0;
 
@@ -5317,7 +5327,12 @@ private:
         }
         serialized.replace(marker_offset + marker.size() - 1, 1, std::to_string(final_bytes));
         GGML_ASSERT(serialized.size() == final_bytes);
-        telemetry_append_serialized(sequence, std::move(serialized));
+        return serialized;
+    }
+
+    void telemetry_append_with_serialized_bytes(json event) {
+        const uint64_t sequence = telemetry_next_sequence++;
+        telemetry_append_serialized(sequence, telemetry_serialize_with_serialized_bytes(std::move(event), sequence));
     }
 
     static int64_t telemetry_wall_unix_ms() {
@@ -6013,7 +6028,7 @@ private:
     }
 
     size_t telemetry_moe_chunk_limit_bytes() const {
-        return std::min<size_t>(1024 * 1024, telemetry_event_max_bytes);
+        return std::min(telemetry_moe_chunk_max_bytes, telemetry_event_max_bytes);
     }
 
     void telemetry_record_moe_routing_chunks(
@@ -6089,15 +6104,13 @@ private:
                 invalid_total += telemetry_moe_row_is_invalid(readback.rows[index]);
                 unavailable_total += telemetry_moe_row_is_unavailable(readback.rows[index]);
             }
+            slot.telemetry_moe_chunk_trace_rows += all_rows.size();
 
             json decisions = json::array();
             std::vector<size_t> chunk_rows;
             size_t estimated_bytes = 32 * 1024;
-            auto flush = [&]() {
-                if (decisions.empty()) {
-                    return;
-                }
-
+            uint64_t next_decision_sequence = slot.telemetry_moe_chunk_decision_sequence;
+            auto make_event = [&]() {
                 std::set<std::pair<int32_t, uint32_t>> shared_keys;
                 json shared_experts = json::array();
                 json peer_trace_ids = json::array();
@@ -6105,16 +6118,12 @@ private:
                 bool peer_coverage_complete = true;
                 json first_position = nullptr;
                 json last_position = nullptr;
-                size_t chunk_invalid = 0;
-                size_t chunk_unavailable = 0;
                 for (size_t index : chunk_rows) {
                     const telemetry_moe_routing_row_capture & row = readback.rows[index];
                     shared_keys.insert({row.layer_index, row.graph_type});
                     const physical_peer_coverage & peers = peers_by_ubatch.at(row.physical_ubatch_index);
                     peer_coverage_complete = peer_coverage_complete && peers.complete;
                     chunk_peer_trace_ids.insert(peers.trace_ids.begin(), peers.trace_ids.end());
-                    chunk_invalid += telemetry_moe_row_is_invalid(row);
-                    chunk_unavailable += telemetry_moe_row_is_unavailable(row);
                     if (row.row_identity_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID && row.position >= 0) {
                         first_position = first_position.is_null()
                             ? json(row.position)
@@ -6144,13 +6153,14 @@ private:
                     invalid_total,
                     unavailable_total,
                     slot.telemetry_moe_chunk_unlinked_rows,
+                    slot.telemetry_moe_chunk_unlocated_rows,
                     slot.telemetry_moe_chunk_capture_interrupted,
                     slot.telemetry_moe_chunk_source_unavailable);
-                json event = {
+                return json {
                     {"event", "moe_routing_chunk"},
                     {"moe_routing_schema_version", 2},
                     {"trace_id", trace_id},
-                    {"trace_chunk_sequence", ++slot.telemetry_moe_chunk_sequence},
+                    {"trace_chunk_sequence", slot.telemetry_moe_chunk_sequence + 1},
                     {"final", false},
                     {"control_generation", control_generation},
                     {"physical_step_id", readback.capture_generation},
@@ -6164,21 +6174,40 @@ private:
                         {"chunk_rows", chunk_rows.size()},
                         {"invalid_rows_total", invalid_total},
                         {"unavailable_rows_total", unavailable_total},
-                        {"unlinked_rows_total", 0},
+                        {"unlinked_rows_total", slot.telemetry_moe_chunk_unlinked_rows},
+                        {"unlocated_rows_total", slot.telemetry_moe_chunk_unlocated_rows},
                     }},
                     {"physical_peer_coverage", peer_coverage_complete ? "complete" : "partial"},
-                    {"physical_peer_trace_ids", std::move(peer_trace_ids)},
+                    {"physical_peer_trace_ids", peer_trace_ids},
                     {"position_coverage", {
-                        {"first_model_position", std::move(first_position)},
-                        {"last_model_position", std::move(last_position)},
+                        {"first_model_position", first_position},
+                        {"last_model_position", last_position},
                     }},
-                    {"shared_experts", std::move(shared_experts)},
-                    {"decisions", std::move(decisions)},
+                    {"shared_experts", shared_experts},
+                    {"decisions", decisions},
                 };
+            };
+
+            auto serialized_size = [&]() {
+                return telemetry_serialize_with_serialized_bytes(
+                    make_event(), telemetry_next_sequence).size();
+            };
+
+            auto flush = [&]() {
+                if (decisions.empty()) {
+                    return;
+                }
+
+                json event = make_event();
+                GGML_ASSERT(telemetry_serialize_with_serialized_bytes(event, telemetry_next_sequence).size() <= chunk_limit);
+                ++slot.telemetry_moe_chunk_sequence;
                 telemetry_append_with_serialized_bytes(std::move(event));
                 slot.telemetry_moe_chunk_rows += chunk_rows.size();
-                slot.telemetry_moe_chunk_invalid_rows += chunk_invalid;
-                slot.telemetry_moe_chunk_unavailable_rows += chunk_unavailable;
+                for (size_t index : chunk_rows) {
+                    const telemetry_moe_routing_row_capture & row = readback.rows[index];
+                    slot.telemetry_moe_chunk_invalid_rows += telemetry_moe_row_is_invalid(row);
+                    slot.telemetry_moe_chunk_unavailable_rows += telemetry_moe_row_is_unavailable(row);
+                }
                 chunk_rows.clear();
                 decisions = json::array();
                 estimated_bytes = 32 * 1024;
@@ -6223,7 +6252,7 @@ private:
                 decision_valid = decision_valid && kth_selected_valid && highest_rejected_valid;
                 const bool mtp_verify = !token.is_prompt && slot.can_speculate() && !slot.spec_draft.empty();
                 json decision = {
-                    {"trace_decision_sequence", ++slot.telemetry_moe_chunk_decision_sequence},
+                    {"trace_decision_sequence", next_decision_sequence + 1},
                     {"physical_step_id", readback.capture_generation},
                     {"physical_ubatch_index", row.physical_ubatch_index},
                     {"physical_ubatch_token_index", row.ubatch_token_index >= 0 ? json(row.ubatch_token_index) : json(nullptr)},
@@ -6254,10 +6283,28 @@ private:
                 if (const char * reason = telemetry_moe_value_status_reason(row.rejected_score_status)) {
                     decision["highest_rejected_score_reason"] = reason;
                 }
-                decisions.push_back(std::move(decision));
+                decisions.push_back(decision);
                 chunk_rows.push_back(index);
+                if (serialized_size() > chunk_limit) {
+                    decisions.erase(decisions.size() - 1);
+                    chunk_rows.pop_back();
+                    if (!decisions.empty()) {
+                        flush();
+                    }
+                    decisions.push_back(decision);
+                    chunk_rows.push_back(index);
+                    if (serialized_size() > chunk_limit) {
+                        decisions.erase(decisions.size() - 1);
+                        chunk_rows.pop_back();
+                        slot.telemetry_moe_chunk_serialization_dropped = true;
+                        slot.telemetry_moe_chunk_unlocated_rows++;
+                        continue;
+                    }
+                }
+                ++next_decision_sequence;
                 estimated_bytes += decision_estimate;
             }
+            slot.telemetry_moe_chunk_decision_sequence = next_decision_sequence;
             flush();
             slot.telemetry_moe_chunk_capture_started = true;
         }
@@ -6271,6 +6318,7 @@ private:
             slot.telemetry_moe_chunk_invalid_rows,
             slot.telemetry_moe_chunk_unavailable_rows,
             slot.telemetry_moe_chunk_unlinked_rows,
+            slot.telemetry_moe_chunk_unlocated_rows,
             slot.telemetry_moe_chunk_capture_interrupted,
             slot.telemetry_moe_chunk_source_unavailable);
         json event = {
@@ -6288,11 +6336,12 @@ private:
             {"slot_assignment_ordinal", slot.telemetry_assignment_ordinal},
             {"producer_coverage", {
                 {"state", partial ? "partial" : "complete"},
-                {"trace_rows_total", slot.telemetry_moe_chunk_rows},
+                {"trace_rows_total", slot.telemetry_moe_chunk_trace_rows},
                 {"chunk_rows", 0},
                 {"invalid_rows_total", slot.telemetry_moe_chunk_invalid_rows},
                 {"unavailable_rows_total", slot.telemetry_moe_chunk_unavailable_rows},
                 {"unlinked_rows_total", slot.telemetry_moe_chunk_unlinked_rows},
+                {"unlocated_rows_total", slot.telemetry_moe_chunk_unlocated_rows},
             }},
             {"physical_peer_coverage", "partial"},
             {"physical_peer_trace_ids", json::array()},
@@ -6305,6 +6354,8 @@ private:
         };
         if (slot.telemetry_moe_chunk_capture_interrupted) {
             event["capture_interruption_reason"] = "telemetry_control_disabled";
+        } else if (slot.telemetry_moe_chunk_serialization_dropped) {
+            event["capture_interruption_reason"] = "serialized_chunk_limit";
         } else if (slot.telemetry_moe_chunk_source_unavailable) {
             event["capture_interruption_reason"] = "native_readback_unavailable";
         }

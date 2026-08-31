@@ -71,12 +71,13 @@ static void test_cap_and_invalid_records_remain_distinct(testing & t) {
 }
 
 static void test_producer_coverage_requires_valid_linked_rows(testing & t) {
-    t.assert_true(!server_moe_routing_producer_coverage_is_partial(0, 0, 0, false, false));
-    t.assert_true( server_moe_routing_producer_coverage_is_partial(1, 0, 0, false, false));
-    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 1, 0, false, false));
-    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 1, false, false));
-    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 0, true,  false));
-    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 0, false, true));
+    t.assert_true(!server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, false, false));
+    t.assert_true( server_moe_routing_producer_coverage_is_partial(1, 0, 0, 0, false, false));
+    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 1, 0, 0, false, false));
+    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 1, 0, false, false));
+    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 0, 1, false, false));
+    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, true,  false));
+    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, false, true));
 }
 
 int main() {

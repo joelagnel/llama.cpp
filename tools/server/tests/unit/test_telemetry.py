@@ -1942,6 +1942,62 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         server.stop()
 
 
+def test_moe_routing_chunk_byte_cap_marks_oversized_rows_partial(monkeypatch):
+    global server
+
+    api_key = "moe-routing-chunk-cap-test-key"
+    auth = {"Authorization": f"Bearer {api_key}"}
+    monkeypatch.setenv("LLAMA_TELEMETRY_MOE_CHUNK_MAX_BYTES", "1024")
+    server = ServerPreset.stories15m_moe()
+    server.server_props = True
+    server.api_key = api_key
+    server.n_batch = 4
+    server.n_ubatch = 2
+    server.start()
+
+    try:
+        control = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"moe_routing": True}},
+            headers=auth,
+        )
+        assert control.status_code == 200
+
+        response = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": "A bounded routing chunk capture.",
+                "n_predict": 1,
+                "ignore_eos": True,
+                "temperature": 0,
+            },
+            headers=auth,
+        )
+        assert response.status_code == 200
+
+        events = server.make_request(
+            "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
+        )
+        chunks = [
+            event for event in events.body["events"]
+            if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
+        ]
+        assert chunks
+        assert all(chunk["serialized_bytes"] <= 1024 for chunk in chunks)
+        assert chunks[-1]["final"] is True
+        assert chunks[-1]["producer_coverage"]["state"] == "partial"
+        assert chunks[-1]["capture_interruption_reason"] == "serialized_chunk_limit"
+        assert chunks[-1]["producer_coverage"]["unavailable_rows_total"] == 0
+        assert chunks[-1]["producer_coverage"]["unlocated_rows_total"] > 0
+        assert chunks[-1]["producer_coverage"]["trace_rows_total"] >= (
+            chunks[-1]["producer_coverage"]["unlocated_rows_total"]
+        )
+    finally:
+        server.stop()
+
+
 def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
     api_key = "moe-routing-mtp-test-key"
     auth = {"Authorization": f"Bearer {api_key}"}

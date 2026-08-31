@@ -56,9 +56,10 @@ inline bool server_moe_routing_producer_coverage_is_partial(
         uint64_t invalid_rows,
         uint64_t unavailable_rows,
         uint64_t unlinked_rows,
+        uint64_t unlocated_rows,
         bool interrupted,
         bool source_unavailable) {
-    return invalid_rows > 0 || unavailable_rows > 0 || unlinked_rows > 0 || interrupted || source_unavailable;
+    return invalid_rows > 0 || unavailable_rows > 0 || unlinked_rows > 0 || unlocated_rows > 0 || interrupted || source_unavailable;
 }
 
 inline const char * server_moe_routing_capture_state(
