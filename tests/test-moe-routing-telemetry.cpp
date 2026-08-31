@@ -248,13 +248,16 @@ static void test_saturated_native_dispatch_loss_serialization(testing & t) {
     t.assert_equal(288ULL, gap.at("first_physical_step").get<uint64_t>());
     t.assert_equal(311ULL, gap.at("next_physical_step").get<uint64_t>());
     t.assert_equal(287U, gap.at("first_physical_microbatch").get<uint32_t>());
-    t.assert_equal(309U, gap.at("last_physical_microbatch").get<uint32_t>());
+    t.assert_equal(0U, gap.at("last_physical_microbatch").get<uint32_t>());
     t.assert_equal(101LL, gap.at("first_dispatch_monotonic_us").get<int64_t>());
     t.assert_equal(123LL, gap.at("last_dispatch_monotonic_us").get<int64_t>());
     t.assert_equal(23ULL, gap.at("physical_dispatch_count").get<uint64_t>());
+    t.assert_equal(1ULL, gap.at("encode_physical_dispatch_count").get<uint64_t>());
+    t.assert_equal(22ULL, gap.at("decode_physical_dispatch_count").get<uint64_t>());
     t.assert_equal("target", gap.at("physical_context").get<std::string>());
     t.assert_equal("decode", gap.at("operation").get<std::string>());
-    t.assert_equal("decode", gap.at("last_operation").get<std::string>());
+    t.assert_equal("encode", gap.at("last_operation").get<std::string>());
+    t.assert_equal("mixed", gap.at("operation_state").get<std::string>());
     t.assert_true(gap.at("saturation").get<bool>());
     t.assert_equal("saturated_exact", gap.at("loss_descriptor_state").get<std::string>());
     t.assert_equal("mixed", gap.at("generation_state").get<std::string>());
@@ -267,9 +270,11 @@ static void test_saturated_native_dispatch_loss_serialization(testing & t) {
     t.assert_equal("native_dispatch_queue_overflow", gap.at("cause").get<std::string>());
     t.assert_equal(1U, chunk.at("availability").get<uint32_t>());
     t.assert_true(!chunk.contains("unlocated_coverage_loss"));
-    t.assert_equal(1U, (uint32_t) chunk.at("gaps").size());
-    t.assert_equal(288ULL, chunk.at("gaps").at(0).at("first_physical_step").get<uint64_t>());
-    t.assert_equal(311ULL, chunk.at("gaps").at(0).at("next_physical_step").get<uint64_t>());
+    t.assert_equal(2U, (uint32_t) chunk.at("gaps").size());
+    t.assert_equal(239ULL, chunk.at("gaps").at(0).at("first_physical_step").get<uint64_t>());
+    t.assert_equal(240ULL, chunk.at("gaps").at(0).at("next_physical_step").get<uint64_t>());
+    t.assert_equal(288ULL, chunk.at("gaps").at(1).at("first_physical_step").get<uint64_t>());
+    t.assert_equal(311ULL, chunk.at("gaps").at(1).at("next_physical_step").get<uint64_t>());
 }
 #endif
 
