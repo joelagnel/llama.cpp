@@ -2,6 +2,7 @@ import pytest
 from openai import OpenAI
 from utils import *
 import threading
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 server = ServerPreset.tinyllama2()
@@ -85,6 +86,28 @@ def test_openai_library_correct_api_key():
         ],
     )
     assert len(res.choices) == 1
+
+
+def test_api_key_trace_does_not_log_secret():
+    global server
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as log_file:
+        log_path = log_file.name
+
+    try:
+        server.debug = True
+        server.log_path = log_path
+        server.start()
+        server.stop()
+
+        with open(log_path, encoding="utf-8") as log_file:
+            log = log_file.read()
+        assert TEST_API_KEY not in log
+        assert TEST_API_KEY[-4:] not in log
+        assert "api_keys: configured (count=1)" in log
+    finally:
+        server.stop()
+        if os.path.exists(log_path):
+            os.unlink(log_path)
 
 
 @pytest.mark.parametrize("origin,cors_header,cors_header_value", [

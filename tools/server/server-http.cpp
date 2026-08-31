@@ -172,12 +172,10 @@ bool server_http_context::init(const common_params & params) {
         }
     });
 
-    if (params.api_keys.size() == 1) {
-        const auto key = params.api_keys[0];
-        const std::string substr = key.substr(std::max(static_cast<int>(key.length() - 4), 0));
-        SRV_TRC("api_keys: ****%s\n", substr.c_str());
-    } else if (params.api_keys.size() > 1) {
-        SRV_TRC("api_keys: %zu keys loaded\n", params.api_keys.size());
+    if (params.api_keys.empty()) {
+        SRV_TRC("api_keys: not configured\n");
+    } else {
+        SRV_TRC("api_keys: configured (count=%zu)\n", params.api_keys.size());
     }
 
     //
