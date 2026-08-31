@@ -3141,7 +3141,7 @@ void llama_context::extract_moe_routing(
                     (int32_t) token,
                     (int32_t) (token_offset + token),
                     ubatch.token ? ubatch.token[token] : -1,
-                    ubatch.pos ? ubatch.pos[token*ubatch.n_pos] : -1,
+                    ubatch.pos ? ubatch.pos[token] : -1,
                     LLAMA_MOE_ROUTING_VALUE_STATUS_VALID,
                 };
             }
@@ -3159,7 +3159,7 @@ void llama_context::extract_moe_routing(
                         (int32_t) token,
                         (int32_t) (token_offset + token),
                         ubatch.token ? ubatch.token[token] : -1,
-                        ubatch.pos ? ubatch.pos[token*ubatch.n_pos] : -1,
+                        ubatch.pos ? ubatch.pos[token] : -1,
                         LLAMA_MOE_ROUTING_VALUE_STATUS_VALID,
                     };
                 }
