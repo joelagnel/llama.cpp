@@ -7583,13 +7583,13 @@ private:
                         {"physical_microbatch", id.microbatch},
                         {"physical_step", physical_step(id.microbatch)},
                         {"physical_context", "target"},
-                        {"operation", operation},
-                        {"dispatch_monotonic_us", dispatch_monotonic_us(id.microbatch) > 0
-                            ? json(dispatch_monotonic_us(id.microbatch)) : json(nullptr)},
                         {"phase", id.phase},
                         {"layer_index", id.layer},
                         {"control_generation", control_generation},
                     }},
+                    {"dispatch_monotonic_us", dispatch_monotonic_us(id.microbatch) > 0
+                        ? json(dispatch_monotonic_us(id.microbatch)) : json(nullptr)},
+                    {"operation", operation},
                     {"expected_request_trace_count", coverage.expected_trace_ids.size()},
                     {"expected_decision_count", coverage.expected_decisions},
                     {"captured_valid_decision_count", coverage.captured_valid_decisions},

@@ -2108,14 +2108,23 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         for chunk in chunks:
             for physical in chunk["physical_events"]:
                 key = physical["event_key"]
+                assert set(key) == {
+                    "server_instance_id",
+                    "physical_microbatch",
+                    "physical_step",
+                    "physical_context",
+                    "phase",
+                    "layer_index",
+                    "control_generation",
+                }
                 assert key["physical_context"] == "target"
-                assert key["operation"] == "decode"
-                assert key["dispatch_monotonic_us"] > 0
+                assert physical["operation"] == "decode"
+                assert physical["dispatch_monotonic_us"] > 0
                 assert "timestamp_state" not in physical
                 previous = timestamps_by_step.setdefault(
-                    key["physical_step"], key["dispatch_monotonic_us"]
+                    key["physical_step"], physical["dispatch_monotonic_us"]
                 )
-                assert previous == key["dispatch_monotonic_us"]
+                assert previous == physical["dispatch_monotonic_us"]
         assert timestamps_by_step
         ordered_timestamps = [timestamps_by_step[step] for step in sorted(timestamps_by_step)]
         assert ordered_timestamps == sorted(ordered_timestamps)
