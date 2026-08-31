@@ -6102,6 +6102,41 @@ private:
             <= telemetry_moe_chunk_limit_bytes();
     }
 
+    json telemetry_moe_routing_descriptor() const {
+        const int32_t routed_expert_count = llama_model_n_expert(model_tgt);
+        const int32_t experts_per_token = llama_model_n_expert_used(model_tgt);
+        const int32_t model_layer_count = llama_model_n_layer(model_tgt);
+        const int32_t moe_layer_count = llama_model_n_moe_layer(model_tgt);
+        const int32_t shared_expert_count = llama_model_n_expert_shared(model_tgt);
+        GGML_ASSERT(routed_expert_count > 0 && experts_per_token > 0 && model_layer_count > 0 && moe_layer_count > 0);
+
+        json moe_layer_indices = json::array();
+        for (int32_t index = 0; index < moe_layer_count; ++index) {
+            const int32_t layer_index = llama_model_moe_layer_index(model_tgt, index);
+            GGML_ASSERT(layer_index >= 0 && layer_index < model_layer_count);
+            moe_layer_indices.push_back(layer_index);
+        }
+
+        return {
+            {"schema_version", 2},
+            {"server_instance_id", telemetry_server_instance_id},
+            {"server_build", std::string(llama_build_info())},
+            {"model_id", model_name},
+            {"model_fingerprint", nullptr},
+            {"model_fingerprint_availability", 10},
+            {"model_fingerprint_reason", "llama-server does not expose a stable model digest."},
+            {"routed_expert_count", routed_expert_count},
+            {"experts_per_token", experts_per_token},
+            {"moe_layer_count", model_layer_count},
+            {"model_layer_count", model_layer_count},
+            {"moe_layer_indices", std::move(moe_layer_indices)},
+            {"shared_expert_count", shared_expert_count},
+            {"weight_semantics", "exact effective routed coefficient"},
+            {"score_semantics", "router score after selection bias and group masking"},
+            {"clock_domain", "llama_server_process_monotonic"},
+        };
+    }
+
     bool telemetry_moe_chunk_can_be_finalized(const json & event) const {
         // The one pending chunk becomes the substantive final chunk. Reserve
         // the bounded, coordinate-free interruption evidence it may need at
@@ -6267,30 +6302,7 @@ private:
             slot.telemetry_moe_chunk_unavailable_rows += telemetry_moe_row_is_unavailable(row);
         }
 
-        int32_t shared_expert_count = 0;
-        for (const telemetry_moe_shared_expert_capture & shared : readback.shared_experts) {
-            shared_expert_count = std::max(shared_expert_count, (int32_t) shared.configured_count);
-        }
-        const int32_t routed_expert_count = llama_model_n_expert(model_tgt);
-        const int32_t experts_per_token = llama_model_n_expert_used(model_tgt);
-        const int32_t moe_layer_count = llama_model_n_layer(model_tgt);
-        GGML_ASSERT(routed_expert_count > 0 && experts_per_token > 0 && moe_layer_count > 0);
-        const json descriptor = {
-            {"schema_version", 2},
-            {"server_instance_id", telemetry_server_instance_id},
-            {"server_build", std::string(llama_build_info())},
-            {"model_id", model_name},
-            {"model_fingerprint", nullptr},
-            {"model_fingerprint_availability", 10},
-            {"model_fingerprint_reason", "llama-server does not expose a stable model digest."},
-            {"routed_expert_count", routed_expert_count},
-            {"experts_per_token", experts_per_token},
-            {"moe_layer_count", moe_layer_count},
-            {"shared_expert_count", shared_expert_count},
-            {"weight_semantics", "exact effective routed coefficient"},
-            {"score_semantics", "router score after selection bias and group masking"},
-            {"clock_domain", "llama_server_process_monotonic"},
-        };
+        const json descriptor = telemetry_moe_routing_descriptor();
 
         const auto shared_metadata = [&](const telemetry_moe_routing_row_capture & row) {
             for (const telemetry_moe_shared_expert_capture & shared : readback.shared_experts) {
@@ -6588,10 +6600,8 @@ private:
             return;
         }
 
-        const int32_t routed_expert_count = llama_model_n_expert(model_tgt);
-        const int32_t experts_per_token = llama_model_n_expert_used(model_tgt);
-        const int32_t moe_layer_count = llama_model_n_layer(model_tgt);
-        if (routed_expert_count <= 0 || experts_per_token <= 0 || moe_layer_count <= 0) {
+        if (llama_model_n_expert(model_tgt) <= 0 || llama_model_n_expert_used(model_tgt) <= 0 ||
+                llama_model_n_moe_layer(model_tgt) <= 0) {
             return;
         }
         json marker = {
@@ -6603,22 +6613,7 @@ private:
             {"is_final_for_trace", true},
             {"availability", 10},
             {"reason", "No routable MoE records were retained for this request."},
-            {"descriptor", {
-                {"schema_version", 2},
-                {"server_instance_id", telemetry_server_instance_id},
-                {"server_build", std::string(llama_build_info())},
-                {"model_id", model_name},
-                {"model_fingerprint", nullptr},
-                {"model_fingerprint_availability", 10},
-                {"model_fingerprint_reason", "llama-server does not expose a stable model digest."},
-                {"routed_expert_count", routed_expert_count},
-                {"experts_per_token", experts_per_token},
-                {"moe_layer_count", moe_layer_count},
-                {"shared_expert_count", 0},
-                {"weight_semantics", "exact effective routed coefficient"},
-                {"score_semantics", "router score after selection bias and group masking"},
-                {"clock_domain", "llama_server_process_monotonic"},
-            }},
+            {"descriptor", telemetry_moe_routing_descriptor()},
         };
         telemetry_append_moe_routing_chunk(std::move(marker));
     }

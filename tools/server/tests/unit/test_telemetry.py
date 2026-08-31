@@ -1934,6 +1934,13 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         assert chunks[-1]["decisions"]
         assert all(chunk["availability"] == 0 for chunk in chunks)
         assert all(chunk["descriptor"]["schema_version"] == 2 for chunk in chunks)
+        assert all(
+            chunk["descriptor"]["model_layer_count"] == chunk["descriptor"]["moe_layer_count"]
+            and chunk["descriptor"]["moe_layer_indices"] == sorted(chunk["descriptor"]["moe_layer_indices"])
+            and len(chunk["descriptor"]["moe_layer_indices"]) > 0
+            and all(0 <= layer < chunk["descriptor"]["model_layer_count"] for layer in chunk["descriptor"]["moe_layer_indices"])
+            for chunk in chunks
+        )
         assert all(chunk["descriptor"]["model_fingerprint"] is None for chunk in chunks)
         assert all(chunk["descriptor"]["model_fingerprint_availability"] == 10 for chunk in chunks)
         assert all("moe_routing_schema_version" not in chunk and "final" not in chunk for chunk in chunks)
@@ -2003,6 +2010,10 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         assert [decision["sequence"] for decision in decisions] == list(range(len(decisions)))
         assert {decision["event_key"]["phase"] for decision in decisions} >= {1, 2}
         assert all(chunk["serialized_bytes"] <= 1024 * 1024 for chunk in chunks)
+        assert all(
+            decision["event_key"]["layer_index"] in chunk["descriptor"]["moe_layer_indices"]
+            for chunk in chunks for decision in chunk["decisions"]
+        )
         assert all(
             chunk["serialized_bytes"] == len(
                 json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
