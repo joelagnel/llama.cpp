@@ -15,6 +15,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "src/llama-ext.h"
+#include "src/llama-graph.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -5996,8 +5997,15 @@ private:
     }
 
     static uint32_t telemetry_moe_phase_number(
+            uint32_t graph_type,
             const server_batch::token & token,
             const server_slot & slot) {
+        if (graph_type == LLM_GRAPH_TYPE_DECODER_MTP) {
+            return 3; // MtpVerify
+        }
+        if (graph_type == LLM_GRAPH_TYPE_ENCODER) {
+            return 1; // PrefillOutput
+        }
         if (token.is_prompt) {
             return 1; // PrefillOutput
         }
@@ -6008,10 +6016,10 @@ private:
 
     static const char * telemetry_moe_graph_type_name(uint32_t graph_type) {
         switch (graph_type) {
-            case 0: return "default";
-            case 1: return "encoder";
-            case 2: return "decoder";
-            case 3: return "decoder_mtp";
+            case LLM_GRAPH_TYPE_DEFAULT: return "default";
+            case LLM_GRAPH_TYPE_ENCODER: return "encoder";
+            case LLM_GRAPH_TYPE_DECODER: return "decoder";
+            case LLM_GRAPH_TYPE_DECODER_MTP: return "decoder_mtp";
         }
         return "unknown";
     }
@@ -6298,31 +6306,32 @@ private:
             if (!slot.task) {
                 continue;
             }
-            const uint32_t phase = telemetry_moe_phase_number(token, slot);
+            const uint32_t phase = telemetry_moe_phase_number(row.graph_type, token, slot);
             const physical_event_id event_id = { row.physical_ubatch_index, row.layer_index, phase };
-            const bool locatable = row.row_identity_status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID
-                && row.layer_index >= 0
+            const bool has_physical_event = row.layer_index >= 0;
+            const bool locatable = row.layer_index >= 0
                 && row.position >= 0
                 && row.row_index >= 0
                 && row.ubatch_token_index >= 0;
             const bool enabled = telemetry_moe_request_enabled(slot);
-            if (!locatable) {
-                if (enabled) {
-                    trace_capture & capture = captures_by_trace[slot.task->trace_id];
-                    capture.slot = &slot;
-                    ++capture.unlocated_rows;
-                    ++slot.telemetry_moe_chunk_unlocated_rows;
-                    ++slot.telemetry_moe_chunk_unlinked_rows;
-                }
-                continue;
+            if (has_physical_event) {
+                physical_event_coverage & coverage = coverage_by_event[event_id];
+                coverage.expected_trace_ids.insert(slot.task->trace_id);
+                ++coverage.expected_decisions;
             }
-
-            physical_event_coverage & coverage = coverage_by_event[event_id];
-            coverage.expected_trace_ids.insert(slot.task->trace_id);
-            ++coverage.expected_decisions;
             if (!enabled) {
                 continue;
             }
+            if (!locatable) {
+                trace_capture & capture = captures_by_trace[slot.task->trace_id];
+                capture.slot = &slot;
+                ++capture.unlocated_rows;
+                ++slot.telemetry_moe_chunk_unlocated_rows;
+                ++slot.telemetry_moe_chunk_unlinked_rows;
+                continue;
+            }
+
+            physical_event_coverage & coverage = coverage_by_event.at(event_id);
 
             const int32_t expected_experts = llama_model_n_expert_used(model_tgt);
             const bool invalid = telemetry_moe_row_is_invalid(row)
@@ -6439,7 +6448,7 @@ private:
                         {"phase", record->event.phase},
                         {"layer_index", record->event.layer},
                         {"control_generation", control_generation},
-                        {"cause", 5},
+                        {"cause", 8},
                         {"reason", "The producer could not retain this exact routing record within the serialized chunk limit."},
                     });
                     continue;

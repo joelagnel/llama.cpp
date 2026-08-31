@@ -2128,6 +2128,10 @@ def test_moe_routing_chunk_byte_cap_splits_canonical_envelopes(monkeypatch):
             chunk["availability"] != 1 or chunk["gaps"] or chunk.get("unlocated_coverage_loss")
             for chunk in chunks
         )
+        assert all(
+            gap["cause"] == 8
+            for chunk in chunks for gap in chunk["gaps"]
+        )
     finally:
         server.stop()
 
