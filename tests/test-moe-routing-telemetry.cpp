@@ -412,25 +412,57 @@ static void test_native_dispatch_loss_timeline(testing & t) {
 static void test_native_dispatch_loss_small_cap_fails_closed(testing & t) {
     const json result = server_test_moe_dispatch_loss_small_cap_json();
     const json & events = result.at("events");
-    t.assert_equal(1024ULL, result.at("chunk_limit_bytes").get<uint64_t>());
-    t.assert_true(result.at("terminal_after_finalize").get<bool>());
-    t.assert_true(!result.at("terminal_after_reset").get<bool>());
-    t.assert_true(!result.at("capture_started_after_reset").get<bool>());
-    t.assert_true(!result.at("source_unavailable_after_reset").get<bool>());
-    t.assert_equal(2ULL, result.at("next_sequence").get<uint64_t>());
-    t.assert_equal(1U, (uint32_t) events.size());
-    const json & event = events.at(0);
-    t.assert_equal("telemetry_dispatch_queue_loss", event.at("event").get<std::string>());
-    t.assert_equal(1ULL, event.at("sequence").get<uint64_t>());
-    t.assert_equal("exact_unavailable", event.at("routing_coverage_state").get<std::string>());
-    t.assert_equal("target", event.at("physical_context").get<std::string>());
-    t.assert_equal(1U, (uint32_t) event.at("losses").size());
-    const json & loss = event.at("losses").at(0);
+    t.assert_equal(1024ULL, result.at("small_chunk_limit_bytes").get<uint64_t>());
+    t.assert_equal(4096ULL, result.at("normal_chunk_limit_bytes").get<uint64_t>());
+    t.assert_true(result.at("native_terminal_after_finalize").get<bool>());
+    t.assert_true(!result.at("native_terminal_after_reset").get<bool>());
+    t.assert_true(!result.at("native_capture_started_after_reset").get<bool>());
+    t.assert_true(!result.at("native_source_unavailable_after_reset").get<bool>());
+    t.assert_true(result.at("routed_span_terminal_after_finalize").get<bool>());
+    t.assert_true(!result.at("routed_span_terminal_after_reset").get<bool>());
+    t.assert_true(result.at("normal_capture_started").get<bool>());
+    t.assert_true(result.at("normal_pending_before_finalize").get<bool>());
+    t.assert_true(!result.at("normal_terminal_after_finalize").get<bool>());
+    t.assert_true(!result.at("normal_terminal_after_reset").get<bool>());
+    t.assert_equal(4ULL, result.at("next_sequence").get<uint64_t>());
+    t.assert_equal(3U, (uint32_t) events.size());
+
+    const json & native_event = events.at(0);
+    t.assert_equal("telemetry_dispatch_queue_loss", native_event.at("event").get<std::string>());
+    t.assert_equal(1ULL, native_event.at("sequence").get<uint64_t>());
+    t.assert_equal("exact_unavailable", native_event.at("routing_coverage_state").get<std::string>());
+    t.assert_equal("target", native_event.at("physical_context").get<std::string>());
+    t.assert_equal(1U, (uint32_t) native_event.at("losses").size());
+    const json & loss = native_event.at("losses").at(0);
     t.assert_equal("moe_routing_span", loss.at("kind").get<std::string>());
     t.assert_equal(1ULL, loss.at("first_physical_step").get<uint64_t>());
     t.assert_equal(2ULL, loss.at("next_physical_step").get<uint64_t>());
     t.assert_equal("target", loss.at("physical_context").get<std::string>());
     t.assert_equal("decode", loss.at("operation").get<std::string>());
+
+    const json & routed_span_event = events.at(1);
+    t.assert_equal("telemetry_dispatch_queue_loss", routed_span_event.at("event").get<std::string>());
+    t.assert_equal(2ULL, routed_span_event.at("sequence").get<uint64_t>());
+    t.assert_equal("exact_unavailable", routed_span_event.at("routing_coverage_state").get<std::string>());
+    t.assert_true(!routed_span_event.contains("losses"));
+    const json & unlocated = routed_span_event.at("unlocated_coverage_loss");
+    t.assert_equal(1ULL, unlocated.at("count").get<uint64_t>());
+    t.assert_equal("loss", unlocated.at("state").get<std::string>());
+    t.assert_equal("serialized_capacity_reservation", unlocated.at("classification").get<std::string>());
+    t.assert_equal("unavailable", unlocated.at("coordinate_state").get<std::string>());
+    t.assert_equal("target", unlocated.at("physical_context").get<std::string>());
+    t.assert_equal("decode", unlocated.at("operation").get<std::string>());
+    t.assert_equal(2ULL, unlocated.at("props_generation").get<uint64_t>());
+
+    const json & normal_event = events.at(2);
+    t.assert_equal("moe_routing_chunk", normal_event.at("event").get<std::string>());
+    t.assert_equal(3ULL, normal_event.at("sequence").get<uint64_t>());
+    t.assert_equal(3U, normal_event.at("schema_version").get<uint32_t>());
+    t.assert_equal("trace-routed-span-normal-cap", normal_event.at("trace_id").get<std::string>());
+    t.assert_true(normal_event.at("is_final_for_trace").get<bool>());
+    t.assert_true(normal_event.contains("descriptor"));
+    t.assert_true(normal_event.contains("clock"));
+    t.assert_true(normal_event.at("serialized_bytes").get<uint64_t>() <= 4096);
 }
 #endif
 
