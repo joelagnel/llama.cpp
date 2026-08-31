@@ -7259,6 +7259,7 @@ private:
             server_slot * slot = nullptr;
             std::vector<trace_record> records;
             size_t unlocated_rows = 0;
+            size_t unlinked_rows = 0;
             std::string created_at;
             uint64_t pending_unlocated_rows = 0;
             std::vector<std::vector<const trace_record *>> chunks;
@@ -7346,6 +7347,7 @@ private:
                     capture.created_at = telemetry_moe_created_at();
                 }
                 ++capture.unlocated_rows;
+                ++capture.unlinked_rows;
                 ++slot.telemetry_moe_chunk_unlocated_rows;
                 ++slot.telemetry_moe_chunk_unlinked_rows;
                 continue;
@@ -7464,14 +7466,19 @@ private:
 
         const auto make_event = [&](const std::string & trace_id, const trace_capture & capture,
                                     const std::vector<const trace_record *> & records,
-                                    uint64_t unlocated_rows, const std::string & chunk_id) {
+                                    uint64_t unlocated_rows, uint64_t unlinked_rows,
+                                    const std::string & chunk_id) {
             json decisions = json::array();
             json invalid_records = json::array();
             json intervals = json::array();
             json gaps = json::array();
             std::set<physical_event_id> physical_events_in_chunk;
+            uint64_t invalid_rows = 0;
+            uint64_t unavailable_rows = 0;
             for (const trace_record * record : records) {
                 const telemetry_moe_routing_row_capture & row = *record->row;
+                invalid_rows += record->invalid;
+                unavailable_rows += telemetry_moe_row_is_unavailable(row);
                 if (record->gap) {
                     gaps.push_back({
                         {"first_sequence", record->sequence},
@@ -7595,14 +7602,17 @@ private:
                 physical_events.push_back(std::move(physical));
             }
 
+            // A non-final chunk describes only the evidence it carries.  The
+            // slot counters remain request-level finalization state and must
+            // not make later all-valid chunks sticky Partial.
             const server_moe_routing_chunk_coverage routing_coverage = {
-                capture.slot->telemetry_moe_chunk_invalid_rows,
-                capture.slot->telemetry_moe_chunk_unavailable_rows,
-                capture.slot->telemetry_moe_chunk_unlinked_rows,
+                invalid_rows,
+                unavailable_rows,
+                unlinked_rows,
                 unlocated_rows,
-                capture.slot->telemetry_moe_chunk_capture_interrupted,
-                capture.slot->telemetry_moe_chunk_source_unavailable,
-                capture.slot->telemetry_moe_chunk_attribution_ambiguous,
+                false,
+                false,
+                false,
                 !gaps.empty(),
             };
             json event = {
@@ -7643,6 +7653,7 @@ private:
             const std::vector<const trace_record *> no_records;
             const size_t chunk_base_upper_bound = telemetry_moe_chunk_finalized_size(make_event(
                 trace_id, capture, no_records, std::numeric_limits<uint64_t>::max(),
+                std::numeric_limits<uint64_t>::max(),
                 "moe-pending-18446744073709551615"));
             size_t current_upper_bound = chunk_base_upper_bound;
             constexpr size_t completeness_reserve = 128;
@@ -7650,6 +7661,7 @@ private:
                 const std::vector<const trace_record *> one_record = { &record };
                 size_t one_record_upper_bound = telemetry_moe_chunk_finalized_size(make_event(
                     trace_id, capture, one_record, std::numeric_limits<uint64_t>::max(),
+                    std::numeric_limits<uint64_t>::max(),
                     "moe-pending-18446744073709551615"));
                 if (one_record_upper_bound > telemetry_moe_chunk_limit_bytes() && !record.invalid) {
                     record.gap = true;
@@ -7666,6 +7678,7 @@ private:
                     }
                     one_record_upper_bound = telemetry_moe_chunk_finalized_size(make_event(
                         trace_id, capture, one_record, std::numeric_limits<uint64_t>::max(),
+                        std::numeric_limits<uint64_t>::max(),
                         "moe-pending-18446744073709551615"));
                 }
                 GGML_ASSERT(one_record_upper_bound >= chunk_base_upper_bound);
@@ -7720,7 +7733,11 @@ private:
             for (size_t index = 0; index < capture.chunks.size(); ++index) {
                 const std::string chunk_id = string_format("moe-%d-%" PRIu64,
                     capture.slot->id, ++capture.slot->telemetry_moe_chunk_sequence);
-                json event = make_event(trace_id, capture, capture.chunks[index], index == 0 ? unlocated_rows : 0, chunk_id);
+                json event = make_event(
+                    trace_id, capture, capture.chunks[index],
+                    index == 0 ? unlocated_rows : 0,
+                    index == 0 ? capture.unlinked_rows : 0,
+                    chunk_id);
                 GGML_ASSERT(telemetry_moe_chunk_fits_limit(event));
                 GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(event));
                 telemetry_queue_moe_routing_chunk(*capture.slot, std::move(event));
@@ -10445,6 +10462,14 @@ json server_context_impl::test_native_dispatch_loss_timeline() {
         result.rows.push_back(std::move(row));
         return result;
     };
+    const auto unavailable_span = [&]() {
+        llama_context_moe_routing_span result;
+        result.decision = decision(0);
+        result.operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;
+        result.logical_call = 0;
+        result.capture_generation = 0;
+        return result;
+    };
 
     llama_context_dispatch_drain drained;
     drained.losses.reserve(256);
@@ -10452,8 +10477,10 @@ json server_context_impl::test_native_dispatch_loss_timeline() {
         drained.losses.push_back(loss(physical_step, physical_step + 1, false));
     }
     drained.losses.push_back(loss(258, 260, true));
+    drained.moe_routing_spans.push_back(unavailable_span());
     drained.moe_routing_spans.push_back(span(256));
     drained.moe_routing_spans.push_back(span(257));
+    drained.moe_routing_spans.push_back(span(258));
     for (const uint64_t physical_step : { uint64_t(256), uint64_t(259), uint64_t(260) }) {
         drained.notices.push_back({
             decision(physical_step),

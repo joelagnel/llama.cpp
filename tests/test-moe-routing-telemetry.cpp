@@ -374,6 +374,8 @@ static void test_native_dispatch_loss_timeline(testing & t) {
     bool saw_routed_span = false;
     bool saw_saturation = false;
     bool saw_saturation_before_next_boundary = false;
+    uint64_t native_loss_chunk_count = 0;
+    uint64_t pending_loss_chunk_count = 0;
     for (const json & event : events) {
         const std::string kind = event.at("event").get<std::string>();
         if (kind == "telemetry_control_boundary") {
@@ -398,44 +400,59 @@ static void test_native_dispatch_loss_timeline(testing & t) {
         t.assert_equal("server_process_monotonic_microseconds",
             event.at("clock").at("clock_domain").get<std::string>());
         if (event.contains("unlocated_coverage_loss")) {
-            t.assert_true(event.at("gaps").empty());
+            t.assert_equal(1U, event.at("availability").get<uint32_t>());
             const json & unlocated = event.at("unlocated_coverage_loss");
-            const uint64_t first_step = unlocated.at("first_physical_step").get<uint64_t>();
-            const uint64_t next_step = unlocated.at("next_physical_step").get<uint64_t>();
-            t.assert_equal("native_dispatch_queue_overflow", unlocated.at("classification").get<std::string>());
-            t.assert_equal("unavailable", unlocated.at("coordinate_state").get<std::string>());
-            t.assert_true(!unlocated.contains("first_sequence"));
-            t.assert_true(!unlocated.contains("phase"));
-            t.assert_true(!unlocated.contains("layer_index"));
-            if (unlocated.at("saturation").get<bool>()) {
-                t.assert_equal(258ULL, first_step);
-                t.assert_equal(260ULL, next_step);
-                t.assert_true(saw_second_boundary);
-                t.assert_equal(2U, (uint32_t) span_steps.size());
-                if (span_steps.size() == 2) {
-                    t.assert_equal(256ULL, span_steps[0]);
-                    t.assert_equal(257ULL, span_steps[1]);
+            if (unlocated.value("classification", "") == "native_dispatch_queue_overflow") {
+                ++native_loss_chunk_count;
+                t.assert_true(event.at("gaps").empty());
+                const uint64_t first_step = unlocated.at("first_physical_step").get<uint64_t>();
+                const uint64_t next_step = unlocated.at("next_physical_step").get<uint64_t>();
+                t.assert_equal("unavailable", unlocated.at("coordinate_state").get<std::string>());
+                t.assert_true(!unlocated.contains("first_sequence"));
+                t.assert_true(!unlocated.contains("phase"));
+                t.assert_true(!unlocated.contains("layer_index"));
+                if (unlocated.at("saturation").get<bool>()) {
+                    t.assert_equal(258ULL, first_step);
+                    t.assert_equal(260ULL, next_step);
+                    t.assert_true(saw_second_boundary);
+                    t.assert_equal(3U, (uint32_t) span_steps.size());
+                    if (span_steps.size() == 3) {
+                        t.assert_equal(256ULL, span_steps[0]);
+                        t.assert_equal(257ULL, span_steps[1]);
+                        t.assert_equal(258ULL, span_steps[2]);
+                    }
+                    saw_saturation = true;
+                } else {
+                    t.assert_true(!saw_saturation);
+                    t.assert_true(!saw_routed_span);
+                    t.assert_equal(expected_loss_step, first_step);
+                    t.assert_equal(expected_loss_step + 1, next_step);
+                    ++expected_loss_step;
                 }
-                saw_saturation = true;
             } else {
-                t.assert_true(!saw_saturation);
-                t.assert_true(!saw_routed_span);
-                t.assert_equal(expected_loss_step, first_step);
-                t.assert_equal(expected_loss_step + 1, next_step);
-                ++expected_loss_step;
+                ++pending_loss_chunk_count;
+                t.assert_equal(1ULL, unlocated.at("count").get<uint64_t>());
+                t.assert_true(!unlocated.contains("first_physical_step"));
             }
         }
         for (const json & decision : event.value("decisions", json::array())) {
             t.assert_true(!saw_saturation);
             t.assert_true(saw_first_boundary);
             t.assert_equal(256ULL, expected_loss_step);
+            if (event.contains("unlocated_coverage_loss")) {
+                t.assert_equal(1U, event.at("availability").get<uint32_t>());
+            } else {
+                t.assert_equal(0U, event.at("availability").get<uint32_t>());
+            }
             saw_routed_span = true;
             span_steps.push_back(decision.at("event_key").at("physical_step").get<uint64_t>());
         }
     }
     t.assert_equal(256ULL, expected_loss_step);
+    t.assert_equal(256ULL, native_loss_chunk_count);
+    t.assert_equal(1ULL, pending_loss_chunk_count);
     t.assert_equal(3ULL, control_boundaries);
-    t.assert_equal(2U, (uint32_t) span_steps.size());
+    t.assert_equal(3U, (uint32_t) span_steps.size());
     t.assert_true(saw_saturation);
     t.assert_true(saw_saturation_before_next_boundary);
 }
