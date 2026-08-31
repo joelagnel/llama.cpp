@@ -57,6 +57,25 @@ def configure_telemetry_server():
     server.make_request = authenticated_request
 
 
+def configure_embedded_mtp_fixture(test_server):
+    model_path = os.environ.get("LLAMA_TEST_MTP_MODEL_PATH")
+    if not model_path:
+        pytest.skip("requires LLAMA_TEST_MTP_MODEL_PATH for an embedded-MTP fixture")
+
+    test_server.model_file = model_path
+    test_server.model_hf_repo = None
+    test_server.model_hf_file = None
+    test_server.spec_type = "draft-mtp"
+    test_server.spec_draft_n_max = 3
+
+
+def configure_ngram_simple_speculation(test_server):
+    test_server.spec_type = "ngram-simple"
+    test_server.spec_ngram_simple_size_n = 2
+    test_server.spec_ngram_simple_size_m = 3
+    test_server.spec_ngram_simple_min_hits = 1
+
+
 def apply_telemetry_control(**features):
     response = server.make_request(
         "POST",
@@ -1390,15 +1409,7 @@ def test_output_token_identity_follows_the_separate_content_policy(monkeypatch):
 
 
 def test_output_token_control_enables_request_defaults():
-    model_path = os.environ.get("LLAMA_TEST_MODEL_PATH", "")
-    if "qwen" in os.path.basename(model_path).lower():
-        server.spec_type = "draft-mtp"
-        server.spec_draft_n_max = 3
-    else:
-        server.spec_type = "ngram-simple"
-        server.spec_ngram_simple_size_n = 2
-        server.spec_ngram_simple_size_m = 3
-        server.spec_ngram_simple_min_hits = 1
+    configure_ngram_simple_speculation(server)
     server.start()
     apply_telemetry_control(
         output_token_detail=True,
@@ -1925,21 +1936,13 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
 
 
 def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
-    model_path = os.environ.get("LLAMA_TEST_MTP_MODEL_PATH")
-    if not model_path:
-        pytest.skip("requires LLAMA_TEST_MTP_MODEL_PATH for an embedded-MTP MoE fixture")
-
     api_key = "moe-routing-mtp-test-key"
     auth = {"Authorization": f"Bearer {api_key}"}
     mtp_server = ServerPreset.stories15m_moe()
-    mtp_server.model_file = model_path
-    mtp_server.model_hf_repo = None
-    mtp_server.model_hf_file = None
+    configure_embedded_mtp_fixture(mtp_server)
     mtp_server.server_props = True
     mtp_server.api_key = api_key
-    mtp_server.spec_type = "draft-mtp"
     mtp_server.spec_draft_n_min = 1
-    mtp_server.spec_draft_n_max = 3
     mtp_server.n_batch = 4
     mtp_server.n_ubatch = 2
     mtp_server.start()
@@ -2343,19 +2346,7 @@ def test_native_gpu_gpm_capability_and_bounded_endpoint():
 
 
 def test_speculative_invariants_and_ttft(monkeypatch):
-    model_path = os.environ.get("LLAMA_TEST_MODEL_PATH", "")
-    use_embedded_mtp = "qwen" in os.path.basename(model_path).lower()
-    if use_embedded_mtp:
-        # The local Qwen fixture contains its own MTP layers, so exercise the real
-        # target/draft/verification path instead of relying on tokenizer-sensitive
-        # n-gram matches.
-        server.spec_type = "draft-mtp"
-        server.spec_draft_n_max = 3
-    else:
-        server.spec_type = "ngram-simple"
-        server.spec_ngram_simple_size_n = 2
-        server.spec_ngram_simple_size_m = 3
-        server.spec_ngram_simple_min_hits = 1
+    configure_embedded_mtp_fixture(server)
     server.start()
     apply_telemetry_control(output_token_detail=True)
     content_enabled = (
@@ -2392,11 +2383,7 @@ def test_speculative_invariants_and_ttft(monkeypatch):
     assert speculative["useful_output_tokens_per_target_pass"] == pytest.approx(
         speculative["useful_output_tokens"] / speculative["actual_target_passes"]
     )
-    if use_embedded_mtp:
-        assert "draft-mtp" in speculative["configuration"]["types"]
-    else:
-        assert speculative["configuration"]["ngram_simple_size_n"] == 2
-        assert speculative["configuration"]["ngram_simple_size_m"] == 3
+    assert "draft-mtp" in speculative["configuration"]["types"]
     assert event["sampling"]["requested_temperature"] == 0
     assert event["sampling"]["effective_temperature"] == 0
     assert event["sampling"]["effective_seed"] >= 0
@@ -2551,15 +2538,7 @@ def test_speculative_invariants_and_ttft(monkeypatch):
 
 def test_mtp_target_candidate_detail_is_lazy_bounded_and_independently_stateful(monkeypatch):
     monkeypatch.setenv("LLAMA_TELEMETRY_TOKEN_CANDIDATE_MAX_BYTES", "32768")
-    model_path = os.environ.get("LLAMA_TEST_MODEL_PATH", "")
-    if "qwen" in os.path.basename(model_path).lower():
-        server.spec_type = "draft-mtp"
-        server.spec_draft_n_max = 3
-    else:
-        server.spec_type = "ngram-simple"
-        server.spec_ngram_simple_size_n = 2
-        server.spec_ngram_simple_size_m = 3
-        server.spec_ngram_simple_min_hits = 1
+    configure_embedded_mtp_fixture(server)
     server.start()
     apply_telemetry_control(output_token_detail=True, token_candidates=True)
 
@@ -2686,15 +2665,7 @@ def test_mtp_target_candidate_detail_is_lazy_bounded_and_independently_stateful(
 
 
 def test_mtp_target_candidate_content_identity_and_accepted_position_gate(monkeypatch):
-    model_path = os.environ.get("LLAMA_TEST_MODEL_PATH", "")
-    if "qwen" in os.path.basename(model_path).lower():
-        server.spec_type = "draft-mtp"
-        server.spec_draft_n_max = 3
-    else:
-        server.spec_type = "ngram-simple"
-        server.spec_ngram_simple_size_n = 2
-        server.spec_ngram_simple_size_m = 3
-        server.spec_ngram_simple_min_hits = 1
+    configure_embedded_mtp_fixture(server)
     server.start()
     apply_telemetry_control(
         output_token_detail=True,
@@ -2794,15 +2765,7 @@ def test_token_candidate_bounded_ring_reports_expired_trace(monkeypatch):
 
 
 def test_mtp_target_candidate_requires_global_control():
-    model_path = os.environ.get("LLAMA_TEST_MODEL_PATH", "")
-    if "qwen" in os.path.basename(model_path).lower():
-        server.spec_type = "draft-mtp"
-        server.spec_draft_n_max = 3
-    else:
-        server.spec_type = "ngram-simple"
-        server.spec_ngram_simple_size_n = 2
-        server.spec_ngram_simple_size_m = 3
-        server.spec_ngram_simple_min_hits = 1
+    configure_embedded_mtp_fixture(server)
     server.start()
     apply_telemetry_control(output_token_detail=True)
 
