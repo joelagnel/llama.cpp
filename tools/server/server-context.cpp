@@ -6141,7 +6141,7 @@ private:
             {"shared_expert_count", shared_expert_count},
             {"weight_semantics", "exact effective routed coefficient"},
             {"score_semantics", "router score after selection bias and group masking"},
-            {"clock_domain", "llama_server_process_monotonic"},
+            {"clock_domain", "utc_wall_clock"},
         };
     }
 

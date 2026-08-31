@@ -1934,6 +1934,7 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         assert chunks[-1]["decisions"]
         assert all(chunk["availability"] == 0 for chunk in chunks)
         assert all(chunk["descriptor"]["schema_version"] == 2 for chunk in chunks)
+        assert all(chunk["descriptor"]["clock_domain"] == "utc_wall_clock" for chunk in chunks)
         assert all(
             chunk["descriptor"]["moe_layer_count"] == len(chunk["descriptor"]["moe_layer_indices"])
             and chunk["descriptor"]["moe_layer_indices"] == sorted(set(chunk["descriptor"]["moe_layer_indices"]))
