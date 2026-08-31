@@ -1851,6 +1851,8 @@ def test_prompt_perplexity_is_exact_and_opt_in():
     assert moe["state"] == "not_applicable"
     assert moe["configuration_state"] == "not_applicable"
     assert moe["configuration_reason"]
+    assert moe["model_layer_count"] is None
+    assert moe["moe_layer_indices"] is None
     assert moe["expert_activations"] == []
     assert moe["routed_tokens"] is None
     assert moe["token_detail_state"] == "not_applicable"
@@ -2369,6 +2371,9 @@ def test_moe_routing_states_and_bounded_histogram(monkeypatch):
     assert disabled["state"] == "not_enabled_for_request"
     assert disabled["configuration_state"] == "available"
     assert disabled["configured_experts"] == 4
+    assert disabled["model_layer_count"] > 0
+    assert disabled["moe_layer_indices"] == sorted(set(disabled["moe_layer_indices"]))
+    assert all(0 <= layer < disabled["model_layer_count"] for layer in disabled["moe_layer_indices"])
     assert disabled["expert_activations"] == []
     assert disabled["token_detail_state"] == "not_enabled_for_request"
     assert disabled["token_detail_reason"]
@@ -2408,6 +2413,8 @@ def test_moe_routing_states_and_bounded_histogram(monkeypatch):
     assert plain["state"] == "not_enabled_for_request"
     assert plain["configuration_state"] == "available"
     assert plain["configured_experts"] == 4
+    assert plain["model_layer_count"] == disabled["model_layer_count"]
+    assert plain["moe_layer_indices"] == disabled["moe_layer_indices"]
     assert plain["routed_tokens"] is None
     assert plain["expert_activations"] == []
     assert plain["token_detail_state"] == "not_enabled_for_request"
@@ -2425,6 +2432,8 @@ def test_moe_routing_states_and_bounded_histogram(monkeypatch):
     available = completed_event(available_response.body["trace_id"])["moe_routing"]
     assert available["state"] == "available"
     assert available["configuration_state"] == "available"
+    assert available["model_layer_count"] == disabled["model_layer_count"]
+    assert available["moe_layer_indices"] == disabled["moe_layer_indices"]
     assert available["routed_tokens"] > 0
     assert available["routed_token_layer_decisions"] > 0
     assert available["expert_activations_total"] == available["routed_token_layer_decisions"] * available["experts_per_token"]

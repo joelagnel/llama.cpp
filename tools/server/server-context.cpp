@@ -7654,8 +7654,23 @@ private:
     json telemetry_moe_routing_json(const server_slot & slot) const {
         const int32_t configured_experts = llama_model_n_expert(model_tgt);
         const int32_t experts_per_token = llama_model_n_expert_used(model_tgt);
+        const int32_t model_layer_count = llama_model_n_layer(model_tgt);
+        const int32_t configured_moe_layer_count = llama_model_n_moe_layer(model_tgt);
+        const bool configured_topology_available = configured_experts > 0
+            && model_layer_count > 0 && configured_moe_layer_count > 0;
         const auto base = [&]() {
             const bool routed_model = configured_experts > 0;
+            json moe_layer_indices = nullptr;
+            if (configured_topology_available) {
+                moe_layer_indices = json::array();
+                int32_t previous_layer_index = -1;
+                for (int32_t index = 0; index < configured_moe_layer_count; ++index) {
+                    const int32_t layer_index = llama_model_moe_layer_index(model_tgt, index);
+                    GGML_ASSERT(layer_index > previous_layer_index && layer_index < model_layer_count);
+                    moe_layer_indices.push_back(layer_index);
+                    previous_layer_index = layer_index;
+                }
+            }
             return json {
                 {"schema_version", 2},
                 {"token_detail_schema_version", 2},
@@ -7665,6 +7680,8 @@ private:
                     : "The loaded target model is dense and has no routed-expert configuration."},
                 {"configured_experts", routed_model ? json(configured_experts) : json(nullptr)},
                 {"experts_per_token", experts_per_token > 0 ? json(experts_per_token) : json(nullptr)},
+                {"model_layer_count", configured_topology_available ? json(model_layer_count) : json(nullptr)},
+                {"moe_layer_indices", std::move(moe_layer_indices)},
                 {"moe_layers", nullptr},
                 {"routed_tokens", nullptr},
                 {"routed_token_layer_decisions", nullptr},
