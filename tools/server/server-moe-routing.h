@@ -71,6 +71,17 @@ inline bool server_moe_routing_add_lost_population(uint64_t count, uint64_t & to
     return true;
 }
 
+inline bool server_moe_routing_combine_lost_population(
+        uint64_t existing,
+        uint64_t pending,
+        uint64_t & combined) {
+    if (pending > std::numeric_limits<uint64_t>::max() - existing) {
+        return false;
+    }
+    combined = existing + pending;
+    return true;
+}
+
 inline const char * server_moe_routing_capture_state(
         const server_moe_routing_capture_counts & counts,
         bool has_data) {

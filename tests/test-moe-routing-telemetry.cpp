@@ -89,10 +89,12 @@ static void test_serialization_loss_counts_pending_and_incoming(testing & t) {
 }
 
 static void test_finalization_loss_combines_event_and_pending(testing & t) {
-    uint64_t unlocated_rows = 11;
-    t.assert_true(server_moe_routing_add_lost_population(7, unlocated_rows));
+    uint64_t unlocated_rows = 0;
+    t.assert_true(server_moe_routing_combine_lost_population(11, 7, unlocated_rows));
     t.assert_equal(18ULL, unlocated_rows);
-    t.assert_true(!server_moe_routing_add_lost_population(std::numeric_limits<uint64_t>::max(), unlocated_rows));
+
+    unlocated_rows = 18;
+    t.assert_true(!server_moe_routing_combine_lost_population(11, std::numeric_limits<uint64_t>::max(), unlocated_rows));
     t.assert_equal(18ULL, unlocated_rows);
 }
 

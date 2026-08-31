@@ -6679,8 +6679,10 @@ private:
         const uint64_t pending_unlocated_rows = slot.telemetry_moe_chunk_unlocated_pending;
         if (!slot.telemetry_moe_pending_chunk.is_null()) {
             slot.telemetry_moe_pending_chunk["is_final_for_trace"] = true;
-            uint64_t unlocated_rows = telemetry_moe_chunk_unlocated_loss_count(slot.telemetry_moe_pending_chunk);
-            GGML_ASSERT(server_moe_routing_add_lost_population(pending_unlocated_rows, unlocated_rows));
+            const uint64_t existing_unlocated_rows = telemetry_moe_chunk_unlocated_loss_count(slot.telemetry_moe_pending_chunk);
+            uint64_t unlocated_rows = 0;
+            GGML_ASSERT(server_moe_routing_combine_lost_population(
+                existing_unlocated_rows, pending_unlocated_rows, unlocated_rows));
             if (unlocated_rows > 0) {
                 slot.telemetry_moe_pending_chunk["availability"] = 1;
                 slot.telemetry_moe_pending_chunk["reason"] = "The request ended after routing capture lost an interval without complete routing coordinates.";
