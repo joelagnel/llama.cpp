@@ -355,6 +355,7 @@ static void test_native_dispatch_loss_timeline(testing & t) {
         const std::string kind = event.at("event").get<std::string>();
         if (kind == "telemetry_control_boundary") {
             ++control_boundaries;
+            t.assert_equal("next_microbatch", event.at("effective_from").get<std::string>());
             const uint64_t step = event.at("physical_step").get<uint64_t>();
             if (step == 256) {
                 saw_first_boundary = true;

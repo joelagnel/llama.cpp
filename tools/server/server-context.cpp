@@ -2039,6 +2039,7 @@ private:
             {"clock", telemetry_dispatch_clock_json()},
             {"props_generation", notice.decision.props_generation},
             {"microbatch_generation", notice.decision.microbatch_generation},
+            {"effective_from", "next_microbatch"},
             {"physical_context", draft ? "draft" : "target"},
             {"operation", notice.operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? "encode" : "decode"},
             {"physical_step", notice.physical_step},
