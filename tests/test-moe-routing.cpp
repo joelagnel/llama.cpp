@@ -28,6 +28,18 @@ static bool decode_many(llama_context * ctx, llama_token token, llama_pos pos, i
     return ok;
 }
 
+static bool has_explicit_gpu_layers(int argc, char ** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const char * arg = argv[i];
+        if (strcmp(arg, "-ngl") == 0 || strcmp(arg, "--gpu-layers") == 0 || strcmp(arg, "--n-gpu-layers") == 0 ||
+                strncmp(arg, "-ngl=", 5) == 0 || strncmp(arg, "--gpu-layers=", 13) == 0 ||
+                strncmp(arg, "--n-gpu-layers=", 15) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool expect_empty_moe_routing_observer(llama_context * ctx, const char * phase) {
     const auto observer = llama_moe_routing_test_observer_get(ctx);
     if (observer.enabled || observer.reserve_pending || observer.graph_reserve_invalidations != 0 ||
@@ -53,6 +65,15 @@ static bool expect_enabled_moe_routing_observer(llama_context * ctx) {
             observer.readback_copies == 0 || observer.synchronizations == 0 ||
             observer.batch_peer_reads == 0) {
         fprintf(stderr, "%s: missing enabled MoE work\n", __func__);
+        return false;
+    }
+    return true;
+}
+
+static bool expect_cuda_moe_routing_readback(llama_context * ctx) {
+    const auto observer = llama_moe_routing_test_observer_get(ctx);
+    if (observer.device_to_host_copies == 0) {
+        fprintf(stderr, "%s: expected a CUDA device-to-host readback\n", __func__);
         return false;
     }
     return true;
@@ -249,7 +270,7 @@ static bool test_dense_model(llama_model * model, const common_params & params) 
         equal_logits(ctx_plain.get(), ctx_dense.get(), n_vocab);
 }
 
-static bool test_moe_model(llama_model * model, const common_params & params) {
+static bool test_moe_model(llama_model * model, const common_params & params, bool require_cuda_readback) {
     const int32_t n_expert = llama_model_n_expert(model);
     const int32_t n_expert_used = llama_model_n_expert_used(model);
     if (n_expert <= 0 || n_expert_used <= 0 || n_expert_used > n_expert) {
@@ -288,7 +309,8 @@ static bool test_moe_model(llama_model * model, const common_params & params) {
     if (!decode_many(ctx.get(), 2, 1, 3) || !expect_moe_routing(ctx.get(), model, n_expert, n_expert_used, 3)) {
         return false;
     }
-    if (!expect_enabled_moe_routing_observer(ctx.get())) {
+    if (!expect_enabled_moe_routing_observer(ctx.get()) ||
+            (require_cuda_readback && !expect_cuda_moe_routing_readback(ctx.get()))) {
         return false;
     }
 
@@ -318,7 +340,11 @@ int main(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
-    params.n_gpu_layers = 0;
+    const bool explicit_gpu_layers = has_explicit_gpu_layers(argc, argv);
+    if (!explicit_gpu_layers) {
+        params.n_gpu_layers = 0;
+    }
+    const bool require_cuda_readback = explicit_gpu_layers && params.n_gpu_layers != 0;
 
     ggml_backend_load_all();
     common_init_result_ptr llama_init = common_init_from_params(params);
@@ -332,5 +358,5 @@ int main(int argc, char ** argv) {
         return test_dense_model(model, params) ? 0 : 1;
     }
 
-    return test_moe_model(model, params) ? 0 : 1;
+    return test_moe_model(model, params, require_cuda_readback) ? 0 : 1;
 }

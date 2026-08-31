@@ -136,6 +136,7 @@ option(LLAMA_BUILD_SERVER    "llama: build server example"                      
 option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       OFF)
 option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available" ON)
+option(LLAMA_MOE_ROUTING_CUDA_READBACK_TESTS "llama: require CUDA MoE routing readback tests" OFF)
 
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
@@ -212,6 +213,15 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
+endif()
+
+if (LLAMA_MOE_ROUTING_CUDA_READBACK_TESTS)
+    if (NOT LLAMA_BUILD_COMMON OR NOT LLAMA_BUILD_TESTS)
+        message(FATAL_ERROR "LLAMA_MOE_ROUTING_CUDA_READBACK_TESTS requires LLAMA_BUILD_COMMON=ON and LLAMA_BUILD_TESTS=ON")
+    endif()
+    if (NOT WIN32 OR NOT GGML_CUDA OR BUILD_SHARED_LIBS)
+        message(FATAL_ERROR "LLAMA_MOE_ROUTING_CUDA_READBACK_TESTS requires a Windows static build with GGML_CUDA=ON and BUILD_SHARED_LIBS=OFF")
+    endif()
 endif()
 
 #

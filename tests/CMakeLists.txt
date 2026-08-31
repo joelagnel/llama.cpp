@@ -267,6 +267,19 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
     )
 
+    if (LLAMA_MOE_ROUTING_CUDA_READBACK_TESTS)
+        llama_test(
+            test-moe-routing
+            NAME test-moe-routing-dsv4-cuda-readback
+            LABEL cuda
+            ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf" -ngl 99
+        )
+        set_tests_properties(test-moe-routing-dsv4-cuda-readback PROPERTIES
+            FIXTURES_REQUIRED generate-models
+            RUN_SERIAL TRUE
+        )
+    endif()
+
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
         test-save-load-state
