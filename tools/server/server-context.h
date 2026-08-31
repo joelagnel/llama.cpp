@@ -112,6 +112,11 @@ struct server_context {
     void set_state_callback(server_state_callback_t callback);
 };
 
+#ifdef LLAMA_SERVER_TEST_HOOKS
+json server_test_moe_dispatch_saturation_gap_json();
+json server_test_moe_dispatch_saturation_chunk_json();
+#endif
+
 
 // forward declarations
 struct server_res_generator;

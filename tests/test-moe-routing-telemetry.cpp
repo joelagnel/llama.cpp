@@ -1,6 +1,9 @@
 #include "testing.h"
 
 #include "../tools/server/server-moe-routing.h"
+#if defined(LLAMA_SERVER_TEST_HOOKS)
+#include "../tools/server/server-context.h"
+#endif
 #if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
 #include "../tools/server/server-models.h"
 #endif
@@ -236,6 +239,40 @@ static void test_finalization_loss_combines_event_and_pending(testing & t) {
     t.assert_equal(18ULL, unlocated_rows);
 }
 
+#if defined(LLAMA_SERVER_TEST_HOOKS)
+static void test_saturated_native_dispatch_loss_serialization(testing & t) {
+    const json gap = server_test_moe_dispatch_saturation_gap_json();
+    const json chunk = server_test_moe_dispatch_saturation_chunk_json();
+    t.assert_equal(17ULL, gap.at("first_sequence").get<uint64_t>());
+    t.assert_equal(17ULL, gap.at("next_sequence").get<uint64_t>());
+    t.assert_equal(288ULL, gap.at("first_physical_step").get<uint64_t>());
+    t.assert_equal(311ULL, gap.at("next_physical_step").get<uint64_t>());
+    t.assert_equal(287U, gap.at("first_physical_microbatch").get<uint32_t>());
+    t.assert_equal(309U, gap.at("last_physical_microbatch").get<uint32_t>());
+    t.assert_equal(101LL, gap.at("first_dispatch_monotonic_us").get<int64_t>());
+    t.assert_equal(123LL, gap.at("last_dispatch_monotonic_us").get<int64_t>());
+    t.assert_equal(23ULL, gap.at("physical_dispatch_count").get<uint64_t>());
+    t.assert_equal("target", gap.at("physical_context").get<std::string>());
+    t.assert_equal("decode", gap.at("operation").get<std::string>());
+    t.assert_equal("decode", gap.at("last_operation").get<std::string>());
+    t.assert_true(gap.at("saturation").get<bool>());
+    t.assert_equal("saturated_exact", gap.at("loss_descriptor_state").get<std::string>());
+    t.assert_equal("mixed", gap.at("generation_state").get<std::string>());
+    t.assert_equal("enabled", gap.at("native_moe_routing_state").get<std::string>());
+    t.assert_equal(5ULL, gap.at("props_generation").get<uint64_t>());
+    t.assert_equal(8ULL, gap.at("last_props_generation").get<uint64_t>());
+    t.assert_equal(288ULL, gap.at("microbatch_generation").get<uint64_t>());
+    t.assert_equal(310ULL, gap.at("last_microbatch_generation").get<uint64_t>());
+    t.assert_equal("available", gap.at("timestamp_state").get<std::string>());
+    t.assert_equal("native_dispatch_queue_overflow", gap.at("cause").get<std::string>());
+    t.assert_equal(1U, chunk.at("availability").get<uint32_t>());
+    t.assert_true(!chunk.contains("unlocated_coverage_loss"));
+    t.assert_equal(1U, (uint32_t) chunk.at("gaps").size());
+    t.assert_equal(288ULL, chunk.at("gaps").at(0).at("first_physical_step").get<uint64_t>());
+    t.assert_equal(311ULL, chunk.at("gaps").at(0).at("next_physical_step").get<uint64_t>());
+}
+#endif
+
 #if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
 static void test_router_child_api_key_file_security(testing & t) {
     const server_child_api_key_file_security_test_result result = server_test_child_api_key_file_security();
@@ -261,6 +298,9 @@ int main() {
     t.test("canonical event coverage serialization", test_canonical_event_coverage_serialization);
     t.test("serialization loss counts pending and incoming", test_serialization_loss_counts_pending_and_incoming);
     t.test("finalization loss combines event and pending", test_finalization_loss_combines_event_and_pending);
+#if defined(LLAMA_SERVER_TEST_HOOKS)
+    t.test("saturated native dispatch loss serialization", test_saturated_native_dispatch_loss_serialization);
+#endif
 #if defined(_WIN32) && defined(LLAMA_SERVER_TEST_HOOKS)
     t.test("router child API key file security", test_router_child_api_key_file_security);
 #endif
