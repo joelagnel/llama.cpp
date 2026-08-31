@@ -713,7 +713,6 @@ struct server_slot {
     bool telemetry_moe_chunk_source_unavailable = false;
     bool telemetry_moe_chunk_attribution_ambiguous = false;
     telemetry_moe_unlocated_capacity_loss telemetry_moe_chunk_capacity_loss;
-    std::vector<telemetry_moe_native_dispatch_loss> telemetry_moe_chunk_native_losses;
     json telemetry_moe_pending_chunk;
 
     bool has_next_token = true;
@@ -868,7 +867,6 @@ struct server_slot {
         telemetry_moe_chunk_source_unavailable = false;
         telemetry_moe_chunk_attribution_ambiguous = false;
         telemetry_moe_chunk_capacity_loss = {};
-        telemetry_moe_chunk_native_losses.clear();
         telemetry_moe_pending_chunk = json();
         json_schema = json();
 
@@ -1427,6 +1425,10 @@ public:
         }
     }
 
+#ifdef LLAMA_SERVER_TEST_HOOKS
+    static json test_native_dispatch_loss_stream_finalization();
+#endif
+
     static void copy_ubatch_stats(
             server_metrics::physical_ubatch_metrics & dst,
             const llama_ubatch_stats & src) {
@@ -1774,6 +1776,11 @@ private:
     std::deque<telemetry_token_candidate_block_entry> telemetry_token_candidate_blocks;
     std::deque<std::string> telemetry_token_candidate_expired_trace_ids;
     std::string telemetry_server_instance_id = "server-" + random_string();
+#ifdef LLAMA_SERVER_TEST_HOOKS
+    // Allows the focused chunk-finalization test to run the real private
+    // streaming path without loading a model.
+    json telemetry_moe_test_descriptor;
+#endif
     int64_t telemetry_clock_anchor_monotonic_us = 0;
     int64_t telemetry_clock_anchor_timestamp_unix_ms = 0;
     int64_t telemetry_clock_anchor_precision_us = 0;
@@ -2560,7 +2567,11 @@ private:
         }
         const char * telemetry_moe_chunk_max_bytes_env = getenv("LLAMA_TELEMETRY_MOE_CHUNK_MAX_BYTES");
         if (telemetry_moe_chunk_max_bytes_env) {
-            telemetry_moe_chunk_max_bytes = (size_t) std::max(1024, std::min(1024 * 1024, atoi(telemetry_moe_chunk_max_bytes_env)));
+            // A single exact native dispatch-loss descriptor, together with
+            // the bounded finalization reservation, must fit in a routing
+            // chunk.  Smaller requests use the explicit exact-loss fallback
+            // below rather than asserting or discarding known coordinates.
+            telemetry_moe_chunk_max_bytes = (size_t) std::max(4096, std::min(1024 * 1024, atoi(telemetry_moe_chunk_max_bytes_env)));
         }
         const char * telemetry_buffer_env = getenv("LLAMA_TELEMETRY_EVENT_BUFFER_MIB");
         if (telemetry_buffer_env) {
@@ -6509,6 +6520,7 @@ private:
             return;
         }
         llama_context_dispatch_drain drained = context->dispatch_drain();
+        std::map<int32_t, std::vector<telemetry_moe_native_dispatch_loss>> native_losses_by_slot;
         const auto record_native_loss = [&](server_slot & slot, const llama_context_dispatch_loss & loss, bool ambiguous) {
             if (!telemetry_moe_request_enabled(slot)) {
                 return;
@@ -6516,7 +6528,7 @@ private:
             slot.telemetry_moe_chunk_capture_started = true;
             slot.telemetry_moe_chunk_source_unavailable = true;
             slot.telemetry_moe_chunk_attribution_ambiguous |= ambiguous;
-            slot.telemetry_moe_chunk_native_losses.push_back({
+            native_losses_by_slot[slot.id].push_back({
                 loss.decision.props_generation,
                 loss.decision.microbatch_generation,
                 loss.decision.application_epoch,
@@ -6566,6 +6578,13 @@ private:
                     }
                 }
             }
+        }
+        // Native loss descriptors are bounded only until this drain.  Stream
+        // them now, before later routing chunks can overtake their exact
+        // physical interval; do not retain them in a slot until completion.
+        for (auto & entry : native_losses_by_slot) {
+            GGML_ASSERT(entry.first >= 0 && entry.first < (int32_t) slots.size());
+            telemetry_emit_native_dispatch_loss_chunks(slots[entry.first], entry.second);
         }
         if (drained.dropped_notices > 0 || drained.dropped_moe_routing_spans > 0 ||
                 drained.dropped_loss_descriptors > 0) {
@@ -6841,6 +6860,11 @@ private:
     }
 
     json telemetry_moe_routing_descriptor() const {
+#ifdef LLAMA_SERVER_TEST_HOOKS
+        if (!telemetry_moe_test_descriptor.is_null()) {
+            return telemetry_moe_test_descriptor;
+        }
+#endif
         const int32_t routed_expert_count = llama_model_n_expert(model_tgt);
         const int32_t experts_per_token = llama_model_n_expert_used(model_tgt);
         const int32_t model_layer_count = llama_model_n_layer(model_tgt);
@@ -6975,6 +6999,133 @@ private:
             return;
         }
         slot.telemetry_moe_pending_chunk = std::move(event);
+    }
+
+    json telemetry_make_native_dispatch_loss_chunk(const server_slot & slot) const {
+        return {
+            {"chunk_id", string_format("moe-%d-%" PRIu64,
+                slot.id, slot.telemetry_moe_chunk_sequence + 1)},
+            {"trace_id", slot.task->trace_id},
+            {"created_at", telemetry_moe_created_at()},
+            {"first_sequence", slot.telemetry_moe_chunk_decision_sequence},
+            {"next_sequence", slot.telemetry_moe_chunk_decision_sequence},
+            {"is_final_for_trace", false},
+            {"descriptor", telemetry_moe_routing_descriptor()},
+            {"gaps", json::array()},
+        };
+    }
+
+    bool telemetry_append_native_dispatch_loss_alternative(
+            server_slot & slot,
+            const telemetry_moe_native_dispatch_loss & loss) {
+        // A configured chunk cap can be lower than one exact loss envelope.
+        // Keep the same schema-v3 routing event and exact gap, but mark this
+        // deliberate, bounded escape hatch instead of asserting or replacing
+        // known physical coordinates with an unlocated count.  It is bounded
+        // by the independently configured event ring (at least 1 MiB).
+        json event = {
+            {"chunk_id", string_format("moe-loss-%d-%" PRIu64,
+                slot.id, slot.telemetry_moe_chunk_sequence + 1)},
+            {"trace_id", slot.task->trace_id},
+            {"created_at", telemetry_moe_created_at()},
+            {"first_sequence", slot.telemetry_moe_chunk_decision_sequence},
+            {"next_sequence", slot.telemetry_moe_chunk_decision_sequence},
+            {"is_final_for_trace", false},
+            {"chunk_capacity_state", "exact_loss_alternative"},
+            {"gaps", json::array({
+                telemetry_moe_native_dispatch_loss_gap_json(
+                    slot.telemetry_moe_chunk_decision_sequence, loss),
+            })},
+        };
+        server_moe_routing_apply_canonical_event_coverage(
+            event, { 0, 0, 0, 0, false, true, false, true }, false,
+            "The producer retained an exact native dispatch-loss interval:",
+            "Routing capture lost rows before complete routing coordinates were retained.");
+
+        const uint64_t sequence = telemetry_next_sequence;
+        std::string serialized = telemetry_serialize_moe_routing_chunk(std::move(event), sequence);
+        if (serialized.size() > telemetry_event_max_bytes) {
+            return false;
+        }
+        ++telemetry_next_sequence;
+        ++slot.telemetry_moe_chunk_sequence;
+        telemetry_append_serialized(sequence, std::move(serialized));
+        return true;
+    }
+
+    void telemetry_emit_native_dispatch_loss_chunks(
+            server_slot & slot,
+            const std::vector<telemetry_moe_native_dispatch_loss> & losses) {
+        if (losses.empty()) {
+            return;
+        }
+
+        // A routing chunk can be held pending only while it precedes the loss
+        // interval.  Flush it before emitting a loss-only chunk so ring order
+        // remains physical/causal rather than completion-time order.
+        const bool pending_flushed = telemetry_flush_moe_pending_chunk(slot);
+        std::vector<const telemetry_moe_native_dispatch_loss *> current;
+
+        const auto make_event = [&]() {
+            json event = telemetry_make_native_dispatch_loss_chunk(slot);
+            json & gaps = event["gaps"];
+            for (const telemetry_moe_native_dispatch_loss * loss : current) {
+                gaps.push_back(telemetry_moe_native_dispatch_loss_gap_json(
+                    slot.telemetry_moe_chunk_decision_sequence, *loss));
+            }
+            telemetry_moe_sort_physical_gaps(gaps);
+            server_moe_routing_apply_canonical_event_coverage(
+                event, { 0, 0, 0, 0, false, true, false, true }, false,
+                "The producer retained an exact native dispatch-loss interval:",
+                "Routing capture lost rows before complete routing coordinates were retained.");
+            return event;
+        };
+        const auto flush_current = [&]() {
+            if (current.empty()) {
+                return true;
+            }
+            json event = make_event();
+            if (!telemetry_moe_chunk_can_be_finalized(event) ||
+                    !telemetry_append_moe_routing_chunk(std::move(event))) {
+                return false;
+            }
+            ++slot.telemetry_moe_chunk_sequence;
+            current.clear();
+            return true;
+        };
+
+        for (const telemetry_moe_native_dispatch_loss & loss : losses) {
+            if (!pending_flushed) {
+                // The previously planned pending event could not enter the
+                // ring.  Preserve this exact gap with the bounded alternative
+                // rather than retaining an unbounded per-slot backlog.
+                telemetry_append_native_dispatch_loss_alternative(slot, loss);
+                continue;
+            }
+
+            current.push_back(&loss);
+            if (telemetry_moe_chunk_can_be_finalized(make_event())) {
+                continue;
+            }
+            current.pop_back();
+            if (!flush_current()) {
+                for (const telemetry_moe_native_dispatch_loss * retained : current) {
+                    telemetry_append_native_dispatch_loss_alternative(slot, *retained);
+                }
+                current.clear();
+            }
+
+            current.push_back(&loss);
+            if (!telemetry_moe_chunk_can_be_finalized(make_event())) {
+                current.clear();
+                telemetry_append_native_dispatch_loss_alternative(slot, loss);
+            }
+        }
+        if (!flush_current()) {
+            for (const telemetry_moe_native_dispatch_loss * retained : current) {
+                telemetry_append_native_dispatch_loss_alternative(slot, *retained);
+            }
+        }
     }
 
     void telemetry_record_moe_routing_chunks(
@@ -7503,23 +7654,9 @@ private:
             unlocated["application_epoch"] = loss.application_epoch;
             unlocated["reason"] = "A routing record could not be retained with the configured serialized chunk-capacity finalization reservation.";
         };
-        const auto append_native_loss_gaps = [&](json & event) {
-            if (slot.telemetry_moe_chunk_native_losses.empty()) {
-                return false;
-            }
-            json gaps = event.value("gaps", json::array());
-            for (const telemetry_moe_native_dispatch_loss & loss : slot.telemetry_moe_chunk_native_losses) {
-                gaps.push_back(telemetry_moe_native_dispatch_loss_gap_json(
-                    slot.telemetry_moe_chunk_decision_sequence, loss));
-            }
-            telemetry_moe_sort_physical_gaps(gaps);
-            event["gaps"] = std::move(gaps);
-            return true;
-        };
         const uint64_t pending_unlocated_rows = slot.telemetry_moe_chunk_unlocated_pending;
         if (!slot.telemetry_moe_pending_chunk.is_null()) {
             slot.telemetry_moe_pending_chunk["is_final_for_trace"] = true;
-            const bool native_loss = append_native_loss_gaps(slot.telemetry_moe_pending_chunk);
             const uint64_t existing_unlocated_rows = telemetry_moe_chunk_unlocated_loss_count(slot.telemetry_moe_pending_chunk);
             uint64_t unlocated_rows = 0;
             GGML_ASSERT(server_moe_routing_combine_lost_population(
@@ -7532,7 +7669,7 @@ private:
                 slot.telemetry_moe_chunk_capture_interrupted,
                 slot.telemetry_moe_chunk_source_unavailable,
                 slot.telemetry_moe_chunk_attribution_ambiguous,
-                native_loss,
+                false,
             };
             server_moe_routing_apply_canonical_event_coverage(
                 slot.telemetry_moe_pending_chunk, routing_coverage, true,
@@ -7542,17 +7679,19 @@ private:
             slot.telemetry_moe_chunk_unlocated_pending = 0;
             GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(slot.telemetry_moe_pending_chunk));
             GGML_ASSERT(telemetry_flush_moe_pending_chunk(slot));
-            slot.telemetry_moe_chunk_native_losses.clear();
             slot.telemetry_moe_chunk_capacity_loss = {};
             return;
         }
 
-        if (llama_model_n_expert(model_tgt) <= 0 || llama_model_n_expert_used(model_tgt) <= 0 ||
-                llama_model_n_moe_layer(model_tgt) <= 0) {
+        if (
+#ifdef LLAMA_SERVER_TEST_HOOKS
+                telemetry_moe_test_descriptor.is_null() &&
+#endif
+                (llama_model_n_expert(model_tgt) <= 0 || llama_model_n_expert_used(model_tgt) <= 0 ||
+                 llama_model_n_moe_layer(model_tgt) <= 0)) {
             return;
         }
         const uint64_t unlocated_rows = pending_unlocated_rows;
-        const bool native_loss = !slot.telemetry_moe_chunk_native_losses.empty();
         const server_moe_routing_chunk_coverage routing_coverage = {
             slot.telemetry_moe_chunk_invalid_rows,
             slot.telemetry_moe_chunk_unavailable_rows,
@@ -7561,7 +7700,7 @@ private:
             slot.telemetry_moe_chunk_capture_interrupted,
             slot.telemetry_moe_chunk_source_unavailable,
             slot.telemetry_moe_chunk_attribution_ambiguous,
-            native_loss,
+            false,
         };
         json marker = {
             {"chunk_id", string_format("moe-%d-%" PRIu64, slot.id, ++slot.telemetry_moe_chunk_sequence)},
@@ -7572,7 +7711,6 @@ private:
             {"is_final_for_trace", true},
             {"descriptor", telemetry_moe_routing_descriptor()},
         };
-        GGML_ASSERT(append_native_loss_gaps(marker) == native_loss);
         server_moe_routing_apply_canonical_event_coverage(
             marker, routing_coverage, false,
             "The request ended with partial routing coverage:",
@@ -7581,7 +7719,6 @@ private:
         annotate_capacity_loss(marker);
         GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(marker));
         GGML_ASSERT(telemetry_append_moe_routing_chunk(std::move(marker)));
-        slot.telemetry_moe_chunk_native_losses.clear();
         slot.telemetry_moe_chunk_capacity_loss = {};
     }
 
@@ -10013,6 +10150,74 @@ private:
 //
 // server_context (public API)
 //
+
+#ifdef LLAMA_SERVER_TEST_HOOKS
+json server_context_impl::test_native_dispatch_loss_stream_finalization() {
+    server_context_impl server;
+    server.telemetry_server_instance_id = "server-test-native-loss-stream";
+    server.telemetry_event_max_bytes = 1024 * 1024;
+    server.telemetry_moe_chunk_max_bytes = 4096;
+    server.telemetry_moe_test_descriptor = {
+        {"routed_expert_count", 2},
+        {"experts_per_token", 1},
+        {"model_layer_count", 2},
+        {"moe_layer_count", 1},
+        {"moe_layer_indices", json::array({1})},
+        {"shared_expert_count", 0},
+    };
+    server.telemetry_capture_dispatch_clock_anchor();
+
+    server_slot slot = {};
+    slot.id = 7;
+    auto task = std::make_unique<server_task>();
+    task->trace_id = "trace-native-loss-stream";
+    task->params.moe_routing_telemetry_permitted = true;
+    slot.task = std::move(task);
+    slot.telemetry_moe_chunk_capture_started = true;
+    slot.telemetry_moe_chunk_source_unavailable = true;
+
+    std::vector<telemetry_moe_native_dispatch_loss> losses;
+    losses.reserve(256);
+    for (uint64_t step = 1; step <= 255; ++step) {
+        losses.push_back({
+            100 + step, 200 + step, 300 + step,
+            step, step + 1, (int64_t) (1000 + step), (int64_t) (1000 + step), step,
+            LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE,
+            LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE,
+            (uint32_t) step, (uint32_t) step, step,
+            100 + step, 200 + step, 300 + step,
+            1, false, false, false, 0, 1, false,
+        });
+    }
+    losses.push_back({
+        356, 456, 556,
+        256, 280, 1256, 1279, 256,
+        LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE,
+        LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE,
+        256, 279, 279,
+        379, 479, 579,
+        24, true, true, false, 0, 24, false,
+    });
+
+    server.telemetry_emit_native_dispatch_loss_chunks(slot, losses);
+    server.telemetry_record_moe_routing_final_marker(slot, "success");
+
+    json result = {
+        {"chunk_limit_bytes", server.telemetry_moe_chunk_limit_bytes()},
+        {"dropped_events", server.telemetry_dropped_events},
+        {"events", json::array()},
+    };
+    for (const telemetry_event_entry & entry : server.telemetry_events) {
+        result["events"].push_back(json::parse(entry.serialized));
+    }
+    server.sleeping = true;
+    return result;
+}
+
+json server_test_moe_dispatch_loss_stream_finalization_json() {
+    return server_context_impl::test_native_dispatch_loss_stream_finalization();
+}
+#endif
 
 server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
