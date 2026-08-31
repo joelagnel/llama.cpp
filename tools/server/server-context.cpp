@@ -272,6 +272,12 @@ struct telemetry_control_application {
     const char * effective_from = "next_request";
 };
 
+struct telemetry_control_boundary_pending {
+    bool pending = false;
+    telemetry_control_state effective;
+    uint64_t microbatch_generation = 0;
+};
+
 enum telemetry_moe_token_phase {
     TELEMETRY_MOE_TOKEN_PHASE_PREFILL_OUTPUT,
     TELEMETRY_MOE_TOKEN_PHASE_NORMAL_DECODE,
@@ -1612,6 +1618,10 @@ private:
     uint64_t telemetry_slot_epoch = 0;
     mutable std::mutex mutex_telemetry_control;
     telemetry_control_state telemetry_control;
+    telemetry_control_state telemetry_microbatch_control;
+    telemetry_control_boundary_pending telemetry_control_boundary;
+    uint64_t telemetry_microbatch_generation = 0;
+    bool telemetry_native_moe_routing_enabled = false;
     bool telemetry_gpu_gpm_active = false;
     bool telemetry_kv_pressure_active = false;
     size_t telemetry_output_token_limit = 512;
@@ -1649,6 +1659,9 @@ private:
     void destroy() {
         gpu_telemetry.stop();
         telemetry_gpu_gpm_active = false;
+        telemetry_kv_pressure_active = false;
+        telemetry_native_moe_routing_enabled = false;
+        telemetry_microbatch_control = {};
         spec.reset();
         spec_init.reset();
 
@@ -1664,8 +1677,29 @@ private:
         mctx = nullptr;
     }
 
-    void telemetry_apply_micro_controls() {
-        const telemetry_control_state control = telemetry_control_current();
+    static bool telemetry_microbatch_controls_changed(
+            const telemetry_control_state & current,
+            const telemetry_control_state & next) {
+        return current.moe_routing != next.moe_routing ||
+            current.kv_pressure_detail != next.kv_pressure_detail ||
+            current.native_gpu_gpm != next.native_gpu_gpm;
+    }
+
+    void telemetry_apply_micro_controls(
+            const telemetry_control_state & control,
+            bool native_moe_routing_enabled) {
+        if (telemetry_microbatch_controls_changed(telemetry_microbatch_control, control)) {
+            telemetry_microbatch_control = control;
+            ++telemetry_microbatch_generation;
+            telemetry_control_boundary = {
+                true,
+                control,
+                telemetry_microbatch_generation,
+            };
+        } else if (telemetry_control_boundary.pending) {
+            telemetry_control_boundary.effective = control;
+        }
+
         if (control.kv_pressure_detail != telemetry_kv_pressure_active) {
             telemetry_kv_pressure_active = control.kv_pressure_detail;
             telemetry_kv_wait.clear();
@@ -1679,15 +1713,42 @@ private:
                 }
             }
         }
-        if (control.native_gpu_gpm == telemetry_gpu_gpm_active) {
+        if (control.native_gpu_gpm != telemetry_gpu_gpm_active) {
+            if (control.native_gpu_gpm) {
+                gpu_telemetry.start();
+            } else {
+                gpu_telemetry.stop();
+            }
+            telemetry_gpu_gpm_active = control.native_gpu_gpm;
+        }
+
+        if (llama_model_n_expert(model_tgt) > 0 &&
+                native_moe_routing_enabled != telemetry_native_moe_routing_enabled) {
+            llama_set_moe_routing(ctx_tgt, native_moe_routing_enabled);
+            telemetry_native_moe_routing_enabled = native_moe_routing_enabled;
+        }
+    }
+
+    void telemetry_emit_control_boundary(uint64_t successful_ubatches_before_dispatch) {
+        if (!telemetry_control_boundary.pending) {
             return;
         }
-        if (control.native_gpu_gpm) {
-            gpu_telemetry.start();
-        } else {
-            gpu_telemetry.stop();
-        }
-        telemetry_gpu_gpm_active = control.native_gpu_gpm;
+
+        const llama_ubatch_stats ubatches = llama_get_ubatch_stats(ctx_tgt);
+        GGML_ASSERT(ubatches.successful == successful_ubatches_before_dispatch + 1);
+        telemetry_append({
+            {"schema_version", 1},
+            {"event", "telemetry_control_boundary"},
+            {"timestamp_unix_ms", telemetry_wall_unix_ms()},
+            {"props_generation", telemetry_control_boundary.effective.generation},
+            {"microbatch_generation", telemetry_control_boundary.microbatch_generation},
+            {"physical_step", ubatches.successful},
+            {"physical_microbatch", 0},
+            {"effective", telemetry_control_effective_json(telemetry_control_boundary.effective)},
+            {"native_moe_routing_enabled", telemetry_native_moe_routing_enabled},
+            {"moe_routing_applicable", llama_model_n_expert(model_tgt) > 0},
+        });
+        telemetry_control_boundary.pending = false;
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -3697,7 +3758,6 @@ private:
 #endif
 
     void update_slots() {
-        telemetry_apply_micro_controls();
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3773,7 +3833,7 @@ private:
 
         llama_batch batch_view;
         int32_t off_next = 0;
-        int32_t n_batch = llama_n_batch(ctx_tgt);
+        int32_t n_batch = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -3790,8 +3850,8 @@ private:
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
-                    // on successful decode, restore the original batch size
-                    n_batch = llama_n_batch(ctx_tgt);
+                    // on successful decode, restore the one-physical-ubatch limit
+                    n_batch = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
                 } else {
                     // try again with the updated n_batch
                     continue;
@@ -3855,7 +3915,7 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                if (telemetry_kv_pressure_active) {
+                if (telemetry_kv_pressure_active && telemetry_control_current().kv_pressure_detail) {
                     const llama_memory_diagnostics diagnostics_before = llama_get_memory_diagnostics(ctx_tgt);
                     slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                     slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
@@ -4046,8 +4106,8 @@ private:
             slot.handle_last_sampled_token(batch);
         });
 
-        // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx_tgt);
+        // process in chunks that map one server dispatch to one physical ubatch
+        int32_t n_batch  = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
         auto & alora_scale       = batch.alora_scale;
@@ -4646,33 +4706,31 @@ private:
             }
         }
 
-        const telemetry_control_state control = telemetry_control_current();
+        const bool target_has_moe = llama_model_n_expert(model_tgt) > 0;
         bool has_output = false;
-        bool collect_moe_routing = false;
+        bool has_moe_routing_request = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
             server_slot & slot = slots[batch.tokens[i].id_slot];
-            if (llama_model_n_expert(model_tgt) > 0 && slot.task &&
-                    slot.task->params.moe_routing_telemetry_permitted &&
-                    !control.moe_routing && slot.telemetry_moe_chunk_capture_started) {
-                if (!slot.telemetry_moe_chunk_capture_interrupted) {
-                    slot.telemetry_moe_chunk_capture_interrupted = true;
-                    ++slot.telemetry_moe_chunk_unlocated_pending;
-                }
-            }
-            collect_moe_routing |= control.moe_routing
-                && llama_model_n_expert(model_tgt) > 0
-                && slot.task
+            has_moe_routing_request |= target_has_moe && slot.task
                 && slot.task->params.moe_routing_telemetry_permitted;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        telemetry_control_state control;
+        bool collect_moe_routing = false;
+        uint64_t successful_ubatches_before_dispatch = 0;
         telemetry_moe_routing_readback_capture moe_routing_readback;
         bool moe_routing_readback_copied = false;
         queue_tasks.yield_to_queue([&]() {
-            llama_set_moe_routing(ctx_tgt, collect_moe_routing);
+            control = telemetry_control_current();
+            collect_moe_routing = control.moe_routing && has_moe_routing_request;
+            telemetry_apply_micro_controls(control, collect_moe_routing);
+            if (telemetry_control_boundary.pending) {
+                successful_ubatches_before_dispatch = llama_get_ubatch_stats(ctx_tgt).successful;
+            }
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -4682,6 +4740,21 @@ private:
             }
         });
         const int64_t decode_completed_us = ggml_time_us();
+
+        if (ret == 0) {
+            telemetry_emit_control_boundary(successful_ubatches_before_dispatch);
+        }
+
+        if (!control.moe_routing && target_has_moe) {
+            for (int i = off; i < off + batch_view.n_tokens; ++i) {
+                server_slot & slot = slots[batch.tokens[i].id_slot];
+                if (slot.task && slot.task->params.moe_routing_telemetry_permitted &&
+                        slot.telemetry_moe_chunk_capture_started && !slot.telemetry_moe_chunk_capture_interrupted) {
+                    slot.telemetry_moe_chunk_capture_interrupted = true;
+                    ++slot.telemetry_moe_chunk_unlocated_pending;
+                }
+            }
+        }
 
         if (ret == 0 && collect_moe_routing) {
             const bool readback_has_rows = moe_routing_readback_copied && !moe_routing_readback.rows.empty();
@@ -8092,7 +8165,7 @@ private:
     }
 
     void telemetry_on_start(server_slot & slot) {
-        if (telemetry_kv_pressure_active) {
+        if (telemetry_kv_pressure_active && telemetry_control_current().kv_pressure_detail) {
             telemetry_kv_request_started(slot);
         }
         if (telemetry_output_token_request_enabled(slot)) {
