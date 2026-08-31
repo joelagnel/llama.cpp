@@ -11,9 +11,10 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
-#include <map>
+#include <array>
 #include <deque>
 #include <iterator>
+#include <map>
 #include <vector>
 
 struct llama_model;
@@ -125,6 +126,16 @@ struct llama_context_dispatch_loss {
     int64_t first_dispatch_monotonic_us = 0;
     int64_t last_dispatch_monotonic_us = 0;
     bool moe_routing_span = false;
+    uint32_t first_physical_microbatch = 0;
+    uint32_t last_physical_microbatch = 0;
+    uint64_t last_logical_call = 0;
+    uint64_t last_props_generation = 0;
+    uint64_t last_microbatch_generation = 0;
+    uint64_t last_application_epoch = 0;
+    uint64_t physical_dispatch_count = 0;
+    bool saturation = false;
+    bool generation_mixed = false;
+    bool native_moe_routing_mixed = false;
 };
 
 struct llama_context_dispatch_drain {
@@ -510,6 +521,8 @@ private:
     std::deque<llama_context_dispatch_notice> dispatch_notices;
     std::deque<llama_context_moe_routing_span> dispatch_moe_routing_spans;
     std::deque<llama_context_dispatch_loss> dispatch_losses;
+    std::array<llama_context_dispatch_loss, 2> dispatch_loss_saturation;
+    std::array<bool, 2> dispatch_loss_saturation_active = {};
     uint64_t dispatch_dropped_notices = 0;
     uint64_t dispatch_dropped_moe_routing_spans = 0;
     uint64_t dispatch_dropped_loss_descriptors = 0;

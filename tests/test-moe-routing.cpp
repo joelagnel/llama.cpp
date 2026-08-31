@@ -377,6 +377,84 @@ static bool test_dispatch_observer(llama_model * model, const common_params & pa
         }
     }
 
+    cparams.n_ctx = 1024;
+    cparams.n_batch = 620;
+    cparams.n_ubatch = 2;
+    llama_context_ptr ctx_saturation { llama_init_from_model(model, cparams) };
+    if (!ctx_saturation) {
+        fprintf(stderr, "%s: failed to create saturation context\n", __func__);
+        return false;
+    }
+    dispatch_script saturating;
+    for (uint64_t generation = 1; generation <= 310; ++generation) {
+        // Alternating a non-routing microbatch control produces both boundary
+        // and routing-span pressure while keeping native routing enabled.
+        saturating.decisions.push_back({ 1, generation, generation,
+            (uint8_t) (generation % 2 ? 1 : 33), true, true, true });
+    }
+    ctx_saturation->set_dispatch_observer({ &saturating, dispatch_script::pre });
+    if (!decode_many(ctx_saturation.get(), 1, 0, 620)) {
+        fprintf(stderr, "%s: saturation decode failed\n", __func__);
+        return false;
+    }
+    drained = ctx_saturation->dispatch_drain();
+    if (saturating.next != 310 || drained.notices.size() != 256 || drained.dropped_notices != 16 ||
+            drained.moe_routing_spans.size() != 32 || drained.dropped_moe_routing_spans != 240 ||
+            drained.losses.size() != 256 || drained.dropped_loss_descriptors != 0) {
+        fprintf(stderr, "%s: saturation did not preserve bounded exact loss evidence (next=%zu notices=%zu dropped-notices=%llu spans=%zu dropped-spans=%llu losses=%zu descriptors=%llu)\n",
+                __func__, saturating.next, drained.notices.size(),
+                (unsigned long long) drained.dropped_notices, drained.moe_routing_spans.size(),
+                (unsigned long long) drained.dropped_moe_routing_spans, drained.losses.size(),
+                (unsigned long long) drained.dropped_loss_descriptors);
+        return false;
+    }
+    std::set<uint64_t> lost_span_steps;
+    std::set<uint64_t> lost_notice_steps;
+    for (size_t i = 0; i < 255; ++i) {
+        const auto & loss = drained.losses[i];
+        if (loss.saturation || loss.first_physical_step == 0 ||
+                loss.next_physical_step != loss.first_physical_step + 1 ||
+                loss.first_physical_microbatch + 1 != loss.first_physical_step ||
+                loss.last_physical_microbatch != loss.first_physical_microbatch ||
+                loss.physical_dispatch_count != 1 || loss.first_dispatch_monotonic_us <= 0 ||
+                loss.last_dispatch_monotonic_us != loss.first_dispatch_monotonic_us) {
+            fprintf(stderr, "%s: detailed loss was not exact before saturation (index=%zu kind=%d steps=%llu-%llu micro=%u-%u count=%llu time=%lld-%lld)\n",
+                    __func__, i, loss.moe_routing_span, (unsigned long long) loss.first_physical_step,
+                    (unsigned long long) loss.next_physical_step, loss.first_physical_microbatch,
+                    loss.last_physical_microbatch, (unsigned long long) loss.physical_dispatch_count,
+                    (long long) loss.first_dispatch_monotonic_us, (long long) loss.last_dispatch_monotonic_us);
+            return false;
+        }
+        (loss.moe_routing_span ? lost_span_steps : lost_notice_steps).insert(loss.first_physical_step);
+    }
+    if (lost_span_steps.size() != 239 || lost_notice_steps.size() != 16 ||
+            *lost_span_steps.begin() != 1 || *lost_span_steps.rbegin() != 239 ||
+            *lost_notice_steps.begin() != 1 || *lost_notice_steps.rbegin() != 16) {
+        fprintf(stderr, "%s: detailed prefix did not retain both loss populations\n", __func__);
+        return false;
+    }
+    for (size_t i = 0; i < drained.moe_routing_spans.size(); ++i) {
+        const auto & span = drained.moe_routing_spans[i];
+        if (span.first_physical_step != 240 + i || span.last_physical_step != 240 + i ||
+                span.physical_dispatches.size() != 1 ||
+                span.physical_dispatches.front().physical_step != 240 + i) {
+            fprintf(stderr, "%s: retained spans overlap or leave a fake saturation coordinate\n", __func__);
+            return false;
+        }
+    }
+    const auto & saturation = drained.losses.back();
+    if (!saturation.saturation || !saturation.moe_routing_span ||
+            saturation.operation != LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE ||
+            saturation.first_physical_step != 272 || saturation.next_physical_step != 311 ||
+            saturation.first_physical_microbatch != 271 || saturation.last_physical_microbatch != 309 ||
+            saturation.physical_dispatch_count != 39 || !saturation.generation_mixed ||
+            saturation.decision.microbatch_generation != 272 ||
+            saturation.last_microbatch_generation != 310 || saturation.first_dispatch_monotonic_us <= 0 ||
+            saturation.last_dispatch_monotonic_us < saturation.first_dispatch_monotonic_us) {
+        fprintf(stderr, "%s: saturation interval was not exact\n", __func__);
+        return false;
+    }
+
     return true;
 }
 

@@ -1232,28 +1232,107 @@ llama_context_dispatch_drain llama_context::dispatch_drain() {
     result.losses.assign(
         std::make_move_iterator(dispatch_losses.begin()),
         std::make_move_iterator(dispatch_losses.end()));
+    for (size_t index = 0; index < dispatch_loss_saturation.size(); ++index) {
+        if (dispatch_loss_saturation_active[index]) {
+            result.losses.push_back(std::move(dispatch_loss_saturation[index]));
+        }
+    }
     result.dropped_notices = dispatch_dropped_notices;
     result.dropped_moe_routing_spans = dispatch_dropped_moe_routing_spans;
     result.dropped_loss_descriptors = dispatch_dropped_loss_descriptors;
     dispatch_notices.clear();
     dispatch_moe_routing_spans.clear();
     dispatch_losses.clear();
+    dispatch_loss_saturation = {};
+    dispatch_loss_saturation_active = {};
     dispatch_dropped_notices = 0;
     dispatch_dropped_moe_routing_spans = 0;
     dispatch_dropped_loss_descriptors = 0;
     return result;
 }
 
-static void llama_context_dispatch_record_loss(
-        std::deque<llama_context_dispatch_loss> & losses,
-        uint64_t & dropped_loss_descriptors,
+static constexpr size_t llama_context_dispatch_loss_capacity = 256;
+static constexpr size_t llama_context_dispatch_loss_saturation_reserve = 1;
+
+static size_t llama_context_dispatch_loss_saturation_index(
+        llama_context_dispatch_operation operation) {
+    return operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE ? 0 : 1;
+}
+
+static llama_context_dispatch_loss llama_context_dispatch_make_loss(
+        const llama_context_dispatch_decision & decision,
+        llama_context_dispatch_operation operation,
+        uint64_t logical_call,
+        uint64_t first_physical_step,
+        uint64_t next_physical_step,
+        uint32_t first_physical_microbatch,
+        uint32_t last_physical_microbatch,
+        int64_t first_dispatch_monotonic_us,
+        int64_t last_dispatch_monotonic_us,
+        bool moe_routing_span) {
+    llama_context_dispatch_loss result = {
+        decision,
+        operation,
+        logical_call,
+        first_physical_step,
+        next_physical_step,
+        first_dispatch_monotonic_us,
+        last_dispatch_monotonic_us,
+        moe_routing_span,
+    };
+    result.first_physical_microbatch = first_physical_microbatch;
+    result.last_physical_microbatch = last_physical_microbatch;
+    result.last_logical_call = logical_call;
+    result.last_props_generation = decision.props_generation;
+    result.last_microbatch_generation = decision.microbatch_generation;
+    result.last_application_epoch = decision.application_epoch;
+    result.physical_dispatch_count = next_physical_step - first_physical_step;
+    return result;
+}
+
+static bool llama_context_dispatch_loss_can_record_detail(
+        const std::deque<llama_context_dispatch_loss> & losses) {
+    return losses.size() < llama_context_dispatch_loss_capacity -
+        llama_context_dispatch_loss_saturation_reserve;
+}
+
+static bool llama_context_dispatch_loss_is_saturated(
+        const std::array<bool, 2> & saturation_active,
+        llama_context_dispatch_operation operation) {
+    return saturation_active[llama_context_dispatch_loss_saturation_index(operation)];
+}
+
+static void llama_context_dispatch_saturate_loss(
+        std::array<llama_context_dispatch_loss, 2> & saturation,
+        std::array<bool, 2> & saturation_active,
         llama_context_dispatch_loss loss) {
-    static constexpr size_t dispatch_loss_capacity = 256;
-    if (losses.size() == dispatch_loss_capacity) {
-        losses.pop_front();
-        ++dropped_loss_descriptors;
+    const size_t index = llama_context_dispatch_loss_saturation_index(loss.operation);
+    if (!saturation_active[index]) {
+        loss.saturation = true;
+        saturation[index] = std::move(loss);
+        saturation_active[index] = true;
+        return;
     }
-    losses.push_back(std::move(loss));
+
+    llama_context_dispatch_loss & current = saturation[index];
+    GGML_ASSERT(current.next_physical_step == loss.first_physical_step);
+    current.next_physical_step = loss.next_physical_step;
+    current.last_physical_microbatch = loss.last_physical_microbatch;
+    current.last_dispatch_monotonic_us = loss.last_dispatch_monotonic_us;
+    current.last_logical_call = loss.last_logical_call;
+    current.generation_mixed |=
+        current.decision.props_generation != loss.decision.props_generation ||
+        current.decision.microbatch_generation != loss.decision.microbatch_generation ||
+        current.decision.application_epoch != loss.decision.application_epoch ||
+        loss.generation_mixed;
+    current.native_moe_routing_mixed |=
+        current.decision.native_moe_routing_enabled != loss.decision.native_moe_routing_enabled ||
+        loss.native_moe_routing_mixed;
+    current.last_props_generation = loss.last_props_generation;
+    current.last_microbatch_generation = loss.last_microbatch_generation;
+    current.last_application_epoch = loss.last_application_epoch;
+    current.physical_dispatch_count += loss.physical_dispatch_count;
+    current.moe_routing_span |= loss.moe_routing_span;
 }
 
 void llama_context::dispatch_begin(llama_context_dispatch_operation operation) {
@@ -1288,6 +1367,9 @@ void llama_context::dispatch_pre_ubatch() {
         ? dispatch_observer.pre(dispatch_observer.user_data, dispatch_operation)
         : llama_context_dispatch_decision {};
 
+    const bool saturation_active = llama_context_dispatch_loss_is_saturated(
+        dispatch_loss_saturation_active, dispatch_operation);
+
     const bool same_capture =
         moe_routing_capture_logical_call == dispatch_logical_call &&
         moe_routing_capture_decision.version == decision.version &&
@@ -1296,19 +1378,21 @@ void llama_context::dispatch_pre_ubatch() {
         moe_routing_capture_decision.native_moe_routing_enabled == decision.native_moe_routing_enabled &&
         moe_routing_capture_decision.moe_routing_applicable == decision.moe_routing_applicable &&
         moe_routing_capture_decision.report_control_boundary == decision.report_control_boundary &&
-        decision.native_moe_routing_enabled;
+        decision.native_moe_routing_enabled &&
+        !saturation_active;
     if (!same_capture) {
         dispatch_finish_moe_routing_span();
     }
 
+    const bool native_capture_enabled = decision.native_moe_routing_enabled && !saturation_active;
     if (decision.version != 0 && model.hparams.n_expert > 0 &&
-            cparams.moe_routing != decision.native_moe_routing_enabled) {
-        set_moe_routing(decision.native_moe_routing_enabled);
+            cparams.moe_routing != native_capture_enabled) {
+        set_moe_routing(native_capture_enabled);
     }
 
     dispatch_decision = decision;
 
-    if (cparams.moe_routing && model.hparams.n_expert > 0) {
+    if (cparams.moe_routing && model.hparams.n_expert > 0 && !saturation_active) {
         if (!same_capture) {
             ++moe_routing_capture_generation;
             clear_moe_routing_readback();
@@ -1336,21 +1420,37 @@ void llama_context::dispatch_success(uint32_t physical_microbatch) {
     }
     dispatch_last_physical_step = physical_step;
 
-    if (cparams.moe_routing && model.hparams.n_expert > 0) {
-        if (moe_routing_capture_first_physical_step == 0) {
-            moe_routing_capture_first_physical_step = physical_step;
-            moe_routing_capture_first_physical_microbatch = physical_microbatch;
-        }
-        moe_routing_capture_last_physical_step = physical_step;
-        moe_routing_capture_last_physical_microbatch = physical_microbatch;
-        moe_routing_capture_physical_dispatches.push_back({
-            physical_step,
-            physical_microbatch,
-            dispatch_monotonic_us,
-        });
-    }
-
     if (dispatch_decision.version == 0) {
+        const bool saturation_active = llama_context_dispatch_loss_is_saturated(
+            dispatch_loss_saturation_active, dispatch_operation);
+        if (saturation_active) {
+            llama_context_dispatch_saturate_loss(
+                dispatch_loss_saturation,
+                dispatch_loss_saturation_active,
+                llama_context_dispatch_make_loss(
+                    dispatch_decision,
+                    dispatch_operation,
+                    dispatch_logical_call,
+                    physical_step,
+                    physical_step + 1,
+                    physical_microbatch,
+                    physical_microbatch,
+                    dispatch_monotonic_us,
+                    dispatch_monotonic_us,
+                    false));
+        } else if (cparams.moe_routing && model.hparams.n_expert > 0) {
+            if (moe_routing_capture_first_physical_step == 0) {
+                moe_routing_capture_first_physical_step = physical_step;
+                moe_routing_capture_first_physical_microbatch = physical_microbatch;
+            }
+            moe_routing_capture_last_physical_step = physical_step;
+            moe_routing_capture_last_physical_microbatch = physical_microbatch;
+            moe_routing_capture_physical_dispatches.push_back({
+                physical_step,
+                physical_microbatch,
+                dispatch_monotonic_us,
+            });
+        }
         return;
     }
 
@@ -1378,23 +1478,83 @@ void llama_context::dispatch_success(uint32_t physical_microbatch) {
         moe_routing_capture_decision.application_epoch = dispatch_decision.application_epoch;
     }
 
+    if (llama_context_dispatch_loss_is_saturated(
+                dispatch_loss_saturation_active, dispatch_operation)) {
+        llama_context_dispatch_saturate_loss(
+            dispatch_loss_saturation,
+            dispatch_loss_saturation_active,
+            llama_context_dispatch_make_loss(
+                dispatch_decision,
+                dispatch_operation,
+                dispatch_logical_call,
+                physical_step,
+                physical_step + 1,
+                physical_microbatch,
+                physical_microbatch,
+                dispatch_monotonic_us,
+                dispatch_monotonic_us,
+                dispatch_decision.native_moe_routing_enabled));
+        return;
+    }
+
+    if (cparams.moe_routing && model.hparams.n_expert > 0) {
+        if (moe_routing_capture_first_physical_step == 0) {
+            moe_routing_capture_first_physical_step = physical_step;
+            moe_routing_capture_first_physical_microbatch = physical_microbatch;
+        }
+        moe_routing_capture_last_physical_step = physical_step;
+        moe_routing_capture_last_physical_microbatch = physical_microbatch;
+        moe_routing_capture_physical_dispatches.push_back({
+            physical_step,
+            physical_microbatch,
+            dispatch_monotonic_us,
+        });
+    }
+
     if (same_applied_decision) {
         return;
     }
 
     static constexpr size_t dispatch_notice_capacity = 256;
     if (dispatch_notices.size() == dispatch_notice_capacity) {
+        if (!llama_context_dispatch_loss_can_record_detail(dispatch_losses)) {
+            llama_context_dispatch_saturate_loss(
+                dispatch_loss_saturation,
+                dispatch_loss_saturation_active,
+                llama_context_dispatch_make_loss(
+                    dispatch_decision,
+                    dispatch_operation,
+                    dispatch_logical_call,
+                    physical_step,
+                    physical_step + 1,
+                    physical_microbatch,
+                    physical_microbatch,
+                    dispatch_monotonic_us,
+                    dispatch_monotonic_us,
+                    dispatch_decision.native_moe_routing_enabled));
+            ++dispatch_dropped_notices;
+            moe_routing_capture_logical_call = 0;
+            moe_routing_capture_first_physical_step = 0;
+            moe_routing_capture_last_physical_step = 0;
+            moe_routing_capture_first_physical_microbatch = 0;
+            moe_routing_capture_last_physical_microbatch = 0;
+            moe_routing_capture_physical_dispatches.clear();
+            clear_moe_routing_readback();
+            return;
+        }
+
         const llama_context_dispatch_notice & dropped = dispatch_notices.front();
-        llama_context_dispatch_record_loss(dispatch_losses, dispatch_dropped_loss_descriptors, {
+        dispatch_losses.push_back(llama_context_dispatch_make_loss(
             dropped.decision,
             dropped.operation,
             dropped.logical_call,
             dropped.physical_step,
             dropped.physical_step + 1,
+            dropped.physical_microbatch,
+            dropped.physical_microbatch,
             dropped.dispatch_monotonic_us,
             dropped.dispatch_monotonic_us,
-            false,
-        });
+            false));
         dispatch_notices.pop_front();
         ++dispatch_dropped_notices;
     }
@@ -1415,6 +1575,38 @@ void llama_context::dispatch_finish_moe_routing_span() {
 
     if (moe_routing_capture_first_physical_step == 0) {
         moe_routing_capture_logical_call = 0;
+        moe_routing_capture_physical_dispatches.clear();
+        clear_moe_routing_readback();
+        return;
+    }
+
+    static constexpr size_t dispatch_moe_routing_span_capacity = 32;
+    const bool saturation_active = llama_context_dispatch_loss_is_saturated(
+        dispatch_loss_saturation_active, moe_routing_capture_operation);
+    if (saturation_active || (dispatch_moe_routing_spans.size() == dispatch_moe_routing_span_capacity &&
+            !llama_context_dispatch_loss_can_record_detail(dispatch_losses))) {
+        llama_context_dispatch_saturate_loss(
+            dispatch_loss_saturation,
+            dispatch_loss_saturation_active,
+            llama_context_dispatch_make_loss(
+                moe_routing_capture_decision,
+                moe_routing_capture_operation,
+                moe_routing_capture_logical_call,
+                moe_routing_capture_first_physical_step,
+                moe_routing_capture_last_physical_step + 1,
+                moe_routing_capture_first_physical_microbatch,
+                moe_routing_capture_last_physical_microbatch,
+                moe_routing_capture_physical_dispatches.empty() ? 0 :
+                    moe_routing_capture_physical_dispatches.front().dispatch_monotonic_us,
+                moe_routing_capture_physical_dispatches.empty() ? 0 :
+                    moe_routing_capture_physical_dispatches.back().dispatch_monotonic_us,
+                true));
+        ++dispatch_dropped_moe_routing_spans;
+        moe_routing_capture_logical_call = 0;
+        moe_routing_capture_first_physical_step = 0;
+        moe_routing_capture_last_physical_step = 0;
+        moe_routing_capture_first_physical_microbatch = 0;
+        moe_routing_capture_last_physical_microbatch = 0;
         moe_routing_capture_physical_dispatches.clear();
         clear_moe_routing_readback();
         return;
@@ -1477,19 +1669,19 @@ void llama_context::dispatch_finish_moe_routing_span() {
         }
     }
 
-    static constexpr size_t dispatch_moe_routing_span_capacity = 32;
     if (dispatch_moe_routing_spans.size() == dispatch_moe_routing_span_capacity) {
         const llama_context_moe_routing_span & dropped = dispatch_moe_routing_spans.front();
-        llama_context_dispatch_record_loss(dispatch_losses, dispatch_dropped_loss_descriptors, {
+        dispatch_losses.push_back(llama_context_dispatch_make_loss(
             dropped.decision,
             dropped.operation,
             dropped.logical_call,
             dropped.first_physical_step,
             dropped.last_physical_step + 1,
+            dropped.first_physical_microbatch,
+            dropped.last_physical_microbatch,
             dropped.physical_dispatches.empty() ? 0 : dropped.physical_dispatches.front().dispatch_monotonic_us,
             dropped.physical_dispatches.empty() ? 0 : dropped.physical_dispatches.back().dispatch_monotonic_us,
-            true,
-        });
+            true));
         dispatch_moe_routing_spans.pop_front();
         ++dispatch_dropped_moe_routing_spans;
     }
