@@ -70,14 +70,31 @@ static void test_cap_and_invalid_records_remain_distinct(testing & t) {
     t.assert_true(std::strcmp("truncated", server_moe_routing_capture_state(counts, true)) == 0);
 }
 
-static void test_producer_coverage_requires_valid_linked_rows(testing & t) {
-    t.assert_true(!server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, false, false));
-    t.assert_true( server_moe_routing_producer_coverage_is_partial(1, 0, 0, 0, false, false));
-    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 1, 0, 0, false, false));
-    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 1, 0, false, false));
-    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 0, 1, false, false));
-    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, true,  false));
-    t.assert_true( server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, false, true));
+static void test_canonical_event_coverage(testing & t) {
+    t.test("available routing stays available", [](testing & t) {
+        t.assert_true(!server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, false, false));
+    });
+
+    t.test("invalid records mark the canonical event partial", [](testing & t) {
+        t.assert_true(server_moe_routing_producer_coverage_is_partial(1, 0, 0, 0, false, false));
+    });
+
+    t.test("unavailable K+1 or routing weights mark the canonical event partial", [](testing & t) {
+        t.assert_true(server_moe_routing_producer_coverage_is_partial(0, 1, 0, 0, false, false));
+    });
+
+    t.test("unavailable K+1 when K equals N marks the canonical event partial", [](testing & t) {
+        t.assert_true(server_moe_routing_producer_coverage_is_partial(0, 1, 0, 0, false, false));
+    });
+
+    t.test("unmappable rows remain coordinate-free coverage loss", [](testing & t) {
+        t.assert_true(server_moe_routing_producer_coverage_is_partial(0, 0, 1, 1, false, false));
+    });
+
+    t.test("interrupted and unavailable final markers stay partial", [](testing & t) {
+        t.assert_true(server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, true,  false));
+        t.assert_true(server_moe_routing_producer_coverage_is_partial(0, 0, 0, 0, false, true));
+    });
 }
 
 static void test_serialization_loss_counts_pending_and_incoming(testing & t) {
@@ -105,7 +122,7 @@ int main() {
     t.test("invalid records do not look capped", test_invalid_records_do_not_look_capped);
     t.test("cap truncation", test_cap_truncation);
     t.test("cap and invalid records remain distinct", test_cap_and_invalid_records_remain_distinct);
-    t.test("producer coverage requires valid linked rows", test_producer_coverage_requires_valid_linked_rows);
+    t.test("canonical event coverage", test_canonical_event_coverage);
     t.test("serialization loss counts pending and incoming", test_serialization_loss_counts_pending_and_incoming);
     t.test("finalization loss combines event and pending", test_finalization_loss_combines_event_and_pending);
 

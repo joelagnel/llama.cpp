@@ -1935,6 +1935,7 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
         assert chunks[-1]["is_final_for_trace"] is True
         assert chunks[-1]["decisions"]
         assert all(chunk["availability"] == 0 for chunk in chunks)
+        assert all("reason" not in chunk and "unlocated_coverage_loss" not in chunk for chunk in chunks)
         assert all(chunk["descriptor"]["schema_version"] == 2 for chunk in chunks)
         assert all(chunk["descriptor"]["clock_domain"] == "utc_wall_clock" for chunk in chunks)
         assert all(
@@ -2333,6 +2334,7 @@ def test_moe_routing_chunks_mark_on_off_on_intervals_partial():
         partial_chunks = [chunk for chunk in chunks if chunk["availability"] == 1]
         assert partial_chunks
         assert any(chunk["unlocated_coverage_loss"]["count"] > 0 for chunk in partial_chunks)
+        assert any("routing capture was interrupted" in chunk["reason"] for chunk in partial_chunks)
         assert any(
             decision["event_key"]["control_generation"] == 1
             for chunk in chunks for decision in chunk["decisions"]
