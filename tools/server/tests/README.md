@@ -81,7 +81,7 @@ $env:LLAMA_SERVER_BIN_PATH = (Resolve-Path ..\..\..\build\bin\Release\llama-serv
 py -m pytest -q .\unit\test_telemetry_control.py .\unit\test_telemetry.py
 ```
 
-These checks cover full-replacement `/props` control, authentication, actual-listener loopback enforcement, environment/request non-activation, restart reset, dense-path behavior, canonical schema-v2 bytes, sparse topology, chunk boundaries, loss/gaps, peer coverage, MTP linkage, and generic telemetry behavior.
+These checks cover full-replacement `/props` control, authentication, actual-listener loopback enforcement, environment/request non-activation, restart reset, dense-path behavior, canonical schema-v3 bytes, sparse topology, chunk boundaries, loss/gaps, peer coverage, MTP linkage, and generic telemetry behavior.
 
 The CUDA routing-readback gate is separate and Windows-only. It requires a static CUDA build and proves that enabled MoE capture performs device-to-host readback while disabled and dense paths do not. Configure it explicitly; the configuration rejects a CPU build, a shared build, or a non-Windows build:
 
