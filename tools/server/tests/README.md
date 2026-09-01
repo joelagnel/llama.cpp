@@ -63,8 +63,8 @@ The private-fork telemetry contract has native MoE tests and authenticated serve
 
 ```shell
 cmake -S . -B build -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=ON
-cmake --build build --target llama-server test-llama-archs test-moe-routing test-moe-routing-telemetry
-ctest --test-dir build --output-on-failure -R "^(test-moe-routing-telemetry|test-moe-routing-dense|test-moe-routing-dsv4)$"
+cmake --build build --config Release --target llama-server test-llama-archs test-moe-routing test-moe-routing-telemetry
+ctest --test-dir build -C Release --output-on-failure -R "^(test-moe-routing-telemetry|test-moe-routing-dense|test-moe-routing-dsv4)$"
 ```
 
 Run the server scenarios from this directory. Set `LLAMA_SERVER_BIN_PATH` to the server from the same build tree when it is not the default path:
@@ -77,7 +77,7 @@ LLAMA_SERVER_BIN_PATH=../../../build/bin/llama-server \
 On Windows PowerShell, the equivalent environment setup is:
 
 ```powershell
-$env:LLAMA_SERVER_BIN_PATH = (Resolve-Path ..\..\..\build\bin\llama-server.exe)
+$env:LLAMA_SERVER_BIN_PATH = (Resolve-Path ..\..\..\build\bin\Release\llama-server.exe)
 py -m pytest -q .\unit\test_telemetry_control.py .\unit\test_telemetry.py
 ```
 
@@ -89,8 +89,8 @@ The CUDA routing-readback gate is separate and Windows-only. It requires a stati
 cmake -S . -B build-cuda-routing -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF `
   -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TESTS=ON `
   -DLLAMA_MOE_ROUTING_CUDA_READBACK_TESTS=ON
-cmake --build build-cuda-routing --target test-llama-archs test-moe-routing
-ctest --test-dir build-cuda-routing --output-on-failure `
+cmake --build build-cuda-routing --config Release --target test-llama-archs test-moe-routing
+ctest --test-dir build-cuda-routing -C Release --output-on-failure `
   -R "^test-moe-routing-dsv4-cuda-readback$"
 ```
 
