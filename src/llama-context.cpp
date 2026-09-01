@@ -3225,9 +3225,9 @@ void llama_context::extract_moe_routing(
 
 #ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
 llama_moe_routing_test_row_position_mapping llama_context::test_map_moe_routing_primary_positions() {
-    constexpr uint32_t n_tokens = 40;
+    static constexpr uint32_t n_tokens = 40;
     constexpr uint32_t n_pos = 4;
-    constexpr int32_t token_offset = 17;
+    static constexpr int32_t token_offset = 17;
     std::array<llama_token, n_tokens> tokens;
     std::array<llama_pos, n_tokens*n_pos> positions;
     std::array<int8_t, n_tokens> output;
