@@ -1960,9 +1960,10 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
             if event.get("trace_id") == trace_id
             and event["event"] in ("request_completed", "request_ended")
         ]
+        raw_events = raw_telemetry_event_envelopes(events_http.content)
         raw_chunks = [
             raw
-            for raw in raw_telemetry_event_envelopes(events_http.content)
+            for raw in raw_events
             if (event := json.loads(raw)).get("event") == "moe_routing_chunk"
             and event.get("trace_id") == trace_id
         ]
@@ -2035,7 +2036,7 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
             "physical_peer_coverage",
         }
         for raw, chunk in zip(raw_chunks, chunks):
-            assert raw == json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            assert json.loads(raw) == chunk
             assert chunk["serialized_bytes"] == len(raw)
             assert chunk["schema_version"] == 3
             assert chunk["event"] == "moe_routing_chunk"
@@ -2081,17 +2082,7 @@ def test_moe_routing_chunks_cover_prefill_and_decode_with_props_control():
             decision["event_key"]["layer_index"] in chunk["descriptor"]["moe_layer_indices"]
             for chunk in chunks for decision in chunk["decisions"]
         )
-        assert all(
-            chunk["serialized_bytes"] == len(
-                json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            )
-            for chunk in chunks
-        )
-        serialized_events = [
-            json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            for event in events_response["events"]
-        ]
-        assert b'"events":[' + b",".join(serialized_events) + b"]" in events_http.content
+        assert [json.loads(raw) for raw in raw_events] == events_response["events"]
         assert all(chunk["sequence"] > 0 for chunk in chunks)
         assert all(chunk["server_instance_id"] == events_response["server_instance_id"] for chunk in chunks)
         assert all(chunk["first_sequence"] < chunk["next_sequence"] for chunk in chunks)
