@@ -535,6 +535,7 @@ static void test_router_child_api_key_file_security(testing & t) {
 #endif
 
 int main() {
+    ggml_time_init();
     testing t;
 
     t.test("record validation", test_record_validation);
