@@ -62,8 +62,8 @@ To run a single test:
 The private-fork telemetry contract has native MoE tests and authenticated server scenarios. Configure and build the server and native test targets first, then run the focused CTest selection:
 
 ```shell
-cmake -S . -B build -DLLAMA_BUILD_TESTS=ON
-cmake --build build --target llama-server test-moe-routing test-moe-routing-telemetry
+cmake -S . -B build -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=ON
+cmake --build build --target llama-server test-llama-archs test-moe-routing test-moe-routing-telemetry
 ctest --test-dir build --output-on-failure -R "^(test-moe-routing-telemetry|test-moe-routing-dense|test-moe-routing-dsv4)$"
 ```
 
@@ -89,7 +89,7 @@ The CUDA routing-readback gate is separate and Windows-only. It requires a stati
 cmake -S . -B build-cuda-routing -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF `
   -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TESTS=ON `
   -DLLAMA_MOE_ROUTING_CUDA_READBACK_TESTS=ON
-cmake --build build-cuda-routing --target test-moe-routing
+cmake --build build-cuda-routing --target test-llama-archs test-moe-routing
 ctest --test-dir build-cuda-routing --output-on-failure `
   -R "^test-moe-routing-dsv4-cuda-readback$"
 ```
