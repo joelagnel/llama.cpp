@@ -88,7 +88,7 @@ An events response contains `cursor`, `oldest_sequence`, `next_sequence`, `gap`,
 
 ## Response probability
 
-Response probability is normally conditional on request `n_probs > 0`. When all three trusted-local diagnostic gates described below are enabled, llama-server raises an omitted or zero request value to `n_probs = 1`. It computes the selected emitted token's log probability from the raw target-model logits before sampler truncation. This adds no model inference, rejected draft tokens never contribute, accepted speculative output tokens contribute once, and replayed/discarded verification passes contribute nothing. The exact event semantic is:
+Response probability is conditional on request `n_probs > 0`. Telemetry producer controls never raise an omitted or zero request value. When probabilities are requested, llama-server computes the selected emitted token's log probability from the raw target-model logits before sampler truncation. This adds no model inference, rejected draft tokens never contribute, accepted speculative output tokens contribute once, and replayed/discarded verification passes contribute nothing. The exact event semantic is:
 
 - `raw_target_model_pre_sampler_selected_token_probability`.
 
