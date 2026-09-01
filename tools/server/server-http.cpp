@@ -191,7 +191,7 @@ bool server_http_context::init(const common_params & params) {
     });
 
     if (params.api_keys.empty()) {
-        SRV_TRC("api_keys: not configured\n");
+        SRV_TRC("%s", "api_keys: not configured\n");
     } else {
         SRV_TRC("api_keys: configured (count=%zu)\n", params.api_keys.size());
     }
@@ -485,7 +485,7 @@ bool server_http_context::start() {
         if (srv->get_bound_address(bound_address, bound_port)) {
             telemetry_control_loopback_listener.store(is_loopback_address(bound_address));
         } else {
-            SRV_WRN("couldn't inspect the bound HTTP listener; telemetry control remains disabled\n");
+            SRV_WRN("%s", "couldn't inspect the bound HTTP listener; telemetry control remains disabled\n");
         }
     }
 
