@@ -12,9 +12,15 @@
 #include <set>
 #include <vector>
 
+static llama_token normalize_test_token(llama_context * ctx, llama_token token) {
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    GGML_ASSERT(n_vocab > 0);
+    return token % n_vocab;
+}
+
 static bool decode_one(llama_context * ctx, llama_token token, llama_pos pos) {
     llama_batch batch = llama_batch_init(1, 0, 1);
-    common_batch_add(batch, token, pos, { 0 }, true);
+    common_batch_add(batch, normalize_test_token(ctx, token), pos, { 0 }, true);
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
     return ok;
@@ -23,7 +29,7 @@ static bool decode_one(llama_context * ctx, llama_token token, llama_pos pos) {
 static bool decode_many(llama_context * ctx, llama_token token, llama_pos pos, int32_t n_tokens) {
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     for (int32_t i = 0; i < n_tokens; ++i) {
-        common_batch_add(batch, token + i, pos + i, { 0 }, true);
+        common_batch_add(batch, normalize_test_token(ctx, token + i), pos + i, { 0 }, true);
     }
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
@@ -509,7 +515,7 @@ static bool test_dispatch_observer(llama_model * model, const common_params & pa
     llama_set_abort_callback(ctx_interleaved.get(), nullptr, nullptr);
 
     for (llama_token token = 1; token <= 8; ++token) {
-        if (!decode_one(ctx_interleaved.get(), 544 + token, 543 + token)) {
+        if (!decode_one(ctx_interleaved.get(), 544 + token, 544 + token)) {
             fprintf(stderr, "%s: post-failure decode recovery failed\n", __func__);
             return false;
         }
