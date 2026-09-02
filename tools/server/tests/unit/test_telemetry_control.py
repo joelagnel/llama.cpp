@@ -316,7 +316,7 @@ def test_mtmd_image_prefill_emits_a_target_decode_boundary():
                     "content": [
                         {"type": "text", "text": "What is in this image?"},
                         {"type": "image_url", "image_url": {
-                            "url": "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/11_truck.png",
+                            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
                         }},
                     ],
                 }],
