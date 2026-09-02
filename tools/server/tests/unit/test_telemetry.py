@@ -2366,8 +2366,8 @@ def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
     mtp_server.server_props = True
     mtp_server.api_key = api_key
     mtp_server.spec_draft_n_min = 1
-    mtp_server.n_batch = 4
-    mtp_server.n_ubatch = 2
+    mtp_server.n_batch = 32
+    mtp_server.n_ubatch = 16
     mtp_server.start()
 
     try:
@@ -2436,11 +2436,21 @@ def test_moe_routing_chunks_link_decoder_mtp_context_when_available():
         ]
         mtp_decisions = [decision for decision in decisions if decision["event_key"]["phase"] == 3]
         assert mtp_decisions
+        assert all(
+            chunk["descriptor"]["model_layer_count"] > max(
+                decision["event_key"]["layer_index"] for decision in chunk["decisions"]
+            )
+            for chunk in mtp_chunks if chunk["decisions"]
+        )
+        assert all(
+            decision["event_key"]["layer_index"] in chunk["descriptor"]["moe_layer_indices"]
+            for chunk in mtp_chunks for decision in chunk["decisions"]
+        )
         assert boundary["sequence"] < min(
             event["sequence"] for event in events.body["events"]
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
         )
-        assert all(decision["native_row"]["graph_type"] == "decoder_mtp" for decision in mtp_decisions)
+        assert all(decision["native_row"]["graph_type"] == "default" for decision in mtp_decisions)
         assert all(decision["model_position"] is not None for decision in mtp_decisions)
         assert all(decision["speculative_pass"]["logical_verification_step"] is not None for decision in mtp_decisions)
         assert all(decision["speculative_pass"]["actual_target_pass"] is not None for decision in mtp_decisions)

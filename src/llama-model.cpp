@@ -3121,7 +3121,7 @@ int32_t llama_model_n_expert_shared(const struct llama_model * model) {
 }
 
 int32_t llama_model_n_moe_layer(const struct llama_model * model) {
-    return (int32_t) std::count_if(model->layers.begin(), model->layers.end(), [](const llama_layer & layer) {
+    return (int32_t) std::count_if(model->layers.begin(), model->layers.begin() + model->hparams.n_layer(), [](const llama_layer & layer) {
         return layer.ffn_gate_inp != nullptr;
     });
 }
@@ -3131,7 +3131,7 @@ int32_t llama_model_moe_layer_index(const struct llama_model * model, int32_t mo
         return -1;
     }
 
-    for (size_t layer_index = 0; layer_index < model->layers.size(); ++layer_index) {
+    for (size_t layer_index = 0; layer_index < model->hparams.n_layer(); ++layer_index) {
         if (model->layers[layer_index].ffn_gate_inp == nullptr) {
             continue;
         }
