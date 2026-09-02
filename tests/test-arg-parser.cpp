@@ -229,11 +229,29 @@ static void test(void) {
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    {
+        common_params swap_params;
+        argv = {"binary_name", "--kv-swap-max-mib", "0"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), swap_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     printf("test-arg-parser: test valid usage\n\n");
 
     argv = {"binary_name", "-m", "model_file.gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");
+
+    {
+        common_params swap_params;
+        assert(swap_params.kv_swap == false);
+        assert(swap_params.kv_swap_max_mib == 4096);
+
+        argv = {"binary_name", "--kv-swap", "--kv-swap-max-mib", "8192", "--kv-unified"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), swap_params, LLAMA_EXAMPLE_SERVER));
+        assert(swap_params.kv_swap == true);
+        assert(swap_params.kv_swap_max_mib == 8192);
+        assert(swap_params.kv_unified == true);
+    }
 
     argv = {"binary_name", "-t", "1234"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

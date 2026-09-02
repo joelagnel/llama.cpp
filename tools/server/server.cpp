@@ -139,6 +139,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
 
+    if (params.kv_swap && !params.kv_unified) {
+        SRV_ERR("%s", "--kv-swap requires --kv-unified\n");
+        return 1;
+    }
+
     if (!is_router_server) {
         // validate batch size for embeddings
         // embeddings require all tokens to be processed in a single ubatch
@@ -155,6 +160,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_parallel = 4;
             params.kv_unified = true;
         }
+
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias

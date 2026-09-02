@@ -748,6 +748,16 @@ ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
 
+ggml_backend_t llama_context::get_backend(ggml_backend_dev_t device) const {
+    for (const auto & backend : backends) {
+        if (ggml_backend_get_device(backend.get()) == device) {
+            return backend.get();
+        }
+    }
+
+    return nullptr;
+}
+
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }

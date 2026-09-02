@@ -62,6 +62,8 @@ struct llama_context {
 
     ggml_backend_sched_t get_sched() const;
 
+    ggml_backend_t get_backend(ggml_backend_dev_t device) const;
+
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;

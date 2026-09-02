@@ -1718,6 +1718,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--kv-swap"},
+        {"--no-kv-swap"},
+        "swap unified attention KV pages to pinned host memory (default: disabled, requires --kv-unified)",
+        [](common_params & params, bool value) {
+            params.kv_swap = value;
+        }
+    ).set_env("LLAMA_ARG_KV_SWAP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-swap-max-mib"}, "N",
+        string_format("maximum pinned host memory for KV swapping in MiB (default: %d)", params.kv_swap_max_mib),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("kv-swap-max-mib must be positive");
+            }
+            params.kv_swap_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KV_SWAP_MAX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

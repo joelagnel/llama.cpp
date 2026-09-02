@@ -1521,7 +1521,7 @@ json server_task_result_metrics::to_json() {
 
 // metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
 std::string server_task_result_metrics::to_metrics() {
-    const std::vector<metric_item> counters = {
+    std::vector<metric_item> counters = {
         {
             "prompt_tokens_total",
             "Number of prompt tokens processed, excluding cached tokens",
@@ -1565,7 +1565,7 @@ std::string server_task_result_metrics::to_metrics() {
         },
     };
 
-    const std::vector<metric_item> gauges = {
+    std::vector<metric_item> gauges = {
         {
             "prompt_tokens_seconds",
             "Average prompt throughput in tokens/s",
@@ -1588,6 +1588,29 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
         },
     };
+
+    if (metrics.kv_swap_enabled) {
+        const auto & swap = metrics.kv_swap;
+        counters.insert(counters.end(), {
+            {"kv_swap_d2h_bytes_total", "KV bytes transferred from device to pinned host memory", (double) swap.d2h_bytes},
+            {"kv_swap_h2d_bytes_total", "KV bytes transferred from pinned host memory to device", (double) swap.h2d_bytes},
+            {"kv_swap_d2h_seconds_total", "Time spent transferring KV from device to host", swap.d2h_time_us / 1.e6},
+            {"kv_swap_h2d_seconds_total", "Time spent transferring KV from host to device", swap.h2d_time_us / 1.e6},
+            {"kv_swap_overlap_seconds_total", "Decode wall time observed while KV copies were pending", swap.overlap_time_us / 1.e6},
+            {"kv_swap_pages_out_total", "Number of logical KV pages swapped to host", (double) swap.pages_out},
+            {"kv_swap_pages_in_total", "Number of logical KV pages restored to device", (double) swap.pages_in},
+            {"kv_swap_sequences_out_total", "Number of completed sequence evictions", (double) swap.sequences_out},
+            {"kv_swap_sequences_in_total", "Number of completed sequence restorations", (double) swap.sequences_in},
+        });
+        gauges.insert(gauges.end(), {
+            {"kv_swap_host_bytes", "Pinned host bytes currently allocated for KV swap", (double) swap.host_bytes},
+            {"kv_swap_host_bytes_peak", "Peak pinned host bytes allocated for KV swap", (double) swap.host_bytes_peak},
+            {"kv_swap_device_cells", "Total cells in the unified device attention KV cache", (double) swap.device_cells},
+            {"kv_swap_device_cells_used", "Occupied cells in the unified device attention KV cache", (double) swap.device_cells_used},
+            {"kv_swap_transfers_pending", "KV page groups with an incomplete asynchronous copy", (double) swap.transfers_pending},
+            {"kv_swap_page_cells", "Logical cells per KV swap page", (double) swap.page_cells},
+        });
+    }
 
     std::stringstream prometheus;
 

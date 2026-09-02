@@ -479,6 +479,9 @@ struct server_metrics {
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    bool kv_swap_enabled = false;
+    llama_kv_swap_stats kv_swap = {};
+
     void init() {
         t_start = ggml_time_us();
     }

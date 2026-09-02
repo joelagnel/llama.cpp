@@ -104,7 +104,35 @@ enum slot_state {
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
+    SLOT_STATE_SWAPPING_OUT,
+    SLOT_STATE_PAUSED,
+    SLOT_STATE_SWAPPING_IN,
 };
+
+static const char * slot_state_name(slot_state state) {
+    switch (state) {
+        case SLOT_STATE_IDLE:              return "idle";
+        case SLOT_STATE_WAIT_OTHER:        return "waiting";
+        case SLOT_STATE_STARTED:           return "started";
+        case SLOT_STATE_PROCESSING_PROMPT: return "prompt";
+        case SLOT_STATE_DONE_PROMPT:       return "prompt_done";
+        case SLOT_STATE_GENERATING:        return "generating";
+        case SLOT_STATE_SWAPPING_OUT:      return "swapping_out";
+        case SLOT_STATE_PAUSED:            return "paused";
+        case SLOT_STATE_SWAPPING_IN:       return "swapping_in";
+    }
+    GGML_ABORT("invalid slot state");
+}
+
+static const char * kv_swap_state_name(llama_kv_swap_state state) {
+    switch (state) {
+        case LLAMA_KV_SWAP_STATE_RESIDENT:     return "resident";
+        case LLAMA_KV_SWAP_STATE_SWAPPING_OUT: return "swapping_out";
+        case LLAMA_KV_SWAP_STATE_HOST:         return "host";
+        case LLAMA_KV_SWAP_STATE_SWAPPING_IN:  return "swapping_in";
+    }
+    GGML_ABORT("invalid KV swap state");
+}
 
 struct server_slot; // forward declaration
 
@@ -240,6 +268,7 @@ struct server_slot {
     int id;
 
     llama_context * ctx_tgt = nullptr;
+    llama_kv_swap * kv_swap = nullptr;
     llama_context * ctx_dft = nullptr;
 
     common_memory mem;
@@ -293,6 +322,14 @@ struct server_slot {
 
     // state
     slot_state state = SLOT_STATE_IDLE;
+    slot_state state_resume = SLOT_STATE_IDLE;
+
+    uint64_t kv_swap_quantum_tokens = 0;
+    uint64_t kv_swap_count = 0;
+    uint64_t kv_swap_stall_us = 0;
+    int64_t kv_swap_last_run_us = -1;
+    int64_t kv_swap_pause_start_us = 0;
+    uint64_t kv_swap_resume_after_decode = 0;
 
     server_prompt prompt;
 
@@ -334,6 +371,7 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
+        llama_kv_swap_seq_discard(kv_swap, id);
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
@@ -691,7 +729,24 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
+            {"state",         slot_state_name(state)},
         };
+
+        if (kv_swap) {
+            const auto swap = llama_kv_swap_seq_get_status(kv_swap, id);
+            res["kv_swap"] = {
+                {"state",             kv_swap_state_name(swap.state)},
+                {"total_cells",       swap.total_cells},
+                {"device_cells",      swap.device_cells},
+                {"host_pages",        swap.host_pages},
+                {"transfer_pages",    swap.transfer_pages},
+                {"host_bytes",        swap.host_bytes},
+                {"last_use_us",       swap.last_use_us},
+                {"quantum_tokens",    kv_swap_quantum_tokens},
+                {"swap_count",        kv_swap_count},
+                {"swap_stall_ms",     kv_swap_stall_us / 1000.0},
+            };
+        }
 
         const auto & ptask = task ? task : task_prev;
 
@@ -865,7 +920,10 @@ public:
     }
 
     server_metrics get_metrics() const {
-        return metrics;
+        server_metrics result = metrics;
+        result.kv_swap_enabled = kv_swap != nullptr;
+        result.kv_swap = llama_kv_swap_get_stats(kv_swap);
+        return result;
     }
 
     void reset_metrics_bucket() {
@@ -882,6 +940,7 @@ private:
     common_init_result_ptr llama_init;
 
     llama_context * ctx_tgt = nullptr;
+    llama_kv_swap * kv_swap = nullptr;
 
     server_batch batch;
 
@@ -916,6 +975,11 @@ private:
 
     server_metrics metrics;
 
+    static constexpr uint32_t KV_SWAP_QUANTUM_TOKENS = 32;
+
+    uint64_t kv_swap_decode_tokens = 0;
+    uint32_t kv_swap_batch_limit = UINT32_MAX;
+
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
     // note: kept out of server_metrics, which is copied as-is into the task result
     int64_t  t_decode_start  = 0; // start of the last submitted decode
@@ -941,6 +1005,9 @@ private:
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
+
+        llama_kv_swap_free(kv_swap);
+        kv_swap = nullptr;
 
         llama_init.reset();
 
@@ -1263,12 +1330,30 @@ private:
             return false;
         }
 
+        if (params_base.kv_swap) {
+            char reason[256] = {};
+            if (!llama_kv_swap_supported(ctx_tgt, reason, sizeof(reason))) {
+                SRV_ERR("failed to enable KV swap: %s\n", reason);
+                return false;
+            }
+
+            const size_t max_bytes = (size_t) params_base.kv_swap_max_mib * 1024 * 1024;
+            kv_swap = llama_kv_swap_init(ctx_tgt, max_bytes);
+            if (!kv_swap) {
+                SRV_ERR("failed to allocate KV swap arena (%d MiB)\n", params_base.kv_swap_max_mib);
+                return false;
+            }
+
+            SRV_INF("KV swap enabled, pinned host budget = %d MiB\n", params_base.kv_swap_max_mib);
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
+            slot.kv_swap = kv_swap;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
@@ -1395,6 +1480,11 @@ private:
         });
 
         metrics.init();
+
+        if (kv_swap && params_base.cache_idle_slots) {
+            SRV_INF("%s", "KV swap supersedes --cache-idle-slots for unified attention state\n");
+            params_base.cache_idle_slots = false;
+        }
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
@@ -1602,6 +1692,11 @@ private:
         }
 
         if (ret) {
+            if (kv_swap && llama_kv_swap_seq_get_status(kv_swap, ret->id).state != LLAMA_KV_SWAP_STATE_RESIDENT) {
+                // The normal prompt cache serializer expects the KV to be device-resident.
+                update_cache = false;
+            }
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -1688,6 +1783,23 @@ private:
             }
         } else {
             slot.lora = params_base.lora_adapters;
+        }
+
+        llama_kv_swap_state launch_swap_state = LLAMA_KV_SWAP_STATE_RESIDENT;
+        bool launch_from_swap = false;
+        if (kv_swap) {
+            launch_swap_state = llama_kv_swap_seq_get_status(kv_swap, slot.id).state;
+            if (launch_swap_state != LLAMA_KV_SWAP_STATE_RESIDENT) {
+                const bool reuse = task.params.cache_prompt &&
+                    slot.prompt.tokens.get_common_prefix(task.tokens) > 0;
+                if (reuse) {
+                    launch_from_swap = true;
+                } else {
+                    SLT_TRC(slot, "%s", "discarding swapped KV without a reusable prompt prefix\n");
+                    slot.prompt_clear();
+                    launch_swap_state = LLAMA_KV_SWAP_STATE_RESIDENT;
+                }
+            }
         }
 
         // if using alora, make sure it's only a single one requested and active
@@ -1787,9 +1899,30 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
-        slot.state = slot.task->is_child()
+        const slot_state state_started = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+
+        slot.state_resume = state_started;
+        slot.kv_swap_quantum_tokens = 0;
+        slot.kv_swap_count = 0;
+        slot.kv_swap_stall_us = 0;
+        slot.kv_swap_last_run_us = ggml_time_us();
+        slot.kv_swap_pause_start_us = 0;
+        slot.kv_swap_resume_after_decode = kv_swap_decode_tokens;
+
+        if (launch_from_swap) {
+            slot.kv_swap_pause_start_us = ggml_time_us();
+            if (launch_swap_state == LLAMA_KV_SWAP_STATE_HOST) {
+                slot.state = SLOT_STATE_PAUSED;
+            } else if (launch_swap_state == LLAMA_KV_SWAP_STATE_SWAPPING_IN) {
+                slot.state = SLOT_STATE_SWAPPING_IN;
+            } else {
+                slot.state = SLOT_STATE_SWAPPING_OUT;
+            }
+        } else {
+            slot.state = state_started;
+        }
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -2465,7 +2598,7 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
-                    res->metrics             = metrics;
+                    res->metrics             = get_metrics();
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -2742,6 +2875,308 @@ private:
     };
 #endif
 
+    void kv_swap_poll_slots() {
+        if (!kv_swap) {
+            return;
+        }
+
+        llama_kv_swap_poll(kv_swap);
+
+        const int64_t t_now = ggml_time_us();
+        for (auto & slot : slots) {
+            if (!slot.task) {
+                continue;
+            }
+
+            const auto status = llama_kv_swap_seq_get_status(kv_swap, slot.id);
+            if (slot.state == SLOT_STATE_SWAPPING_OUT && status.state == LLAMA_KV_SWAP_STATE_HOST) {
+                slot.state = SLOT_STATE_PAUSED;
+                SLT_INF(slot, "KV swap paused sequence, pages = %u, host = %.2f MiB\n",
+                        status.host_pages, status.host_bytes / 1024.0 / 1024.0);
+            } else if (slot.state == SLOT_STATE_SWAPPING_IN && status.state == LLAMA_KV_SWAP_STATE_RESIDENT) {
+                slot.state = slot.state_resume;
+                if (slot.kv_swap_pause_start_us > 0) {
+                    slot.kv_swap_stall_us += t_now - slot.kv_swap_pause_start_us;
+                    slot.kv_swap_pause_start_us = 0;
+                }
+                slot.kv_swap_quantum_tokens = 0;
+                slot.kv_swap_last_run_us = t_now;
+                SLT_INF(slot, "KV swap resumed sequence, cells = %u\n", status.device_cells);
+            }
+        }
+    }
+
+    llama_kv_swap_result kv_swap_begin_out(server_slot & slot) {
+        const auto status = llama_kv_swap_seq_get_status(kv_swap, slot.id);
+        if (status.state != LLAMA_KV_SWAP_STATE_RESIDENT || status.device_cells == 0) {
+            return LLAMA_KV_SWAP_RESULT_NO_SEQUENCE;
+        }
+
+        const bool active = slot.is_processing();
+        const int64_t last_use_us = active ? slot.kv_swap_last_run_us : slot.t_last_used;
+        const auto result = llama_kv_swap_seq_out(kv_swap, slot.id, last_use_us);
+        if (result != LLAMA_KV_SWAP_RESULT_OK) {
+            return result;
+        }
+
+        if (active) {
+            slot.state_resume = slot.state;
+            slot.state = SLOT_STATE_SWAPPING_OUT;
+            slot.kv_swap_quantum_tokens = 0;
+            slot.kv_swap_count++;
+            slot.kv_swap_pause_start_us = ggml_time_us();
+            slot.kv_swap_resume_after_decode = kv_swap_decode_tokens + KV_SWAP_QUANTUM_TOKENS;
+        }
+
+        SLT_INF(slot, "KV swap D2H started, cells = %u, active = %d\n", status.device_cells, active);
+        return LLAMA_KV_SWAP_RESULT_OK;
+    }
+
+    bool kv_swap_reclaim_idle_host() {
+        server_slot * victim = nullptr;
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                continue;
+            }
+            const auto status = llama_kv_swap_seq_get_status(kv_swap, slot.id);
+            if (status.state != LLAMA_KV_SWAP_STATE_HOST) {
+                continue;
+            }
+            if (!victim || slot.t_last_used < victim->t_last_used) {
+                victim = &slot;
+            }
+        }
+
+        if (!victim) {
+            return false;
+        }
+
+        SLT_WRN(*victim, "%s", "discarding dormant host KV to make swap-arena room\n");
+        victim->prompt_clear();
+        return true;
+    }
+
+    uint32_t kv_swap_projected_free() const {
+        const auto stats = llama_kv_swap_get_stats(kv_swap);
+        uint64_t result = stats.device_cells - stats.device_cells_used;
+
+        for (const auto & slot : slots) {
+            const auto status = llama_kv_swap_seq_get_status(kv_swap, slot.id);
+            if (status.state == LLAMA_KV_SWAP_STATE_SWAPPING_OUT) {
+                result += status.device_cells;
+            }
+        }
+
+        return (uint32_t) std::min<uint64_t>(result, stats.device_cells);
+    }
+
+    bool kv_swap_ensure_free(uint32_t required, bool force_active) {
+        if (kv_swap_projected_free() >= required) {
+            return true;
+        }
+
+        std::vector<server_slot *> dormant;
+        for (auto & slot : slots) {
+            const auto status = llama_kv_swap_seq_get_status(kv_swap, slot.id);
+            if (!slot.is_processing() && status.state == LLAMA_KV_SWAP_STATE_RESIDENT && status.device_cells > 0) {
+                dormant.push_back(&slot);
+            }
+        }
+        std::sort(dormant.begin(), dormant.end(), [](const server_slot * a, const server_slot * b) {
+            return a->t_last_used < b->t_last_used;
+        });
+
+        for (server_slot * slot : dormant) {
+            auto result = kv_swap_begin_out(*slot);
+            if (result == LLAMA_KV_SWAP_RESULT_NO_HOST_CAPACITY && kv_swap_reclaim_idle_host()) {
+                result = kv_swap_begin_out(*slot);
+            }
+            if (result == LLAMA_KV_SWAP_RESULT_NO_HOST_CAPACITY) {
+                // Dormant work has no open response to preserve. Purge it only after host eviction failed.
+                SLT_WRN(*slot, "%s", "purging dormant KV because the host swap arena is full\n");
+                slot->prompt_clear();
+            } else if (result < 0) {
+                SLT_WRN(*slot, "failed to swap dormant KV: %s\n", llama_kv_swap_get_error(kv_swap));
+            }
+
+            if (kv_swap_projected_free() >= required) {
+                return true;
+            }
+        }
+
+        std::vector<server_slot *> active;
+        for (auto & slot : slots) {
+            if (!slot.is_processing() ||
+                    slot.state == SLOT_STATE_WAIT_OTHER ||
+                    slot.state == SLOT_STATE_SWAPPING_OUT ||
+                    slot.state == SLOT_STATE_PAUSED ||
+                    slot.state == SLOT_STATE_SWAPPING_IN) {
+                continue;
+            }
+
+            const auto status = llama_kv_swap_seq_get_status(kv_swap, slot.id);
+            if (status.state != LLAMA_KV_SWAP_STATE_RESIDENT || status.device_cells == 0) {
+                continue;
+            }
+            if (!force_active && slot.kv_swap_quantum_tokens < KV_SWAP_QUANTUM_TOKENS) {
+                continue;
+            }
+            active.push_back(&slot);
+        }
+
+        std::sort(active.begin(), active.end(), [](const server_slot * a, const server_slot * b) {
+            if (a->kv_swap_quantum_tokens != b->kv_swap_quantum_tokens) {
+                return a->kv_swap_quantum_tokens > b->kv_swap_quantum_tokens;
+            }
+            return a->kv_swap_last_run_us < b->kv_swap_last_run_us;
+        });
+
+        for (server_slot * slot : active) {
+            auto result = kv_swap_begin_out(*slot);
+            if (result == LLAMA_KV_SWAP_RESULT_NO_HOST_CAPACITY && kv_swap_reclaim_idle_host()) {
+                result = kv_swap_begin_out(*slot);
+            }
+            if (result == LLAMA_KV_SWAP_RESULT_NO_HOST_CAPACITY) {
+                SLT_WRN(*slot, "cannot preempt sequence: %s\n", llama_kv_swap_get_error(kv_swap));
+            } else if (result != LLAMA_KV_SWAP_RESULT_OK && result != LLAMA_KV_SWAP_RESULT_NO_SEQUENCE) {
+                SLT_WRN(*slot, "failed to preempt sequence: %s\n", llama_kv_swap_get_error(kv_swap));
+            }
+
+            if (kv_swap_projected_free() >= required) {
+                return true;
+            }
+        }
+
+        return kv_swap_projected_free() >= required;
+    }
+
+    bool kv_swap_fail_unpreservable_request() {
+        server_slot * victim = nullptr;
+        uint32_t victim_cells = UINT32_MAX;
+
+        for (auto & slot : slots) {
+            if (!slot.task || !slot.is_processing() ||
+                    slot.state == SLOT_STATE_WAIT_OTHER ||
+                    slot.state == SLOT_STATE_SWAPPING_OUT ||
+                    slot.state == SLOT_STATE_PAUSED ||
+                    slot.state == SLOT_STATE_SWAPPING_IN) {
+                continue;
+            }
+
+            const auto status = llama_kv_swap_seq_get_status(kv_swap, slot.id);
+            if (!victim || status.device_cells < victim_cells ||
+                    (status.device_cells == victim_cells &&
+                     slot.kv_swap_last_run_us > victim->kv_swap_last_run_us)) {
+                victim = &slot;
+                victim_cells = status.device_cells;
+            }
+        }
+
+        if (!victim) {
+            return false;
+        }
+
+        const std::string err = "KV cache and configured host swap capacity cannot preserve this request.";
+        SLT_ERR(*victim, "%s\n", err.c_str());
+        send_error(*victim, err, ERROR_TYPE_SERVER);
+        victim->release();
+        victim->prompt_clear();
+        return true;
+    }
+
+    bool kv_swap_schedule() {
+        if (!kv_swap) {
+            kv_swap_batch_limit = UINT32_MAX;
+            return true;
+        }
+
+        kv_swap_poll_slots();
+
+        auto is_runnable = [](const server_slot & slot) {
+            return slot.task && slot.is_processing() &&
+                slot.state != SLOT_STATE_WAIT_OTHER &&
+                slot.state != SLOT_STATE_SWAPPING_OUT &&
+                slot.state != SLOT_STATE_PAUSED &&
+                slot.state != SLOT_STATE_SWAPPING_IN;
+        };
+
+        bool has_runnable = std::any_of(slots.begin(), slots.end(), is_runnable);
+
+        server_slot * resume = nullptr;
+        for (auto & slot : slots) {
+            if (!slot.task || slot.state != SLOT_STATE_PAUSED) {
+                continue;
+            }
+            const auto status = llama_kv_swap_seq_get_status(kv_swap, slot.id);
+            if (status.state != LLAMA_KV_SWAP_STATE_HOST) {
+                continue;
+            }
+            if (has_runnable && kv_swap_decode_tokens < slot.kv_swap_resume_after_decode) {
+                continue;
+            }
+            if (!resume || slot.kv_swap_last_run_us < resume->kv_swap_last_run_us) {
+                resume = &slot;
+            }
+        }
+
+        if (resume) {
+            const auto status = llama_kv_swap_seq_get_status(kv_swap, resume->id);
+            const auto stats = llama_kv_swap_get_stats(kv_swap);
+            const uint32_t free_cells = stats.device_cells - stats.device_cells_used;
+
+            if (free_cells < status.total_cells) {
+                // Once a paused sequence's quantum arrives, preserve newly freed groups for its restore.
+                if (!kv_swap_ensure_free(status.total_cells, true)) {
+                    const std::string err = "KV cache and configured host swap capacity cannot preserve all requests.";
+                    SLT_ERR(*resume, "%s\n", err.c_str());
+                    send_error(*resume, err, ERROR_TYPE_SERVER);
+                    resume->release();
+                    resume->prompt_clear();
+
+                    const auto current = llama_kv_swap_get_stats(kv_swap);
+                    kv_swap_batch_limit = current.device_cells - current.device_cells_used;
+                    return has_runnable && kv_swap_batch_limit > 0;
+                }
+                kv_swap_batch_limit = 0;
+                return false;
+            }
+
+            const auto result = llama_kv_swap_seq_in(kv_swap, resume->id);
+            if (result == LLAMA_KV_SWAP_RESULT_OK) {
+                resume->state = SLOT_STATE_SWAPPING_IN;
+                SLT_INF(*resume, "KV swap H2D started, cells = %u\n", status.total_cells);
+            } else if (result != LLAMA_KV_SWAP_RESULT_BUSY) {
+                SLT_ERR(*resume, "failed to restore KV: %s\n", llama_kv_swap_get_error(kv_swap));
+            }
+
+            has_runnable = std::any_of(slots.begin(), slots.end(), is_runnable);
+        }
+
+        auto stats = llama_kv_swap_get_stats(kv_swap);
+        uint32_t free_cells = stats.device_cells - stats.device_cells_used;
+        const uint32_t low_watermark = std::min(stats.page_cells, stats.device_cells);
+
+        if (has_runnable && free_cells < low_watermark) {
+            const bool preserved = kv_swap_ensure_free(low_watermark, free_cells == 0);
+            stats = llama_kv_swap_get_stats(kv_swap);
+            free_cells = stats.device_cells - stats.device_cells_used;
+
+            // A few remaining cells are still useful and will lead us back
+            // here after a bounded decode.  At zero cells, however, no
+            // sequence can make progress.  Fail the least-established
+            // runnable request only after both device reclamation and the
+            // configured host arena have proved insufficient.
+            if (!preserved && free_cells == 0 && kv_swap_fail_unpreservable_request()) {
+                stats = llama_kv_swap_get_stats(kv_swap);
+                free_cells = stats.device_cells - stats.device_cells_used;
+            }
+        }
+
+        has_runnable = std::any_of(slots.begin(), slots.end(), is_runnable);
+        kv_swap_batch_limit = free_cells;
+        return has_runnable && free_cells > 0;
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -2755,6 +3190,8 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        const bool kv_swap_can_decode = kv_swap_schedule();
 
         // check if all slots are idle
         {
@@ -2781,6 +3218,10 @@ private:
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
             }
+        }
+
+        if (!kv_swap_can_decode) {
+            return;
         }
 
         try {
@@ -2938,6 +3379,10 @@ private:
                 return;
             }
 
+            if (kv_swap && generating.size() >= kv_swap_batch_limit) {
+                return;
+            }
+
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
                 slot_batched = &slot;
@@ -3054,6 +3499,9 @@ private:
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
+        if (kv_swap) {
+            n_batch = std::min<int32_t>(n_batch, kv_swap_batch_limit);
+        }
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
         auto & alora_scale       = batch.alora_scale;
@@ -3630,12 +4078,17 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool swap_overlap = kv_swap && llama_kv_swap_get_stats(kv_swap).transfers_pending > 0;
+        const int64_t t_swap_overlap = swap_overlap ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (swap_overlap) {
+            llama_kv_swap_add_overlap(kv_swap, ggml_time_us() - t_swap_overlap);
+        }
 
         if (ret != 0) {
             {
@@ -3644,7 +4097,9 @@ private:
                 if (n_batch == 1 && ret == 1) {
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
                     //       need to remove the tokens from the current batch too
-                    err = "Context size has been exceeded.";
+                    err = kv_swap
+                        ? "KV cache and configured host swap capacity have been exceeded."
+                        : "Context size has been exceeded.";
                 }
 
                 if (ret == -1) {
@@ -4026,6 +4481,16 @@ private:
         // note: a slot can be released before we get here, which clears its stats
         //       the tokens were still computed, counted in the global metrics, not in slot
         uint64_t n_prompt_tokens = 0;
+
+        if (kv_swap) {
+            kv_swap_decode_tokens += n_tokens;
+            const int64_t t_now = ggml_time_us();
+            for (int i = off; i < off + n_tokens; ++i) {
+                auto & slot = slots[batch.tokens[i].id_slot];
+                slot.kv_swap_quantum_tokens++;
+                slot.kv_swap_last_run_us = t_now;
+            }
+        }
 
         for (int i = off; i < off + n_tokens; ++i) {
             const auto & t = batch.tokens[i];

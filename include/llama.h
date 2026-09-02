@@ -62,6 +62,7 @@ extern "C" {
     struct llama_model;
     struct llama_context;
     struct llama_sampler;
+    struct llama_kv_swap;
 
     typedef struct llama_memory_i * llama_memory_t;
 
@@ -802,6 +803,100 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    //
+    // Unified KV host swap [EXPERIMENTAL]
+    //
+
+    enum llama_kv_swap_state {
+        LLAMA_KV_SWAP_STATE_RESIDENT = 0,
+        LLAMA_KV_SWAP_STATE_SWAPPING_OUT,
+        LLAMA_KV_SWAP_STATE_HOST,
+        LLAMA_KV_SWAP_STATE_SWAPPING_IN,
+    };
+
+    enum llama_kv_swap_result {
+        LLAMA_KV_SWAP_RESULT_OK = 0,
+        LLAMA_KV_SWAP_RESULT_NO_SEQUENCE,
+        LLAMA_KV_SWAP_RESULT_BUSY,
+        LLAMA_KV_SWAP_RESULT_NO_HOST_CAPACITY,
+        LLAMA_KV_SWAP_RESULT_NO_DEVICE_CAPACITY,
+        LLAMA_KV_SWAP_RESULT_UNSUPPORTED = -1,
+        LLAMA_KV_SWAP_RESULT_ERROR       = -2,
+    };
+
+    struct llama_kv_swap_stats {
+        uint64_t host_bytes;
+        uint64_t host_bytes_peak;
+        uint64_t d2h_bytes;
+        uint64_t h2d_bytes;
+        uint64_t d2h_time_us;
+        uint64_t h2d_time_us;
+        uint64_t overlap_time_us;
+        uint64_t pages_out;
+        uint64_t pages_in;
+        uint64_t sequences_out;
+        uint64_t sequences_in;
+        uint32_t device_cells;
+        uint32_t device_cells_used;
+        uint32_t page_cells;
+        uint32_t transfers_pending;
+    };
+
+    struct llama_kv_swap_seq_status {
+        enum llama_kv_swap_state state;
+        uint32_t total_cells;
+        uint32_t device_cells;
+        uint32_t host_pages;
+        uint32_t transfer_pages;
+        uint64_t host_bytes;
+        int64_t  last_use_us;
+    };
+
+    // The MVP supports a single unified attention KV cache on CUDA. Hybrid recurrent state is not swapped.
+    LLAMA_API bool llama_kv_swap_supported(
+            struct llama_context * ctx,
+                         char     * reason,
+                         size_t     reason_size);
+
+    LLAMA_API struct llama_kv_swap * llama_kv_swap_init(
+            struct llama_context * ctx,
+                         size_t     max_bytes);
+
+    LLAMA_API void llama_kv_swap_free(struct llama_kv_swap * swap);
+
+    LLAMA_API const char * llama_kv_swap_get_error(const struct llama_kv_swap * swap);
+
+    LLAMA_API enum llama_kv_swap_result llama_kv_swap_seq_out(
+            struct llama_kv_swap * swap,
+                    llama_seq_id   seq_id,
+                         int64_t   last_use_us);
+
+    LLAMA_API enum llama_kv_swap_result llama_kv_swap_seq_in(
+            struct llama_kv_swap * swap,
+                    llama_seq_id   seq_id);
+
+    // Apply completed page transfers without blocking.
+    LLAMA_API void llama_kv_swap_poll(struct llama_kv_swap * swap);
+
+    // Wait for an in-flight transfer for this sequence and discard its host snapshot.
+    LLAMA_API void llama_kv_swap_seq_discard(
+            struct llama_kv_swap * swap,
+                    llama_seq_id   seq_id);
+
+    LLAMA_API uint64_t llama_kv_swap_seq_size(
+            const struct llama_kv_swap * swap,
+                          llama_seq_id   seq_id);
+
+    LLAMA_API struct llama_kv_swap_seq_status llama_kv_swap_seq_get_status(
+            const struct llama_kv_swap * swap,
+                          llama_seq_id   seq_id);
+
+    LLAMA_API struct llama_kv_swap_stats llama_kv_swap_get_stats(const struct llama_kv_swap * swap);
+
+    LLAMA_API void llama_kv_swap_add_overlap(
+            struct llama_kv_swap * swap,
+                         uint64_t   time_us);
 
     //
     // State / sessions
