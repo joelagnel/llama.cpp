@@ -1672,6 +1672,10 @@ public:
         return telemetry_event_max_bytes;
     }
 
+    size_t telemetry_moe_chunk_limit_value() const {
+        return telemetry_moe_chunk_limit_bytes();
+    }
+
     const std::string & telemetry_instance_id() const {
         return telemetry_server_instance_id;
     }
@@ -1846,7 +1850,9 @@ private:
     uint64_t telemetry_last_dropped_sequence = 0;
     size_t telemetry_event_bytes = 0;
     size_t telemetry_event_max_bytes = 64 * 1024 * 1024;
-    size_t telemetry_moe_chunk_max_bytes = 1024 * 1024;
+    // Leave headroom for consumers that project the flattened event into a typed block.
+    // The environment override can still use the 1 MiB protocol ceiling.
+    size_t telemetry_moe_chunk_max_bytes = 768 * 1024;
     size_t telemetry_moe_trace_row_limit = 1024;
     uint64_t telemetry_kv_pressure_next_sequence = 1;
     uint64_t telemetry_kv_pressure_dropped_events = 0;
@@ -11449,7 +11455,7 @@ void server_routes::init_routes() {
                         {"endpoint", "/telemetry/v1/events"},
                         {"chunk_event", "moe_routing_chunk"},
                         {"chunk_schema_version", 3},
-                        {"chunk_max_serialized_bytes", 1024 * 1024},
+                        {"chunk_max_serialized_bytes", ctx_server.telemetry_moe_chunk_limit_value()},
                         {"full_request_capture", false},
                         {"maximum_prompt_decisions", ctx_server.telemetry_moe_trace_row_limit_value()},
                         {"maximum_output_decisions", ctx_server.telemetry_moe_trace_row_limit_value()},
@@ -11521,7 +11527,7 @@ void server_routes::init_routes() {
                 {"moe_token_detail_activation_record_limit", ctx_server.telemetry_moe_activation_limit_value()},
                 {"moe_routing_prompt_decision_limit", ctx_server.telemetry_moe_trace_row_limit_value()},
                 {"moe_routing_output_decision_limit", ctx_server.telemetry_moe_trace_row_limit_value()},
-                {"moe_routing_chunk_max_serialized_bytes", 1024 * 1024},
+                {"moe_routing_chunk_max_serialized_bytes", ctx_server.telemetry_moe_chunk_limit_value()},
                 {"prometheus_content", false},
             }},
         });
