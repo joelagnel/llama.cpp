@@ -111,7 +111,7 @@ static bool telemetry_create_private_file(
         HANDLE file = CreateFileW(
             path.c_str(),
             GENERIC_WRITE,
-            0,
+            FILE_SHARE_READ,
             &attributes,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL,
