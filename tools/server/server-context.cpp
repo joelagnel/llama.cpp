@@ -28,10 +28,13 @@
 #include <cstddef>
 #include <cinttypes>
 #include <cctype>
+#include <cerrno>
+#include <cstdio>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <chrono>
+#include <condition_variable>
 #include <ctime>
 #include <random>
 #include <tuple>
@@ -43,6 +46,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -51,9 +55,344 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#include <aclapi.h>
+#include <fcntl.h>
+#include <io.h>
+#pragma comment(lib, "Advapi32.lib")
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+#if defined(_WIN32)
+static bool telemetry_create_private_file(
+        const std::filesystem::path & path,
+        FILE * & stream,
+        std::string & reason) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        reason = "OpenProcessToken failed with " + std::to_string(GetLastError());
+        return false;
+    }
+
+    DWORD token_bytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &token_bytes);
+    std::vector<unsigned char> token_buffer(token_bytes);
+    if (token_bytes == 0 || !GetTokenInformation(token, TokenUser, token_buffer.data(), token_bytes, &token_bytes)) {
+        reason = "GetTokenInformation failed with " + std::to_string(GetLastError());
+        CloseHandle(token);
+        return false;
+    }
+
+    const TOKEN_USER * token_user = reinterpret_cast<const TOKEN_USER *>(token_buffer.data());
+    EXPLICIT_ACCESSW access = {};
+    access.grfAccessPermissions = GENERIC_ALL;
+    access.grfAccessMode = SET_ACCESS;
+    access.grfInheritance = NO_INHERITANCE;
+    access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    access.Trustee.ptstrName = reinterpret_cast<LPWSTR>(token_user->User.Sid);
+
+    PACL acl = nullptr;
+    DWORD status = SetEntriesInAclW(1, &access, nullptr, &acl);
+    SECURITY_DESCRIPTOR descriptor = {};
+    if (status == ERROR_SUCCESS) {
+        if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION)
+                || !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE)
+                || !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+            status = GetLastError();
+        }
+    }
+    if (status == ERROR_SUCCESS) {
+        SECURITY_ATTRIBUTES attributes = {sizeof(attributes), &descriptor, FALSE};
+        HANDLE file = CreateFileW(
+            path.c_str(),
+            GENERIC_WRITE,
+            0,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            status = GetLastError();
+        } else {
+            const int descriptor = _open_osfhandle(reinterpret_cast<intptr_t>(file), _O_WRONLY | _O_BINARY);
+            if (descriptor == -1) {
+                status = GetLastError();
+                CloseHandle(file);
+            } else {
+                stream = _fdopen(descriptor, "wb");
+                if (stream == nullptr) {
+                    status = errno;
+                    _close(descriptor);
+                }
+            }
+        }
+    }
+    if (acl != nullptr) {
+        LocalFree(acl);
+    }
+    CloseHandle(token);
+    if (status != ERROR_SUCCESS) {
+        reason = "ACL setup failed with " + std::to_string(status);
+        return false;
+    }
+    return true;
+}
+#else
+static bool telemetry_create_private_file(
+        const std::filesystem::path & path,
+        FILE * & stream,
+        std::string & reason) {
+    int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    const int file = open(path.c_str(), flags, S_IRUSR | S_IWUSR);
+    if (file < 0) {
+        reason = "private file creation failed with errno " + std::to_string(errno);
+        return false;
+    }
+    stream = fdopen(file, "w");
+    if (stream == nullptr) {
+        reason = "private stream creation failed with errno " + std::to_string(errno);
+        close(file);
+        return false;
+    }
+    return true;
+}
+#endif
+
+// Disk-backed trace journal: inference enqueues serialized envelopes into a
+// byte-bounded shock absorber while a dedicated writer drains an uncapped file.
+class telemetry_event_journal {
+public:
+    struct loss_snapshot {
+        uint64_t dropped_events = 0;
+        uint64_t last_dropped_sequence = 0;
+    };
+
+    ~telemetry_event_journal() {
+        stop();
+    }
+
+    void start(
+            const std::filesystem::path & directory,
+            const std::string & server_instance_id,
+            size_t pending_max_bytes) {
+        stop();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_.clear();
+            pending_bytes_ = 0;
+            pending_max_bytes_ = std::max<size_t>(1024 * 1024, pending_max_bytes);
+            dropped_events_ = 0;
+            last_dropped_sequence_ = 0;
+            stopping_ = false;
+            failed_ = false;
+        }
+        try {
+            std::filesystem::create_directories(directory);
+            path_ = directory / (server_instance_id + ".ndjson");
+            std::string permission_reason;
+            if (!telemetry_create_private_file(path_, stream_, permission_reason)) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                failed_ = true;
+                SRV_ERR("telemetry journal: refusing to write because a private file could not be created for %s: %s\n",
+                    path_.string().c_str(), permission_reason.c_str());
+                return;
+            }
+            const json header = {
+                {"journal_schema_version", 1},
+                {"server_instance_id", server_instance_id},
+                {"created_unix_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count()},
+            };
+            const std::string serialized_header = header.dump();
+            if (!write_record(serialized_header) || std::fflush(stream_) != 0) {
+                SRV_ERR("telemetry journal: could not write private file header to %s\n", path_.string().c_str());
+                std::fclose(stream_);
+                stream_ = nullptr;
+                std::error_code remove_error;
+                std::filesystem::remove(path_, remove_error);
+                std::lock_guard<std::mutex> lock(mutex_);
+                failed_ = true;
+                return;
+            }
+            active_ = true;
+            writer_ = std::thread([this]() { writer_loop(); });
+            SRV_INF("telemetry journal: writing uncapped trace envelopes to %s (memory queue %zu MiB)\n",
+                path_.string().c_str(), pending_max_bytes_ / (1024 * 1024));
+        } catch (const std::exception & exception) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                active_ = false;
+                stopping_ = true;
+                failed_ = true;
+            }
+            cv_.notify_all();
+            if (writer_.joinable()) {
+                writer_.join();
+            }
+            if (stream_ != nullptr) {
+                std::fclose(stream_);
+                stream_ = nullptr;
+            }
+            std::error_code remove_error;
+            std::filesystem::remove(path_, remove_error);
+            SRV_ERR("telemetry journal: initialization failed: %s\n", exception.what());
+        }
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!active_ && !writer_.joinable()) {
+                return;
+            }
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        if (writer_.joinable()) {
+            writer_.join();
+        }
+        if (stream_ != nullptr) {
+            std::fflush(stream_);
+            std::fclose(stream_);
+            stream_ = nullptr;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_ = false;
+    }
+
+    bool active() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return active_;
+    }
+
+    void append(uint64_t sequence, std::shared_ptr<const std::string> serialized) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (failed_) {
+            const uint64_t previous_dropped_events = dropped_events_;
+            last_dropped_sequence_ = sequence;
+            ++dropped_events_;
+            log_loss_locked(previous_dropped_events, "archive unavailable");
+            return;
+        }
+        if (!active_ || stopping_) {
+            return;
+        }
+        const size_t bytes = serialized->size() + 1;
+        const uint64_t previous_dropped_events = dropped_events_;
+        if (bytes > pending_max_bytes_) {
+            last_dropped_sequence_ = sequence;
+            ++dropped_events_;
+            log_loss_locked(previous_dropped_events, "record exceeds memory queue");
+            return;
+        }
+        while (!pending_.empty() && pending_bytes_ + bytes > pending_max_bytes_) {
+            last_dropped_sequence_ = pending_.front().sequence;
+            pending_bytes_ -= pending_.front().serialized->size() + 1;
+            pending_.pop_front();
+            ++dropped_events_;
+        }
+        pending_.push_back({sequence, std::move(serialized)});
+        pending_bytes_ += bytes;
+        log_loss_locked(previous_dropped_events, "memory queue overrun");
+        cv_.notify_one();
+    }
+
+    loss_snapshot losses() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {dropped_events_, last_dropped_sequence_};
+    }
+
+private:
+    struct pending_entry {
+        uint64_t sequence = 0;
+        std::shared_ptr<const std::string> serialized;
+    };
+    void log_loss_locked(uint64_t previous_dropped_events, const char * reason) {
+        if (dropped_events_ != previous_dropped_events
+                && (previous_dropped_events == 0 || dropped_events_ / 128 > previous_dropped_events / 128)) {
+            SRV_WRN("telemetry journal: %s; dropped=%" PRIu64 "; last_sequence=%" PRIu64 "\n",
+                reason, dropped_events_, last_dropped_sequence_);
+        }
+    }
+
+    void writer_loop() {
+        while (true) {
+            std::deque<pending_entry> batch;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait_for(lock, std::chrono::milliseconds(250), [this]() {
+                    return stopping_ || !pending_.empty();
+                });
+                if (pending_.empty() && stopping_) {
+                    return;
+                }
+                batch.swap(pending_);
+                pending_bytes_ = 0;
+            }
+
+            bool write_failed = false;
+            size_t written_events = 0;
+            for (const pending_entry & entry : batch) {
+                if (!write_record(*entry.serialized)) {
+                    write_failed = true;
+                    break;
+                }
+                written_events++;
+            }
+            const bool flush_failed = std::fflush(stream_) != 0;
+            write_failed |= flush_failed;
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (write_failed) {
+                const uint64_t lost_from_batch = flush_failed
+                    ? (uint64_t) batch.size()
+                    : (uint64_t) batch.size() - written_events;
+                const uint64_t lost = lost_from_batch + (uint64_t) pending_.size();
+                dropped_events_ += lost;
+                if (!pending_.empty()) {
+                    last_dropped_sequence_ = pending_.back().sequence;
+                } else if (!batch.empty()) {
+                    last_dropped_sequence_ = batch.back().sequence;
+                }
+                pending_.clear();
+                pending_bytes_ = 0;
+                active_ = false;
+                stopping_ = true;
+                failed_ = true;
+                SRV_ERR("telemetry journal: disk write failed at %s; lost=%" PRIu64 "\n",
+                    path_.string().c_str(), lost);
+                return;
+            }
+        }
+    }
+
+    bool write_record(const std::string & serialized) {
+        return stream_ != nullptr
+            && std::fwrite(serialized.data(), 1, serialized.size(), stream_) == serialized.size()
+            && std::fputc('\n', stream_) != EOF;
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<pending_entry> pending_;
+    std::filesystem::path path_;
+    FILE * stream_ = nullptr;
+    std::thread writer_;
+    size_t pending_bytes_ = 0;
+    size_t pending_max_bytes_ = 64 * 1024 * 1024;
+    uint64_t dropped_events_ = 0;
+    uint64_t last_dropped_sequence_ = 0;
+    bool active_ = false;
+    bool stopping_ = false;
+    bool failed_ = false;
+};
 
 static int64_t telemetry_dispatch_clock_precision_us(int64_t before_us, int64_t after_us) {
     return std::max<int64_t>(1, after_us - before_us);
@@ -739,8 +1078,6 @@ struct server_slot {
     uint64_t telemetry_moe_chunk_decision_sequence = 0;
     uint64_t telemetry_moe_chunk_rows = 0;
     uint64_t telemetry_moe_chunk_trace_rows = 0;
-    uint64_t telemetry_moe_chunk_prompt_trace_rows = 0;
-    uint64_t telemetry_moe_chunk_output_trace_rows = 0;
     uint64_t telemetry_moe_chunk_invalid_rows = 0;
     uint64_t telemetry_moe_chunk_unavailable_rows = 0;
     uint64_t telemetry_moe_chunk_unlinked_rows = 0;
@@ -751,9 +1088,6 @@ struct server_slot {
     bool telemetry_moe_chunk_source_unavailable = false;
     bool telemetry_moe_chunk_attribution_ambiguous = false;
     bool telemetry_moe_chunk_exact_unavailable_terminal = false;
-    bool telemetry_moe_chunk_trace_limit_reached = false;
-    bool telemetry_moe_prompt_trace_limit_logged = false;
-    bool telemetry_moe_output_trace_limit_logged = false;
     telemetry_moe_unlocated_capacity_loss telemetry_moe_chunk_capacity_loss;
     json telemetry_moe_pending_chunk;
 
@@ -830,6 +1164,7 @@ struct server_slot {
     server_slot_stats stats;
     bool telemetry_finalized = false;
     uint64_t telemetry_assignment_ordinal = 0;
+    uint64_t telemetry_prefill_pass_ordinal = 0;
     json telemetry_pending_completion_event;
 
     // accepted tokens per draft position
@@ -899,8 +1234,6 @@ struct server_slot {
         telemetry_moe_chunk_decision_sequence = 0;
         telemetry_moe_chunk_rows = 0;
         telemetry_moe_chunk_trace_rows = 0;
-        telemetry_moe_chunk_prompt_trace_rows = 0;
-        telemetry_moe_chunk_output_trace_rows = 0;
         telemetry_moe_chunk_invalid_rows = 0;
         telemetry_moe_chunk_unavailable_rows = 0;
         telemetry_moe_chunk_unlinked_rows = 0;
@@ -911,9 +1244,6 @@ struct server_slot {
         telemetry_moe_chunk_source_unavailable = false;
         telemetry_moe_chunk_attribution_ambiguous = false;
         telemetry_moe_chunk_exact_unavailable_terminal = false;
-        telemetry_moe_chunk_trace_limit_reached = false;
-        telemetry_moe_prompt_trace_limit_logged = false;
-        telemetry_moe_output_trace_limit_logged = false;
         telemetry_moe_chunk_capacity_loss = {};
         telemetry_moe_pending_chunk = json();
         json_schema = json();
@@ -925,6 +1255,7 @@ struct server_slot {
         stats = {};
         telemetry_finalized = false;
         telemetry_assignment_ordinal = 0;
+        telemetry_prefill_pass_ordinal = 0;
         telemetry_pending_completion_event = json();
         n_accepted_per_pos.clear();
         n_draft_hit_steps = 0;
@@ -1443,6 +1774,7 @@ void server_moe_routing_apply_canonical_event_coverage(
 
 struct server_context_impl {
     friend struct server_context;
+    friend struct server_routes;
 
 public:
     // only use these pointers outside of this class:
@@ -1596,42 +1928,49 @@ public:
             {"features", {
                 {"moe_routing", {
                     {"supported", true},
+                    {"overhead_class", "substantial"},
                     {"effective_from", "next_microbatch"},
                     {"dependencies", json::array({"moe_model"})},
                     {"privacy_sensitive", false},
                 }},
                 {"output_token_detail", {
                     {"supported", true},
+                    {"overhead_class", "low"},
                     {"effective_from", "next_request"},
                     {"dependencies", json::array()},
                     {"privacy_sensitive", true},
                 }},
                 {"token_candidates", {
                     {"supported", true},
+                    {"overhead_class", "substantial"},
                     {"effective_from", "next_request"},
                     {"dependencies", json::array({"output_token_detail"})},
                     {"privacy_sensitive", true},
                 }},
                 {"prompt_perplexity", {
                     {"supported", true},
+                    {"overhead_class", "substantial"},
                     {"effective_from", "next_request"},
                     {"dependencies", json::array()},
                     {"privacy_sensitive", false},
                 }},
                 {"request_content", {
                     {"supported", true},
+                    {"overhead_class", "low"},
                     {"effective_from", "next_request"},
                     {"dependencies", json::array()},
                     {"privacy_sensitive", true},
                 }},
                 {"kv_pressure_detail", {
                     {"supported", true},
+                    {"overhead_class", "low"},
                     {"effective_from", "next_microbatch"},
                     {"dependencies", json::array()},
                     {"privacy_sensitive", false},
                 }},
                 {"native_gpu_gpm", {
                     {"supported", true},
+                    {"overhead_class", "low"},
                     {"effective_from", "next_microbatch"},
                     {"dependencies", json::array()},
                     {"privacy_sensitive", false},
@@ -1662,10 +2001,6 @@ public:
 
     size_t telemetry_moe_activation_limit_value() const {
         return telemetry_moe_activation_limit;
-    }
-
-    size_t telemetry_moe_trace_row_limit_value() const {
-        return telemetry_moe_trace_row_limit;
     }
 
     size_t telemetry_event_capacity_bytes() const {
@@ -1765,7 +2100,7 @@ private:
 
     struct telemetry_event_entry {
         uint64_t sequence = 0;
-        std::string serialized;
+        std::shared_ptr<const std::string> serialized;
         size_t bytes = 0;
     };
     struct telemetry_kv_pressure_event_entry {
@@ -1831,6 +2166,7 @@ private:
         bool available = false;
     };
     std::deque<telemetry_event_entry> telemetry_events;
+    telemetry_event_journal telemetry_journal;
     std::deque<telemetry_kv_pressure_event_entry> telemetry_kv_pressure_events;
     std::deque<telemetry_kv_request_window> telemetry_kv_request_windows;
     std::deque<telemetry_token_candidate_block_entry> telemetry_token_candidate_blocks;
@@ -1846,6 +2182,7 @@ private:
     int64_t telemetry_clock_anchor_precision_us = 0;
     uint64_t telemetry_next_sequence = 1;
     uint64_t telemetry_next_assignment_ordinal = 1;
+    uint64_t telemetry_next_prefill_forward_pass = 1;
     uint64_t telemetry_dropped_events = 0;
     uint64_t telemetry_last_dropped_sequence = 0;
     size_t telemetry_event_bytes = 0;
@@ -1853,7 +2190,6 @@ private:
     // Leave headroom for consumers that project the flattened event into a typed block.
     // The environment override can still use the 1 MiB protocol ceiling.
     size_t telemetry_moe_chunk_max_bytes = 768 * 1024;
-    size_t telemetry_moe_trace_row_limit = 1024;
     uint64_t telemetry_kv_pressure_next_sequence = 1;
     uint64_t telemetry_kv_pressure_dropped_events = 0;
     uint64_t telemetry_kv_pressure_last_dropped_sequence = 0;
@@ -1870,6 +2206,7 @@ private:
     telemetry_kv_wait_episode telemetry_kv_wait;
     std::vector<uint64_t> telemetry_slot_marks;
     uint64_t telemetry_slot_epoch = 0;
+    mutable std::mutex mutex_telemetry_events;
     mutable std::mutex mutex_telemetry_control;
     telemetry_control_state telemetry_control;
     uint64_t telemetry_microbatch_generation = 0;
@@ -1911,7 +2248,6 @@ private:
     static constexpr size_t TELEMETRY_TOKEN_CANDIDATE_BLOCK_CAPACITY = 256;
     static constexpr size_t TELEMETRY_TOKEN_CANDIDATE_RETAINED_MAX_BYTES = 64 * 1024 * 1024;
     size_t telemetry_moe_activation_limit = 65536;
-    static constexpr size_t TELEMETRY_EVENT_CAPACITY = 2048;
     static constexpr size_t TELEMETRY_KV_PRESSURE_EVENT_CAPACITY = 32768;
     static constexpr size_t TELEMETRY_KV_REQUEST_WINDOW_MAX_CAPACITY = 32768;
 
@@ -2633,15 +2969,23 @@ private:
         if (telemetry_moe_chunk_max_bytes_env) {
             telemetry_moe_chunk_max_bytes = (size_t) std::max(1024, std::min(1024 * 1024, atoi(telemetry_moe_chunk_max_bytes_env)));
         }
-        const char * telemetry_moe_trace_row_limit_env = getenv("LLAMA_TELEMETRY_MOE_TRACE_ROW_LIMIT");
-        if (telemetry_moe_trace_row_limit_env) {
-            telemetry_moe_trace_row_limit = (size_t) std::max(
-                64, std::min(1048576, atoi(telemetry_moe_trace_row_limit_env)));
-        }
         const char * telemetry_buffer_env = getenv("LLAMA_TELEMETRY_EVENT_BUFFER_MIB");
         if (telemetry_buffer_env) {
             const int mib = std::max(1, std::min(4096, atoi(telemetry_buffer_env)));
             telemetry_event_max_bytes = (size_t) mib * 1024 * 1024;
+        }
+        const char * telemetry_spool_dir_env = getenv("LLAMA_TELEMETRY_SPOOL_DIR");
+        if (telemetry_spool_dir_env && *telemetry_spool_dir_env) {
+            try {
+                telemetry_journal.start(
+                    std::filesystem::path(telemetry_spool_dir_env),
+                    telemetry_server_instance_id,
+                    telemetry_event_max_bytes);
+            } catch (const std::exception & exception) {
+                SRV_ERR("telemetry journal: path resolution failed: %s\n", exception.what());
+            }
+        } else {
+            SRV_INF("telemetry journal: disabled; set LLAMA_TELEMETRY_SPOOL_DIR to enable uncapped disk capture\n");
         }
         const char * telemetry_kv_pressure_buffer_env = getenv("LLAMA_TELEMETRY_KV_PRESSURE_BUFFER_MIB");
         if (telemetry_kv_pressure_buffer_env) {
@@ -5104,12 +5448,7 @@ private:
             server_slot & slot = slots[batch.tokens[i].id_slot];
             const bool moe_requested = target_has_moe && slot.task
                 && slot.task->params.moe_routing_telemetry_permitted;
-            const bool output_phase = !batch.tokens[i].is_prompt;
-            if (moe_requested && telemetry_moe_trace_budget_available(slot, output_phase)) {
-                has_moe_routing_request = true;
-            } else if (moe_requested) {
-                telemetry_mark_moe_trace_limit(slot, output_phase);
-            }
+            has_moe_routing_request |= moe_requested;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -5124,6 +5463,10 @@ private:
             telemetry_drain_dispatch(ctx_tgt, false, off, batch_view.n_tokens);
         });
         const int64_t decode_completed_us = ggml_time_us();
+
+        if (ret == 0) {
+            telemetry_record_prefill_forward_pass(off, batch_view.n_tokens, t_decode_start, decode_completed_us);
+        }
 
         if (ret == 0 && gpu_telemetry.is_collecting()) {
             std::fill(gpu_verify_proposal_positions.begin(), gpu_verify_proposal_positions.end(), 0);
@@ -5771,31 +6114,42 @@ private:
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
     }
 
+    uint64_t telemetry_next_event_sequence() const {
+        std::lock_guard<std::mutex> lock(mutex_telemetry_events);
+        return telemetry_next_sequence;
+    }
+
     void telemetry_append_serialized(uint64_t sequence, std::string serialized) {
+        auto shared = std::make_shared<const std::string>(std::move(serialized));
         telemetry_event_entry entry;
         entry.sequence = sequence;
-        entry.serialized = std::move(serialized);
-        entry.bytes = entry.serialized.size();
+        entry.serialized = shared;
+        entry.bytes = shared->size();
         const size_t bytes = entry.bytes;
-        if (bytes > telemetry_event_max_bytes) {
-            telemetry_dropped_events++;
-            telemetry_last_dropped_sequence = entry.sequence;
-            return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_telemetry_events);
+            telemetry_next_sequence = std::max(telemetry_next_sequence, sequence + 1);
+            if (bytes <= telemetry_event_max_bytes) {
+                telemetry_event_bytes += bytes;
+                telemetry_events.push_back(std::move(entry));
+                while (telemetry_event_bytes > telemetry_event_max_bytes) {
+                    telemetry_event_bytes -= telemetry_events.front().bytes;
+                    telemetry_last_dropped_sequence = telemetry_events.front().sequence;
+                    telemetry_dropped_events++;
+                    telemetry_events.pop_front();
+                }
+            } else {
+                telemetry_dropped_events++;
+                telemetry_last_dropped_sequence = sequence;
+            }
         }
-        telemetry_event_bytes += bytes;
-        telemetry_events.push_back(std::move(entry));
-        while (telemetry_events.size() > TELEMETRY_EVENT_CAPACITY || telemetry_event_bytes > telemetry_event_max_bytes) {
-            telemetry_event_bytes -= telemetry_events.front().bytes;
-            telemetry_last_dropped_sequence = telemetry_events.front().sequence;
-            telemetry_events.pop_front();
-            telemetry_dropped_events++;
-        }
+        telemetry_journal.append(sequence, std::move(shared));
     }
 
     void telemetry_append(json event) {
         event["schema_version"] = 1;
         event["server_instance_id"] = telemetry_server_instance_id;
-        const uint64_t sequence = telemetry_next_sequence++;
+        const uint64_t sequence = telemetry_next_event_sequence();
         event["sequence"] = sequence;
         telemetry_append_serialized(sequence, event.dump());
     }
@@ -5825,13 +6179,127 @@ private:
     }
 
     void telemetry_append_with_serialized_bytes(json event) {
-        const uint64_t sequence = telemetry_next_sequence++;
+        const uint64_t sequence = telemetry_next_event_sequence();
         telemetry_append_serialized(sequence, telemetry_serialize_with_serialized_bytes(std::move(event), sequence));
     }
 
     static int64_t telemetry_wall_unix_ms() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    void telemetry_record_prefill_forward_pass(
+            int32_t off,
+            int32_t n_tokens,
+            int64_t started_us,
+            int64_t completed_us) {
+        struct prompt_token_ref {
+            const server_batch::token * token = nullptr;
+            int32_t batch_index = 0;
+        };
+        std::map<int32_t, std::vector<prompt_token_ref>> tokens_by_slot;
+        for (int32_t index = off; index < off + n_tokens; ++index) {
+            const server_batch::token & batch_entry = batch.tokens[index];
+            if (!batch_entry.is_prompt || batch_entry.id_slot < 0 || batch_entry.id_slot >= (int32_t) slots.size()) {
+                continue;
+            }
+            server_slot & slot = slots[batch_entry.id_slot];
+            if (!slot.task || !telemetry_output_token_request_enabled(slot)) {
+                continue;
+            }
+            tokens_by_slot[batch_entry.id_slot].push_back({&batch_entry, index - off});
+        }
+        if (tokens_by_slot.empty()) {
+            return;
+        }
+
+        const uint64_t physical_forward_pass = telemetry_next_prefill_forward_pass++;
+        for (const auto & [slot_id, token_refs] : tokens_by_slot) {
+            server_slot & slot = slots[slot_id];
+            const uint64_t pass_ordinal = ++slot.telemetry_prefill_pass_ordinal;
+            const bool content_available = telemetry_request_content_enabled(slot) && !batch.has_embd;
+            const size_t total_token_count = token_refs.size();
+            const size_t piece_fragment_bytes = std::max<size_t>(1024, telemetry_event_max_bytes / 2);
+            std::vector<json> transport_tokens;
+            for (const prompt_token_ref & ref : token_refs) {
+                const llama_token token_id = ref.token->token;
+                const bool identity_available = content_available && token_id != LLAMA_TOKEN_NULL;
+                std::string piece_base64;
+                if (identity_available) {
+                    const std::string piece = common_token_to_piece(ctx_tgt, token_id, true);
+                    piece_base64 = base64::encode(piece.data(), piece.size());
+                }
+                const size_t fragment_count = identity_available
+                    ? std::max<size_t>(1, (piece_base64.size() + piece_fragment_bytes - 1) / piece_fragment_bytes)
+                    : 1;
+                for (size_t fragment_index = 0; fragment_index < fragment_count; ++fragment_index) {
+                    const size_t fragment_offset = fragment_index * piece_fragment_bytes;
+                    transport_tokens.push_back({
+                        {"batch_index", ref.batch_index},
+                        {"model_position", ref.token->pos},
+                        {"token_id", identity_available ? json(token_id) : json(nullptr)},
+                        {"token_piece_base64", identity_available
+                            ? json(piece_base64.substr(fragment_offset, piece_fragment_bytes))
+                            : json(nullptr)},
+                        {"token_piece_fragment_index", fragment_index},
+                        {"token_piece_fragment_count", fragment_count},
+                    });
+                }
+            }
+
+            auto make_event = [&](json tokens, size_t chunk_index, size_t chunk_count) {
+                return json {
+                    {"event", "prefill_forward_pass"},
+                    {"trace_id", slot.task->trace_id},
+                    {"task_id", slot.task->id},
+                    {"slot_id", slot.id},
+                    {"slot_assignment_ordinal", slot.telemetry_assignment_ordinal},
+                    {"timestamp_unix_ms", telemetry_unix_ms(slot, completed_us)},
+                    {"prefill_pass_ordinal", pass_ordinal},
+                    {"physical_forward_pass", physical_forward_pass},
+                    {"start_monotonic_us", started_us},
+                    {"end_monotonic_us", completed_us},
+                    {"total_token_count", total_token_count},
+                    {"chunk_index", chunk_index},
+                    {"chunk_count", chunk_count},
+                    {"is_final_chunk_for_pass", chunk_index + 1 == chunk_count},
+                    {"token_identity_state", content_available ? "available" : "not_captured"},
+                    {"token_identity_reason", content_available
+                        ? json(nullptr)
+                        : json(batch.has_embd ? "embedding_input_has_no_token_identity" : "content_capture_disabled")},
+                    {"tokens", std::move(tokens)},
+                };
+            };
+
+            const size_t token_payload_budget = telemetry_event_max_bytes > 8192
+                ? telemetry_event_max_bytes - 8192
+                : telemetry_event_max_bytes / 2;
+            std::vector<json> chunks;
+            json current = json::array();
+            size_t current_serialized_bytes = 2;
+            for (const json & token_record : transport_tokens) {
+                const size_t token_serialized_bytes = token_record.dump().size();
+                const size_t separator_bytes = current.empty() ? 0 : 1;
+                if (!current.empty()
+                        && current_serialized_bytes + separator_bytes + token_serialized_bytes > token_payload_budget) {
+                    chunks.push_back(std::move(current));
+                    current = json::array();
+                    current_serialized_bytes = 2;
+                }
+                current.push_back(token_record);
+                current_serialized_bytes += (current.size() == 1 ? 0 : 1) + token_serialized_bytes;
+            }
+            if (!current.empty()) {
+                chunks.push_back(std::move(current));
+            }
+
+            for (size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
+                telemetry_append_with_serialized_bytes(make_event(
+                    std::move(chunks[chunk_index]),
+                    chunk_index,
+                    chunks.size()));
+            }
+        }
     }
 
     void telemetry_capture_dispatch_clock_anchor() {
@@ -7059,12 +7527,11 @@ private:
     }
 
     bool telemetry_append_moe_routing_chunk(json event) {
-        const uint64_t sequence = telemetry_next_sequence;
+        const uint64_t sequence = telemetry_next_event_sequence();
         std::string serialized = telemetry_serialize_moe_routing_chunk(std::move(event), sequence);
         if (serialized.size() > telemetry_moe_chunk_limit_bytes() || serialized.size() > telemetry_event_max_bytes) {
             return false;
         }
-        ++telemetry_next_sequence;
         telemetry_append_serialized(sequence, std::move(serialized));
         return true;
     }
@@ -7371,17 +7838,12 @@ private:
                 && row.row_index >= 0
                 && row.ubatch_token_index >= 0;
             const bool enabled = telemetry_moe_request_enabled(slot);
-            const bool output_phase = !token.is_prompt;
             if (has_physical_event) {
                 physical_event_coverage & coverage = coverage_by_event[event_id];
                 coverage.expected_trace_ids.insert(slot.task->trace_id);
                 ++coverage.expected_decisions;
             }
             if (!enabled) {
-                continue;
-            }
-            if (!telemetry_moe_trace_budget_available(slot, output_phase)) {
-                telemetry_mark_moe_trace_limit(slot, output_phase);
                 continue;
             }
             if (!locatable) {
@@ -7417,11 +7879,6 @@ private:
                 false,
                 proposal_positions[(size_t) row.token_index],
             });
-            if (output_phase) {
-                ++slot.telemetry_moe_chunk_output_trace_rows;
-            } else {
-                ++slot.telemetry_moe_chunk_prompt_trace_rows;
-            }
             coverage.captured_trace_ids.insert(slot.task->trace_id);
             coverage.captured_valid_decisions += invalid ? 0 : 1;
             ++slot.telemetry_moe_chunk_trace_rows;
@@ -7829,7 +8286,7 @@ private:
         const uint64_t pending_unlocated_rows = slot.telemetry_moe_chunk_unlocated_pending;
         if (!slot.telemetry_moe_pending_chunk.is_null()) {
             slot.telemetry_moe_pending_chunk["is_final_for_trace"] = true;
-            slot.telemetry_moe_pending_chunk["capture_limit_reached"] = slot.telemetry_moe_chunk_trace_limit_reached;
+            slot.telemetry_moe_pending_chunk["capture_limit_reached"] = false;
             const uint64_t existing_unlocated_rows = telemetry_moe_chunk_unlocated_loss_count(slot.telemetry_moe_pending_chunk);
             uint64_t unlocated_rows = 0;
             GGML_ASSERT(server_moe_routing_combine_lost_population(
@@ -7888,7 +8345,7 @@ private:
             {"first_sequence", slot.telemetry_moe_chunk_decision_sequence},
             {"next_sequence", slot.telemetry_moe_chunk_decision_sequence},
             {"is_final_for_trace", true},
-            {"capture_limit_reached", slot.telemetry_moe_chunk_trace_limit_reached},
+            {"capture_limit_reached", false},
             {"descriptor", telemetry_moe_routing_descriptor()},
         };
         server_moe_routing_apply_canonical_event_coverage(
@@ -7915,26 +8372,6 @@ private:
                 llama_model_n_expert(model_tgt) > 0)
             && slot.task
             && slot.task->params.moe_routing_telemetry_permitted;
-    }
-
-    bool telemetry_moe_trace_budget_available(const server_slot & slot, bool output) const {
-        const uint64_t retained = output
-            ? slot.telemetry_moe_chunk_output_trace_rows
-            : slot.telemetry_moe_chunk_prompt_trace_rows;
-        return retained < telemetry_moe_trace_row_limit;
-    }
-
-    void telemetry_mark_moe_trace_limit(server_slot & slot, bool output) {
-        slot.telemetry_moe_chunk_capture_interrupted = true;
-        slot.telemetry_moe_chunk_trace_limit_reached = true;
-        bool & logged = output
-            ? slot.telemetry_moe_output_trace_limit_logged
-            : slot.telemetry_moe_prompt_trace_limit_logged;
-        if (!logged) {
-            SRV_WRN("slot %d: MoE %s trace reached the %zu-row limit; inference continues with partial routing coverage\n",
-                slot.id, output ? "output" : "prompt", telemetry_moe_trace_row_limit);
-            logged = true;
-        }
     }
 
     void telemetry_prepare_moe_storage(server_slot & slot) {
@@ -9506,14 +9943,43 @@ private:
     }
 
     std::string telemetry_events_json(uint64_t cursor, size_t limit) const {
-        const uint64_t latest = telemetry_next_sequence - 1;
+        std::vector<telemetry_event_entry> retained_window;
+        uint64_t latest;
+        uint64_t next_sequence;
+        uint64_t oldest;
+        uint64_t last_retained_sequence;
+        size_t retained_bytes;
+        uint64_t in_memory_dropped;
+        uint64_t in_memory_last_dropped;
+        {
+            std::lock_guard<std::mutex> lock(mutex_telemetry_events);
+            latest = telemetry_next_sequence - 1;
+            next_sequence = telemetry_next_sequence;
+            oldest = telemetry_events.empty() ? next_sequence : telemetry_events.front().sequence;
+            last_retained_sequence = telemetry_events.empty() ? 0 : telemetry_events.back().sequence;
+            retained_bytes = telemetry_event_bytes;
+            in_memory_dropped = telemetry_dropped_events;
+            in_memory_last_dropped = telemetry_last_dropped_sequence;
+            const uint64_t effective_cursor = cursor > latest ? latest : cursor;
+            auto first = std::upper_bound(
+                telemetry_events.begin(), telemetry_events.end(), effective_cursor,
+                [](uint64_t value, const telemetry_event_entry & entry) {
+                    return value < entry.sequence;
+                });
+            for (; first != telemetry_events.end(); ++first) {
+                retained_window.push_back(*first);
+                if (retained_window.size() >= limit) {
+                    break;
+                }
+            }
+        }
         const bool future_cursor = cursor > latest;
         const uint64_t effective_cursor = future_cursor ? latest : cursor;
+        const telemetry_event_journal::loss_snapshot journal_losses = telemetry_journal.losses();
         std::string events = "[";
-        const uint64_t oldest = telemetry_events.empty() ? telemetry_next_sequence : telemetry_events.front().sequence;
         size_t event_count = 0;
         uint64_t next_cursor = effective_cursor;
-        for (const auto & entry : telemetry_events) {
+        for (const auto & entry : retained_window) {
             const uint64_t sequence = entry.sequence;
             if (sequence <= effective_cursor) {
                 continue;
@@ -9521,7 +9987,7 @@ private:
             if (event_count++ > 0) {
                 events += ',';
             }
-            events += entry.serialized;
+            events += *entry.serialized;
             next_cursor = sequence;
             if (event_count >= limit) {
                 break;
@@ -9531,23 +9997,23 @@ private:
 
         json gap_ranges = json::array();
         uint64_t previous_sequence = effective_cursor;
-        for (const auto & entry : telemetry_events) {
-            if (entry.sequence <= effective_cursor) {
+        for (const auto & entry : retained_window) {
+            const uint64_t sequence = entry.sequence;
+            if (sequence <= effective_cursor) {
                 continue;
             }
-            if (entry.sequence > next_cursor) {
+            if (sequence > next_cursor) {
                 break;
             }
-            if (previous_sequence + 1 < entry.sequence) {
+            if (previous_sequence + 1 < sequence) {
                 gap_ranges.push_back({
                     {"first_sequence", previous_sequence + 1},
-                    {"last_sequence", entry.sequence - 1},
+                    {"last_sequence", sequence - 1},
                 });
             }
-            previous_sequence = entry.sequence;
+            previous_sequence = sequence;
         }
-        if (next_cursor < latest &&
-                (telemetry_events.empty() || telemetry_events.back().sequence <= next_cursor)) {
+        if (next_cursor < latest && last_retained_sequence <= next_cursor) {
             gap_ranges.push_back({
                 {"first_sequence", next_cursor + 1},
                 {"last_sequence", latest},
@@ -9559,12 +10025,15 @@ private:
             {"events", json::array()},
             {"cursor", next_cursor},
             {"oldest_sequence", oldest},
-            {"next_sequence", telemetry_next_sequence},
+            {"next_sequence", next_sequence},
             {"gap", future_cursor || !gap_ranges.empty()},
             {"gap_ranges", std::move(gap_ranges)},
-            {"dropped_events", telemetry_dropped_events},
-            {"last_dropped_sequence", telemetry_last_dropped_sequence},
-            {"retained_serialized_bytes", telemetry_event_bytes},
+            {"dropped_events", in_memory_dropped},
+            {"last_dropped_sequence", in_memory_last_dropped},
+            {"journal_dropped_events", journal_losses.dropped_events},
+            {"journal_last_dropped_sequence", journal_losses.last_dropped_sequence},
+            {"retained_serialized_bytes", retained_bytes},
+            {"journal_uncapped", telemetry_journal.active()},
             {"content_logging", telemetry_control_current().request_content},
         }, events);
     }
@@ -10431,7 +10900,7 @@ json server_context_impl::test_native_dispatch_loss_stream_finalization() {
         {"events", json::array()},
     };
     for (const telemetry_event_entry & entry : server.telemetry_events) {
-        result["events"].push_back(json::parse(entry.serialized));
+        result["events"].push_back(json::parse(*entry.serialized));
     }
     server.sleeping = true;
     return result;
@@ -10581,7 +11050,7 @@ json server_context_impl::test_native_dispatch_loss_timeline() {
         {"events", json::array()},
     };
     for (const telemetry_event_entry & entry : server.telemetry_events) {
-        result["events"].push_back(json::parse(entry.serialized));
+        result["events"].push_back(json::parse(*entry.serialized));
     }
     server.sleeping = true;
     return result;
@@ -10724,7 +11193,7 @@ json server_context_impl::test_native_dispatch_loss_small_cap() {
         {"events", json::array()},
     };
     for (const telemetry_event_entry & entry : server.telemetry_events) {
-        result["events"].push_back(json::parse(entry.serialized));
+        result["events"].push_back(json::parse(*entry.serialized));
     }
     server.sleeping = true;
     return result;
@@ -11450,16 +11919,14 @@ void server_routes::init_routes() {
                         {"state", "conditional"},
                         {"configured_experts", llama_model_n_expert(ctx_server.model_tgt)},
                         {"experts_per_token", llama_model_n_expert_used(ctx_server.model_tgt)},
-                        {"reason", "Versioned bounded routing chunks retain selected routed experts, exact effective coefficients, K/K+1 boundary score status, physical microbatch identity, and shared-expert metadata while POST /props enables telemetry_control.moe_routing."},
+                        {"reason", "Versioned transport chunks retain selected routed experts, exact effective coefficients, K/K+1 boundary score status, physical microbatch identity, and shared-expert metadata while POST /props enables telemetry_control.moe_routing."},
                         {"enable_with", "POST /props telemetry_control.moe_routing=true; request moe_routing_telemetry=false permanently opts a request out"},
                         {"endpoint", "/telemetry/v1/events"},
                         {"chunk_event", "moe_routing_chunk"},
                         {"chunk_schema_version", 3},
                         {"chunk_max_serialized_bytes", ctx_server.telemetry_moe_chunk_limit_value()},
-                        {"full_request_capture", false},
-                        {"maximum_prompt_decisions", ctx_server.telemetry_moe_trace_row_limit_value()},
-                        {"maximum_output_decisions", ctx_server.telemetry_moe_trace_row_limit_value()},
-                        {"trace_row_limit_env", "LLAMA_TELEMETRY_MOE_TRACE_ROW_LIMIT"},
+                        {"whole_request_event_cap", false},
+                        {"archive_handoff", "nonblocking byte-bounded memory ring with logged sequence gaps on overrun"},
                         {"transport_gap_ranges", "response gap_ranges report only missing global event-sequence intervals"},
                         {"population", "target_model_routed_token_layer_decisions"},
                         {"token_detail_population", "target_model_output_logit_rows_by_layer"},
@@ -11478,13 +11945,17 @@ void server_routes::init_routes() {
                     }},
                 {"output_token_telemetry", {
                     {"state", "conditional"},
-                    {"reason", "Bounded committed-token timing, target-model position, decode origin, MTP commit linkage, and actual target-pass records require the telemetry control; raw target probability additionally requires n_probs > 0."},
+                    {"reason", "Committed-token timing, target-model position, decode origin, MTP commit linkage, actual target-pass records, and per-forward-pass prefill detail require the telemetry control; raw target probability additionally requires n_probs > 0."},
                     {"enable_with", "POST /props telemetry_control.output_token_detail=true plus request output_token_telemetry=true"},
                     {"probability_enable_with", "n_probs > 0"},
                     {"automatic_request_defaults", true},
                     {"token_identity_policy", "token IDs and authoritative tokenizer-piece bytes require POST /props telemetry_control.request_content=true"},
                     {"population", "committed_generation_tokens"},
                     {"record_schema_version", 3},
+                    {"prefill_forward_pass_event", "prefill_forward_pass"},
+                    {"prefill_forward_pass_schema_version", 1},
+                    {"prefill_token_identity_policy", "token IDs and authoritative tokenizer-piece bytes require POST /props telemetry_control.request_content=true"},
+                    {"prefill_capture", "append_only_disk_journal_with_fixed_transport_chunks_and_no_per_request_limit"},
                     {"mtp_pass_record_schema_version", 2},
                     {"retained_linkage", json::array({"model_ready_monotonic_us", "model_position", "origin", "logical_step", "actual_target_pass", "proposal_position", "accepted_depth", "proposed_count", "replay_pass"})},
                     {"retained_mtp_proposal_fields", json::array({"position", "disposition", "evaluated_actual_target_pass", "draft_token_id", "draft_token_piece_base64", "target_selected_token_id", "target_selected_token_piece_base64", "target_selected_log_probability_ln", "committed_output_ordinal"})},
@@ -11517,16 +11988,16 @@ void server_routes::init_routes() {
             {"telemetry_control", ctx_server.telemetry_control_capability_json()},
             {"content_policy", {
                 {"default", "metadata_only"},
-                {"in_memory_event_capacity", 2048},
+                {"in_memory_event_capacity", "byte_bounded_ring"},
                 {"serialized_event_capacity_bytes", ctx_server.telemetry_event_capacity_bytes()},
                 {"event_buffer_env", "LLAMA_TELEMETRY_EVENT_BUFFER_MIB"},
+                {"disk_journal", "append_only_uncapped"},
+                {"disk_journal_env", "LLAMA_TELEMETRY_SPOOL_DIR"},
                 {"request_capture_limit_bytes", 4 * 1024 * 1024},
                 {"output_token_record_limit", ctx_server.telemetry_output_tokens_limit()},
                 {"token_candidate_max_serialized_bytes", ctx_server.telemetry_token_candidate_max_bytes()},
                 {"moe_activation_record_limit", ctx_server.telemetry_moe_activation_limit_value()},
                 {"moe_token_detail_activation_record_limit", ctx_server.telemetry_moe_activation_limit_value()},
-                {"moe_routing_prompt_decision_limit", ctx_server.telemetry_moe_trace_row_limit_value()},
-                {"moe_routing_output_decision_limit", ctx_server.telemetry_moe_trace_row_limit_value()},
                 {"moe_routing_chunk_max_serialized_bytes", ctx_server.telemetry_moe_chunk_limit_value()},
                 {"prometheus_content", false},
             }},
@@ -11565,7 +12036,10 @@ void server_routes::init_routes() {
             return res;
         }
         limit = std::max<size_t>(1, std::min<size_t>(limit, 512));
-        return handle_telemetry(req, SERVER_TASK_TYPE_TELEMETRY_EVENTS, cursor, limit);
+        auto res = create_response(true);
+        res->headers["Cache-Control"] = "no-store";
+        res->ok_serialized(ctx_server.telemetry_events_json(cursor, limit));
+        return res;
     };
 
     this->get_telemetry_kv = [this](const server_http_req & req) {
