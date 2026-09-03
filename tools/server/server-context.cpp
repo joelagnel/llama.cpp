@@ -11988,7 +11988,7 @@ void server_routes::init_routes() {
             {"telemetry_control", ctx_server.telemetry_control_capability_json()},
             {"content_policy", {
                 {"default", "metadata_only"},
-                {"in_memory_event_capacity", "byte_bounded_ring"},
+                {"in_memory_event_capacity_mode", "byte_bounded_ring"},
                 {"serialized_event_capacity_bytes", ctx_server.telemetry_event_capacity_bytes()},
                 {"event_buffer_env", "LLAMA_TELEMETRY_EVENT_BUFFER_MIB"},
                 {"disk_journal", "append_only_uncapped"},
