@@ -739,6 +739,8 @@ struct server_slot {
     uint64_t telemetry_moe_chunk_decision_sequence = 0;
     uint64_t telemetry_moe_chunk_rows = 0;
     uint64_t telemetry_moe_chunk_trace_rows = 0;
+    uint64_t telemetry_moe_chunk_prompt_trace_rows = 0;
+    uint64_t telemetry_moe_chunk_output_trace_rows = 0;
     uint64_t telemetry_moe_chunk_invalid_rows = 0;
     uint64_t telemetry_moe_chunk_unavailable_rows = 0;
     uint64_t telemetry_moe_chunk_unlinked_rows = 0;
@@ -749,6 +751,9 @@ struct server_slot {
     bool telemetry_moe_chunk_source_unavailable = false;
     bool telemetry_moe_chunk_attribution_ambiguous = false;
     bool telemetry_moe_chunk_exact_unavailable_terminal = false;
+    bool telemetry_moe_chunk_trace_limit_reached = false;
+    bool telemetry_moe_prompt_trace_limit_logged = false;
+    bool telemetry_moe_output_trace_limit_logged = false;
     telemetry_moe_unlocated_capacity_loss telemetry_moe_chunk_capacity_loss;
     json telemetry_moe_pending_chunk;
 
@@ -894,6 +899,8 @@ struct server_slot {
         telemetry_moe_chunk_decision_sequence = 0;
         telemetry_moe_chunk_rows = 0;
         telemetry_moe_chunk_trace_rows = 0;
+        telemetry_moe_chunk_prompt_trace_rows = 0;
+        telemetry_moe_chunk_output_trace_rows = 0;
         telemetry_moe_chunk_invalid_rows = 0;
         telemetry_moe_chunk_unavailable_rows = 0;
         telemetry_moe_chunk_unlinked_rows = 0;
@@ -904,6 +911,9 @@ struct server_slot {
         telemetry_moe_chunk_source_unavailable = false;
         telemetry_moe_chunk_attribution_ambiguous = false;
         telemetry_moe_chunk_exact_unavailable_terminal = false;
+        telemetry_moe_chunk_trace_limit_reached = false;
+        telemetry_moe_prompt_trace_limit_logged = false;
+        telemetry_moe_output_trace_limit_logged = false;
         telemetry_moe_chunk_capacity_loss = {};
         telemetry_moe_pending_chunk = json();
         json_schema = json();
@@ -1654,6 +1664,10 @@ public:
         return telemetry_moe_activation_limit;
     }
 
+    size_t telemetry_moe_trace_row_limit_value() const {
+        return telemetry_moe_trace_row_limit;
+    }
+
     size_t telemetry_event_capacity_bytes() const {
         return telemetry_event_max_bytes;
     }
@@ -1833,6 +1847,7 @@ private:
     size_t telemetry_event_bytes = 0;
     size_t telemetry_event_max_bytes = 64 * 1024 * 1024;
     size_t telemetry_moe_chunk_max_bytes = 1024 * 1024;
+    size_t telemetry_moe_trace_row_limit = 1024;
     uint64_t telemetry_kv_pressure_next_sequence = 1;
     uint64_t telemetry_kv_pressure_dropped_events = 0;
     uint64_t telemetry_kv_pressure_last_dropped_sequence = 0;
@@ -2611,6 +2626,11 @@ private:
         const char * telemetry_moe_chunk_max_bytes_env = getenv("LLAMA_TELEMETRY_MOE_CHUNK_MAX_BYTES");
         if (telemetry_moe_chunk_max_bytes_env) {
             telemetry_moe_chunk_max_bytes = (size_t) std::max(1024, std::min(1024 * 1024, atoi(telemetry_moe_chunk_max_bytes_env)));
+        }
+        const char * telemetry_moe_trace_row_limit_env = getenv("LLAMA_TELEMETRY_MOE_TRACE_ROW_LIMIT");
+        if (telemetry_moe_trace_row_limit_env) {
+            telemetry_moe_trace_row_limit = (size_t) std::max(
+                64, std::min(1048576, atoi(telemetry_moe_trace_row_limit_env)));
         }
         const char * telemetry_buffer_env = getenv("LLAMA_TELEMETRY_EVENT_BUFFER_MIB");
         if (telemetry_buffer_env) {
@@ -5076,8 +5096,14 @@ private:
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
             server_slot & slot = slots[batch.tokens[i].id_slot];
-            has_moe_routing_request |= target_has_moe && slot.task
+            const bool moe_requested = target_has_moe && slot.task
                 && slot.task->params.moe_routing_telemetry_permitted;
+            const bool output_phase = !batch.tokens[i].is_prompt;
+            if (moe_requested && telemetry_moe_trace_budget_available(slot, output_phase)) {
+                has_moe_routing_request = true;
+            } else if (moe_requested) {
+                telemetry_mark_moe_trace_limit(slot, output_phase);
+            }
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -7008,6 +7034,9 @@ private:
         // empty "final" marker.
         json final_event = event;
         final_event["is_final_for_trace"] = true;
+        // Reserve the longer JSON boolean spelling so either terminal value
+        // can be added without exceeding the serialized chunk limit.
+        final_event["capture_limit_reached"] = false;
         final_event["availability"] = 1;
         final_event["reason"] = server_moe_routing_partial_reason(
             { 1, 1, 1, 1, true, true, true, true }, "The request ended with partial routing coverage:");
@@ -7336,12 +7365,17 @@ private:
                 && row.row_index >= 0
                 && row.ubatch_token_index >= 0;
             const bool enabled = telemetry_moe_request_enabled(slot);
+            const bool output_phase = !token.is_prompt;
             if (has_physical_event) {
                 physical_event_coverage & coverage = coverage_by_event[event_id];
                 coverage.expected_trace_ids.insert(slot.task->trace_id);
                 ++coverage.expected_decisions;
             }
             if (!enabled) {
+                continue;
+            }
+            if (!telemetry_moe_trace_budget_available(slot, output_phase)) {
+                telemetry_mark_moe_trace_limit(slot, output_phase);
                 continue;
             }
             if (!locatable) {
@@ -7377,6 +7411,11 @@ private:
                 false,
                 proposal_positions[(size_t) row.token_index],
             });
+            if (output_phase) {
+                ++slot.telemetry_moe_chunk_output_trace_rows;
+            } else {
+                ++slot.telemetry_moe_chunk_prompt_trace_rows;
+            }
             coverage.captured_trace_ids.insert(slot.task->trace_id);
             coverage.captured_valid_decisions += invalid ? 0 : 1;
             ++slot.telemetry_moe_chunk_trace_rows;
@@ -7653,66 +7692,73 @@ private:
             GGML_ASSERT(server_moe_routing_add_lost_population(
                 capture.pending_unlocated_rows, unlocated_rows));
             std::vector<std::vector<const trace_record *>> & chunks = capture.chunks;
-            std::vector<const trace_record *> current;
-            const std::vector<const trace_record *> no_records;
-            const size_t chunk_base_upper_bound = telemetry_moe_chunk_finalized_size(make_event(
-                trace_id, capture, no_records, std::numeric_limits<uint64_t>::max(),
-                std::numeric_limits<uint64_t>::max(),
-                "moe-pending-18446744073709551615"));
-            size_t current_upper_bound = chunk_base_upper_bound;
-            constexpr size_t completeness_reserve = 128;
-            for (trace_record & record : capture.records) {
-                const std::vector<const trace_record *> one_record = { &record };
-                size_t one_record_upper_bound = telemetry_moe_chunk_finalized_size(make_event(
-                    trace_id, capture, one_record, std::numeric_limits<uint64_t>::max(),
+            const auto chunk_fits = [&](size_t first, size_t last) {
+                std::vector<const trace_record *> records;
+                records.reserve(last - first);
+                for (size_t index = first; index < last; ++index) {
+                    records.push_back(&capture.records[index]);
+                }
+                return telemetry_moe_chunk_can_be_finalized(make_event(
+                    trace_id, capture, records, std::numeric_limits<uint64_t>::max(),
                     std::numeric_limits<uint64_t>::max(),
                     "moe-pending-18446744073709551615"));
-                if (one_record_upper_bound > telemetry_moe_chunk_limit_bytes() && !record.invalid) {
+            };
+            const auto retain_chunk = [&](size_t first, size_t last) {
+                std::vector<const trace_record *> records;
+                records.reserve(last - first);
+                for (size_t index = first; index < last; ++index) {
+                    records.push_back(&capture.records[index]);
+                }
+                chunks.push_back(std::move(records));
+            };
+            const auto partition_chunk = [&](auto && self, size_t first, size_t last) -> void {
+                if (first == last) {
+                    return;
+                }
+                if (chunk_fits(first, last)) {
+                    retain_chunk(first, last);
+                    return;
+                }
+                if (last - first > 1) {
+                    const size_t middle = first + (last - first)/2;
+                    self(self, first, middle);
+                    self(self, middle, last);
+                    return;
+                }
+
+                trace_record & record = capture.records[first];
+                capture.slot->telemetry_moe_chunk_capacity_loss = {
+                    true,
+                    decision.props_generation,
+                    decision.microbatch_generation,
+                    decision.application_epoch,
+                    readback.operation,
+                };
+                if (!record.invalid) {
                     record.gap = true;
-                    capture.slot->telemetry_moe_chunk_capacity_loss = {
-                        true,
-                        decision.props_generation,
-                        decision.microbatch_generation,
-                        decision.application_epoch,
-                        readback.operation,
-                    };
                     physical_event_coverage & coverage = coverage_by_event.at(record.event);
                     if (coverage.captured_valid_decisions > 0) {
                         --coverage.captured_valid_decisions;
                     }
-                    one_record_upper_bound = telemetry_moe_chunk_finalized_size(make_event(
-                        trace_id, capture, one_record, std::numeric_limits<uint64_t>::max(),
-                        std::numeric_limits<uint64_t>::max(),
-                        "moe-pending-18446744073709551615"));
+                    if (chunk_fits(first, last)) {
+                        retain_chunk(first, last);
+                        return;
+                    }
                 }
-                GGML_ASSERT(one_record_upper_bound >= chunk_base_upper_bound);
-                size_t record_upper_bound = one_record_upper_bound - chunk_base_upper_bound;
-                if (record_upper_bound <= std::numeric_limits<size_t>::max() - completeness_reserve) {
-                    record_upper_bound += completeness_reserve;
-                }
-                if (chunk_base_upper_bound > telemetry_moe_chunk_limit_bytes()
-                        || record_upper_bound > telemetry_moe_chunk_limit_bytes() - chunk_base_upper_bound) {
-                    capture.slot->telemetry_moe_chunk_capacity_loss = {
-                        true,
-                        decision.props_generation,
-                        decision.microbatch_generation,
-                        decision.application_epoch,
-                        readback.operation,
-                    };
-                    ++capture.slot->telemetry_moe_chunk_unlocated_pending;
-                    ++capture.slot->telemetry_moe_chunk_unlocated_rows;
-                    continue;
-                }
-                if (!current.empty() && record_upper_bound > telemetry_moe_chunk_limit_bytes() - current_upper_bound) {
-                    chunks.push_back(std::move(current));
-                    current.clear();
-                    current_upper_bound = chunk_base_upper_bound;
-                }
-                current.push_back(&record);
-                current_upper_bound += record_upper_bound;
-            }
-            if (!current.empty()) {
-                chunks.push_back(std::move(current));
+                ++capture.slot->telemetry_moe_chunk_unlocated_pending;
+                ++capture.slot->telemetry_moe_chunk_unlocated_rows;
+            };
+
+            // Generated-token dispatches usually contain one routing row per
+            // MoE layer. Measure that group once, then split only groups that
+            // actually exceed the serialized event limit. The former path
+            // rebuilt and serialized a complete event for every row.
+            constexpr size_t chunk_probe_records = 512;
+            for (size_t first = 0; first < capture.records.size(); first += chunk_probe_records) {
+                partition_chunk(
+                    partition_chunk,
+                    first,
+                    std::min(first + chunk_probe_records, capture.records.size()));
             }
             if (chunks.empty()) {
                 GGML_ASSERT(server_moe_routing_add_lost_population(
@@ -7777,6 +7823,7 @@ private:
         const uint64_t pending_unlocated_rows = slot.telemetry_moe_chunk_unlocated_pending;
         if (!slot.telemetry_moe_pending_chunk.is_null()) {
             slot.telemetry_moe_pending_chunk["is_final_for_trace"] = true;
+            slot.telemetry_moe_pending_chunk["capture_limit_reached"] = slot.telemetry_moe_chunk_trace_limit_reached;
             const uint64_t existing_unlocated_rows = telemetry_moe_chunk_unlocated_loss_count(slot.telemetry_moe_pending_chunk);
             uint64_t unlocated_rows = 0;
             GGML_ASSERT(server_moe_routing_combine_lost_population(
@@ -7835,6 +7882,7 @@ private:
             {"first_sequence", slot.telemetry_moe_chunk_decision_sequence},
             {"next_sequence", slot.telemetry_moe_chunk_decision_sequence},
             {"is_final_for_trace", true},
+            {"capture_limit_reached", slot.telemetry_moe_chunk_trace_limit_reached},
             {"descriptor", telemetry_moe_routing_descriptor()},
         };
         server_moe_routing_apply_canonical_event_coverage(
@@ -7861,6 +7909,26 @@ private:
                 llama_model_n_expert(model_tgt) > 0)
             && slot.task
             && slot.task->params.moe_routing_telemetry_permitted;
+    }
+
+    bool telemetry_moe_trace_budget_available(const server_slot & slot, bool output) const {
+        const uint64_t retained = output
+            ? slot.telemetry_moe_chunk_output_trace_rows
+            : slot.telemetry_moe_chunk_prompt_trace_rows;
+        return retained < telemetry_moe_trace_row_limit;
+    }
+
+    void telemetry_mark_moe_trace_limit(server_slot & slot, bool output) {
+        slot.telemetry_moe_chunk_capture_interrupted = true;
+        slot.telemetry_moe_chunk_trace_limit_reached = true;
+        bool & logged = output
+            ? slot.telemetry_moe_output_trace_limit_logged
+            : slot.telemetry_moe_prompt_trace_limit_logged;
+        if (!logged) {
+            SRV_WRN("slot %d: MoE %s trace reached the %zu-row limit; inference continues with partial routing coverage\n",
+                slot.id, output ? "output" : "prompt", telemetry_moe_trace_row_limit);
+            logged = true;
+        }
     }
 
     void telemetry_prepare_moe_storage(server_slot & slot) {
@@ -11376,13 +11444,16 @@ void server_routes::init_routes() {
                         {"state", "conditional"},
                         {"configured_experts", llama_model_n_expert(ctx_server.model_tgt)},
                         {"experts_per_token", llama_model_n_expert_used(ctx_server.model_tgt)},
-                        {"reason", "Versioned full-request routing chunks retain every selected routed expert, exact effective coefficient, K/K+1 boundary score status, physical microbatch identity, and shared-expert metadata while POST /props enables telemetry_control.moe_routing."},
+                        {"reason", "Versioned bounded routing chunks retain selected routed experts, exact effective coefficients, K/K+1 boundary score status, physical microbatch identity, and shared-expert metadata while POST /props enables telemetry_control.moe_routing."},
                         {"enable_with", "POST /props telemetry_control.moe_routing=true; request moe_routing_telemetry=false permanently opts a request out"},
                         {"endpoint", "/telemetry/v1/events"},
                         {"chunk_event", "moe_routing_chunk"},
                         {"chunk_schema_version", 3},
                         {"chunk_max_serialized_bytes", 1024 * 1024},
-                        {"full_request_capture", true},
+                        {"full_request_capture", false},
+                        {"maximum_prompt_decisions", ctx_server.telemetry_moe_trace_row_limit_value()},
+                        {"maximum_output_decisions", ctx_server.telemetry_moe_trace_row_limit_value()},
+                        {"trace_row_limit_env", "LLAMA_TELEMETRY_MOE_TRACE_ROW_LIMIT"},
                         {"transport_gap_ranges", "response gap_ranges report only missing global event-sequence intervals"},
                         {"population", "target_model_routed_token_layer_decisions"},
                         {"token_detail_population", "target_model_output_logit_rows_by_layer"},
@@ -11448,6 +11519,8 @@ void server_routes::init_routes() {
                 {"token_candidate_max_serialized_bytes", ctx_server.telemetry_token_candidate_max_bytes()},
                 {"moe_activation_record_limit", ctx_server.telemetry_moe_activation_limit_value()},
                 {"moe_token_detail_activation_record_limit", ctx_server.telemetry_moe_activation_limit_value()},
+                {"moe_routing_prompt_decision_limit", ctx_server.telemetry_moe_trace_row_limit_value()},
+                {"moe_routing_output_decision_limit", ctx_server.telemetry_moe_trace_row_limit_value()},
                 {"moe_routing_chunk_max_serialized_bytes", 1024 * 1024},
                 {"prometheus_content", false},
             }},

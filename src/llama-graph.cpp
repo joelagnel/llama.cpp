@@ -2090,9 +2090,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
+    ggml_tensor * routing_ranked_experts = nullptr;
     if (selected_experts == nullptr) {
-        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-        cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        if (cparams.moe_routing && n_expert_used < n_expert) {
+            // Routing diagnostics need both the selected K experts and the K+1
+            // boundary. Reuse one full ranking instead of executing a second
+            // full argsort for every MoE layer.
+            routing_ranked_experts = ggml_argsort(ctx0, selection_probs, GGML_SORT_ORDER_DESC);
+            selected_experts = ggml_view_4d(
+                    ctx0, routing_ranked_experts,
+                    n_expert_used, routing_ranked_experts->ne[1], routing_ranked_experts->ne[2], routing_ranked_experts->ne[3],
+                    routing_ranked_experts->nb[1], routing_ranked_experts->nb[2], routing_ranked_experts->nb[3],
+                    0);
+            cb(routing_ranked_experts, "ffn_moe_argsort", il);
+        } else {
+            selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+            cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        }
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
@@ -2106,7 +2120,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_score, "ffn_moe_routing_selected_score", il);
 
         if (n_expert_used < n_expert) {
-            ggml_tensor * rejected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used + 1);
+            ggml_tensor * rejected_experts = routing_ranked_experts != nullptr
+                ? routing_ranked_experts
+                : ggml_argsort_top_k(ctx0, selection_probs, n_expert_used + 1);
             ggml_tensor * rejected_expert_head = ggml_view_2d(
                     ctx0, rejected_experts, 1, n_tokens, rejected_experts->nb[1], n_expert_used*rejected_experts->nb[0]);
             rejected_score = ggml_get_rows(ctx0, selection_probs_readback, rejected_expert_head);

@@ -463,7 +463,29 @@ private:
         std::array<int64_t, GGML_MAX_DIMS> ne {};
         std::array<size_t, GGML_MAX_DIMS> nb {};
         std::vector<uint8_t> data;
+        ggml_backend_buffer_ptr host_buffer;
+        ggml_backend_buffer_type_t host_buffer_type = nullptr;
+        size_t data_size = 0;
         llama_moe_routing_value_status status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+
+        void reset() {
+            ne.fill(0);
+            nb.fill(0);
+            data_size = 0;
+            status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
+        }
+
+        uint8_t * data_ptr() {
+            return host_buffer
+                ? static_cast<uint8_t *>(ggml_backend_buffer_get_base(host_buffer.get()))
+                : data.data();
+        }
+
+        const uint8_t * data_ptr() const {
+            return host_buffer
+                ? static_cast<const uint8_t *>(ggml_backend_buffer_get_base(host_buffer.get()))
+                : data.data();
+        }
     };
 
     struct moe_routing_row_identity {

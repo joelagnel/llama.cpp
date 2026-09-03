@@ -1757,11 +1757,11 @@ void llama_context::materialize_moe_routing_readback() {
             element /= (size_t) capture.ne[dim];
             offset += index*capture.nb[dim];
         }
-        if (element != 0 || offset + sizeof(*value) > capture.data.size()) {
+        if (element != 0 || offset + sizeof(*value) > capture.data_size) {
             return false;
         }
 
-        memcpy(value, capture.data.data() + offset, sizeof(*value));
+        memcpy(value, capture.data_ptr() + offset, sizeof(*value));
         return true;
     };
 
@@ -3084,9 +3084,8 @@ void llama_context::extract_moe_routing(
     GGML_ASSERT(!outputs.empty());
 
     auto capture_tensor = [&](ggml_tensor * tensor, ggml_type type, moe_routing_tensor_capture & capture) {
-        capture = {};
+        capture.reset();
         if (tensor == nullptr) {
-            capture.status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
             return;
         }
         if (tensor->type != type) {
@@ -3098,24 +3097,48 @@ void llama_context::extract_moe_routing(
             capture.ne[dim] = tensor->ne[dim];
             capture.nb[dim] = tensor->nb[dim];
         }
-#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
-        const size_t data_capacity = capture.data.capacity();
-#endif
-        capture.data.resize(ggml_nbytes(tensor));
-#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
-        if (capture.data.capacity() > data_capacity) {
-            ++moe_routing_test_observer.readback_allocations;
-        }
-#endif
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
         if (backend == nullptr) {
-            capture.data.clear();
             capture.status = LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE;
             return;
         }
 
-        ggml_backend_tensor_get_async(backend, tensor, capture.data.data(), 0, capture.data.size());
+        const size_t data_size = ggml_nbytes(tensor);
+        ggml_backend_buffer_type_t host_buffer_type = ggml_backend_dev_host_buffer_type(
+                ggml_backend_get_device(backend));
+        if (host_buffer_type == nullptr) {
+            capture.host_buffer.reset();
+            capture.host_buffer_type = nullptr;
+        } else {
+            const bool must_allocate = capture.host_buffer_type != host_buffer_type ||
+                capture.host_buffer == nullptr ||
+                ggml_backend_buffer_get_size(capture.host_buffer.get()) < data_size;
+            if (must_allocate) {
+                capture.host_buffer.reset(ggml_backend_buft_alloc_buffer(host_buffer_type, data_size));
+                capture.host_buffer_type = capture.host_buffer ? host_buffer_type : nullptr;
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+                if (capture.host_buffer) {
+                    ++moe_routing_test_observer.readback_allocations;
+                }
+#endif
+            }
+        }
+
+        if (capture.host_buffer == nullptr) {
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+            const size_t data_capacity = capture.data.capacity();
+#endif
+            capture.data.resize(data_size);
+#ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
+            if (capture.data.capacity() > data_capacity) {
+                ++moe_routing_test_observer.readback_allocations;
+            }
+#endif
+        }
+        capture.data_size = data_size;
+
+        ggml_backend_tensor_get_async(backend, tensor, capture.data_ptr(), 0, capture.data_size);
 #ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
         ++moe_routing_test_observer.readback_copies;
         if (backend != backend_cpu) {
@@ -3139,7 +3162,19 @@ void llama_context::extract_moe_routing(
         }
 
         auto & capture = moe_routing_captures[moe_routing_capture_count++];
-        capture = {};
+        capture.layer_index = -1;
+        capture.graph_type = 0;
+        capture.physical_ubatch_index = 0;
+        capture.shared_expert_count = 0;
+        capture.shared_expert_ffn_size = 0;
+        capture.token_count = 0;
+        capture.experts_per_token = 0;
+        capture.has_row_shape = false;
+        capture.selected_experts.reset();
+        capture.effective_weights.reset();
+        capture.selected_score.reset();
+        capture.rejected_score.reset();
+        capture.row_identities.clear();
         capture.layer_index = output.layer_index;
         capture.graph_type = (uint32_t) output.graph_type;
         capture.physical_ubatch_index = physical_ubatch_index;
