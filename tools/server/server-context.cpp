@@ -296,16 +296,44 @@ public:
         }
         while (!pending_.empty() && pending_bytes_ + bytes > pending_max_bytes_) {
             last_dropped_sequence_ = pending_.front().sequence;
-            pending_bytes_ -= pending_.front().serialized->size() + 1;
+            pending_bytes_ -= pending_.front().bytes;
             pending_.pop_front();
             ++dropped_events_;
         }
-        pending_.push_back({sequence, std::move(serialized)});
+        pending_.push_back({sequence, std::move(serialized), json(), bytes});
         pending_bytes_ += bytes;
         log_loss_locked(previous_dropped_events, "memory queue overrun");
         if (pending_bytes_ >= flush_threshold_bytes()) {
             cv_.notify_one();
         }
+    }
+
+    bool append_structured(uint64_t sequence, json && event) {
+        const size_t bytes = estimated_json_bytes(event) + 1;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!active_ || stopping_ || failed_) {
+            return false;
+        }
+        const uint64_t previous_dropped_events = dropped_events_;
+        if (bytes > pending_max_bytes_) {
+            last_dropped_sequence_ = sequence;
+            ++dropped_events_;
+            log_loss_locked(previous_dropped_events, "structured record exceeds memory queue");
+            return true;
+        }
+        while (!pending_.empty() && pending_bytes_ + bytes > pending_max_bytes_) {
+            last_dropped_sequence_ = pending_.front().sequence;
+            pending_bytes_ -= pending_.front().bytes;
+            pending_.pop_front();
+            ++dropped_events_;
+        }
+        pending_.push_back({sequence, nullptr, std::move(event), bytes});
+        pending_bytes_ += bytes;
+        log_loss_locked(previous_dropped_events, "memory queue overrun");
+        if (pending_bytes_ >= flush_threshold_bytes()) {
+            cv_.notify_one();
+        }
+        return true;
     }
 
     loss_snapshot losses() const {
@@ -317,7 +345,48 @@ private:
     struct pending_entry {
         uint64_t sequence = 0;
         std::shared_ptr<const std::string> serialized;
+        json structured;
+        size_t bytes = 0;
     };
+
+    static size_t estimated_json_bytes(const json & value) {
+        if (value.is_string()) {
+            return value.get<std::string>().size() + 32;
+        }
+        if (value.is_array()) {
+            size_t result = 32;
+            for (const json & item : value) {
+                result += estimated_json_bytes(item);
+            }
+            return result;
+        }
+        if (value.is_object()) {
+            size_t result = 64;
+            for (auto item = value.begin(); item != value.end(); ++item) {
+                result += item.key().size() + estimated_json_bytes(item.value()) + 32;
+            }
+            return result;
+        }
+        return 32;
+    }
+
+    static std::string serialize_structured(json event) {
+        std::string serialized = event.dump();
+        const std::string marker = "\"serialized_bytes\":0";
+        const size_t marker_offset = serialized.find(marker);
+        GGML_ASSERT(marker_offset != std::string::npos);
+        size_t final_bytes = serialized.size();
+        while (true) {
+            const size_t next_bytes = serialized.size() - 1 + std::to_string(final_bytes).size();
+            if (next_bytes == final_bytes) {
+                break;
+            }
+            final_bytes = next_bytes;
+        }
+        serialized.replace(marker_offset + marker.size() - 1, 1, std::to_string(final_bytes));
+        GGML_ASSERT(serialized.size() == final_bytes);
+        return serialized;
+    }
     void log_loss_locked(uint64_t previous_dropped_events, const char * reason) {
         if (dropped_events_ != previous_dropped_events
                 && (previous_dropped_events == 0 || dropped_events_ / 128 > previous_dropped_events / 128)) {
@@ -346,8 +415,14 @@ private:
 
             bool write_failed = false;
             size_t written_events = 0;
-            for (const pending_entry & entry : batch) {
-                if (!write_record(*entry.serialized)) {
+            for (pending_entry & entry : batch) {
+                std::string structured_serialized;
+                const std::string * serialized = entry.serialized.get();
+                if (serialized == nullptr) {
+                    structured_serialized = serialize_structured(std::move(entry.structured));
+                    serialized = &structured_serialized;
+                }
+                if (!write_record(*serialized)) {
                     write_failed = true;
                     break;
                 }
@@ -2247,6 +2322,7 @@ private:
     std::vector<uint64_t> telemetry_slot_marks;
     uint64_t telemetry_slot_epoch = 0;
     mutable std::mutex mutex_telemetry_events;
+    mutable std::mutex mutex_telemetry_append_order;
     mutable std::mutex mutex_telemetry_control;
     telemetry_control_state telemetry_control;
     uint64_t telemetry_microbatch_generation = 0;
@@ -6191,9 +6267,9 @@ private:
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
     }
 
-    uint64_t telemetry_next_event_sequence() const {
+    uint64_t telemetry_reserve_event_sequence() {
         std::lock_guard<std::mutex> lock(mutex_telemetry_events);
-        return telemetry_next_sequence;
+        return telemetry_next_sequence++;
     }
 
     void telemetry_append_serialized(uint64_t sequence, std::string serialized) {
@@ -6230,9 +6306,10 @@ private:
         if (!telemetry_enabled) {
             return;
         }
+        std::lock_guard<std::mutex> order_lock(mutex_telemetry_append_order);
         event["schema_version"] = 1;
         event["server_instance_id"] = telemetry_server_instance_id;
-        const uint64_t sequence = telemetry_next_event_sequence();
+        const uint64_t sequence = telemetry_reserve_event_sequence();
         event["sequence"] = sequence;
         telemetry_append_serialized(sequence, event.dump());
     }
@@ -6265,7 +6342,8 @@ private:
         if (!telemetry_enabled) {
             return;
         }
-        const uint64_t sequence = telemetry_next_event_sequence();
+        std::lock_guard<std::mutex> order_lock(mutex_telemetry_append_order);
+        const uint64_t sequence = telemetry_reserve_event_sequence();
         telemetry_append_serialized(sequence, telemetry_serialize_with_serialized_bytes(std::move(event), sequence));
     }
 
@@ -7642,11 +7720,15 @@ private:
     }
 
     bool telemetry_append_moe_routing_chunk(json event) {
-        const uint64_t sequence = telemetry_next_event_sequence();
-        std::string serialized = telemetry_serialize_moe_routing_chunk(std::move(event), sequence);
-        if (serialized.size() > telemetry_moe_chunk_limit_bytes() || serialized.size() > telemetry_event_max_bytes) {
+        std::lock_guard<std::mutex> order_lock(mutex_telemetry_append_order);
+        // Validate with the widest possible sequence before reserving one so a
+        // rejected chunk cannot create an unexplained gap in the event stream.
+        if (!telemetry_moe_chunk_fits_limit(event)) {
             return false;
         }
+        const uint64_t sequence = telemetry_reserve_event_sequence();
+        std::string serialized = telemetry_serialize_moe_routing_chunk(std::move(event), sequence);
+        GGML_ASSERT(serialized.size() <= telemetry_moe_chunk_limit_bytes());
         telemetry_append_serialized(sequence, std::move(serialized));
         return true;
     }
@@ -8723,10 +8805,6 @@ private:
             return false;
         }
         slot.telemetry_token_candidate_eligible_count++;
-        if (slot.telemetry_token_candidate_decisions.size() >= telemetry_token_candidate_capture_limit(slot)) {
-            slot.telemetry_token_candidate_dropped_count++;
-            return false;
-        }
         return true;
     }
 
@@ -8761,7 +8839,17 @@ private:
             candidate.draft_proposed = candidate.token_id == record.draft_token_id;
         }
         record.target_candidates = std::move(candidates);
-        slot.telemetry_token_candidate_decisions.push_back(std::move(record));
+        telemetry_append_request_detail(
+            slot,
+            "token_candidate_detail",
+            "candidate_decision",
+            telemetry_token_candidate_decision_json(slot, record),
+            2);
+        if (slot.telemetry_token_candidate_decisions.size() < telemetry_token_candidate_capture_limit(slot)) {
+            slot.telemetry_token_candidate_decisions.push_back(std::move(record));
+        } else {
+            slot.telemetry_token_candidate_dropped_count++;
+        }
     }
 
     void telemetry_record_output_token(
@@ -8778,11 +8866,13 @@ private:
             int64_t accepted_depth = -1,
             int64_t proposed_count = -1,
             bool replay_pass = false) {
-        if (!telemetry_output_token_request_enabled(slot) || slot.telemetry_output_tokens.size() >= telemetry_output_token_limit) {
+        if (!telemetry_output_token_request_enabled(slot)) {
             return;
         }
 
         telemetry_output_token_record record;
+        // n_gen is the authoritative committed-token counter and continues to
+        // advance after the bounded legacy completion cache stops admitting rows.
         record.ordinal = slot.stats.n_gen > 0 ? slot.stats.n_gen - 1 : 0;
         record.model_ready_offset_us = std::max<int64_t>(0, model_ready_us - slot.stats.t_arrival);
         record.model_ready_monotonic_us = model_ready_us;
@@ -8799,7 +8889,15 @@ private:
         record.accepted_depth = accepted_depth;
         record.proposed_count = proposed_count;
         record.replay_pass = replay_pass;
-        slot.telemetry_output_tokens.push_back(std::move(record));
+        telemetry_append_request_detail(
+            slot,
+            "output_token_detail",
+            "output_token_record",
+            telemetry_output_token_record_json(slot, record),
+            3);
+        if (slot.telemetry_output_tokens.size() < telemetry_output_token_limit) {
+            slot.telemetry_output_tokens.push_back(std::move(record));
+        }
     }
 
     void telemetry_prepare_mtp_proposals(
@@ -8807,10 +8905,7 @@ private:
             const llama_tokens & draft,
             const llama_tokens & accepted) {
         slot.telemetry_mtp_proposals_pending.clear();
-        const size_t remaining = telemetry_mtp_proposal_limit > slot.telemetry_mtp_proposals_captured
-            ? telemetry_mtp_proposal_limit - slot.telemetry_mtp_proposals_captured
-            : 0;
-        const size_t captured = std::min(draft.size(), remaining);
+        const size_t captured = draft.size();
         const size_t accepted_depth = accepted.empty() ? 0 : accepted.size() - 1;
         const uint64_t actual_target_pass = slot.n_spec_target_passes > 0 ? slot.n_spec_target_passes - 1 : 0;
         slot.telemetry_mtp_proposals_pending.reserve(captured);
@@ -8844,13 +8939,6 @@ private:
             slot.telemetry_mtp_proposals_pending.clear();
             return;
         }
-        if (slot.telemetry_mtp_passes.size() >= telemetry_mtp_pass_limit) {
-            if (!discarded) {
-                slot.telemetry_mtp_proposals_pending.clear();
-            }
-            return;
-        }
-
         telemetry_mtp_pass_record record;
         record.logical_step = slot.telemetry_spec_logical_step;
         record.actual_target_pass = slot.n_spec_target_passes > 0 ? slot.n_spec_target_passes - 1 : 0;
@@ -8882,9 +8970,24 @@ private:
                 }
             }
             record.proposals = std::move(slot.telemetry_mtp_proposals_pending);
-            slot.telemetry_mtp_proposals_captured += record.proposals.size();
         }
-        slot.telemetry_mtp_passes.push_back(std::move(record));
+        telemetry_append_request_detail(
+            slot,
+            "mtp_pass_detail",
+            "mtp_pass_record",
+            telemetry_mtp_pass_record_json(slot, record),
+            2);
+        if (slot.telemetry_mtp_passes.size() < telemetry_mtp_pass_limit) {
+            const size_t remaining = telemetry_mtp_proposal_limit > slot.telemetry_mtp_proposals_captured
+                ? telemetry_mtp_proposal_limit - slot.telemetry_mtp_proposals_captured
+                : 0;
+            telemetry_mtp_pass_record cached = record;
+            if (cached.proposals.size() > remaining) {
+                cached.proposals.resize(remaining);
+            }
+            slot.telemetry_mtp_proposals_captured += cached.proposals.size();
+            slot.telemetry_mtp_passes.push_back(std::move(cached));
+        }
     }
 
     static size_t telemetry_json_size(const json & value) {
@@ -8901,6 +9004,284 @@ private:
         }
         const std::string piece = common_token_to_piece(slot.ctx_tgt, token, true);
         return telemetry_piece_base64(piece);
+    }
+
+    void telemetry_append_request_detail(
+            const server_slot & slot,
+            const char * event_kind,
+            const char * record_name,
+            json record,
+            int detail_schema_version) {
+        json event = {
+            {"event", event_kind},
+            {"trace_id", slot.task->trace_id},
+            {"task_id", slot.task->id},
+            {"slot_id", slot.id},
+            {"slot_assignment_ordinal", slot.telemetry_assignment_ordinal},
+            {"timestamp_unix_ms", telemetry_unix_ms(slot, ggml_time_us())},
+            {"detail_schema_version", detail_schema_version},
+        };
+        event[record_name] = std::move(record);
+        std::lock_guard<std::mutex> order_lock(mutex_telemetry_append_order);
+        const uint64_t sequence = telemetry_reserve_event_sequence();
+        event["schema_version"] = 1;
+        event["server_instance_id"] = telemetry_server_instance_id;
+        event["sequence"] = sequence;
+        event["serialized_bytes"] = 0;
+        if (telemetry_journal.append_structured(sequence, std::move(event))) {
+            return;
+        }
+
+        // Without a disk journal, preserve legacy live-event behavior. The
+        // production OpenClaw path always configures the asynchronous journal.
+        telemetry_append_serialized(
+            sequence,
+            telemetry_serialize_with_serialized_bytes(std::move(event), sequence));
+    }
+
+    json telemetry_output_token_record_json(
+            const server_slot & slot,
+            const telemetry_output_token_record & record) const {
+        const bool probability_available = std::isfinite(record.selected_log_probability_ln);
+        const bool identity_available = telemetry_request_content_enabled(slot)
+            && record.token_id != LLAMA_TOKEN_NULL;
+        const bool piece_available = telemetry_request_content_enabled(slot) && identity_available;
+        const std::string piece_base64 = piece_available
+            ? telemetry_piece_base64(record.token_piece)
+            : std::string();
+        const bool mtp_linkage_available = record.origin != TELEMETRY_OUTPUT_TOKEN_ORIGIN_NORMAL_DECODE;
+        const char * origin = record.origin == TELEMETRY_OUTPUT_TOKEN_ORIGIN_MTP_ACCEPTED
+            ? "mtp_accepted"
+            : record.origin == TELEMETRY_OUTPUT_TOKEN_ORIGIN_TARGET_AFTER_MISS
+                ? "target_after_miss"
+                : record.origin == TELEMETRY_OUTPUT_TOKEN_ORIGIN_TARGET_BONUS
+                    ? "target_bonus"
+                    : "normal_decode";
+        const std::string probability_reason = probability_available
+            ? "raw_target_model_pre_sampler_selected_token_probability"
+            : slot.task->params.sampling.n_probs == 0
+                ? "request_did_not_enable_logprobs"
+                : slot.response_probability.unavailable_reason.empty()
+                    ? "raw_target_selected_probability_not_retained"
+                    : slot.response_probability.unavailable_reason;
+        return {
+            {"ordinal", record.ordinal},
+            {"model_ready_offset_us", record.model_ready_offset_us},
+            {"model_ready_monotonic_us", record.model_ready_monotonic_us},
+            {"model_position", record.model_position >= 0 ? json(record.model_position) : json(nullptr)},
+            {"model_position_state", record.model_position >= 0 ? "available" : "unavailable"},
+            {"model_position_reason", record.model_position >= 0
+                ? "Position of the committed token in the target-model context, derived directly from the evaluated logits-row position plus one."
+                : "The target-model context position was unavailable at commit time."},
+            {"selected_log_probability_ln", probability_available ? json(record.selected_log_probability_ln) : json(nullptr)},
+            {"probability_state", probability_available ? "available" : slot.task->params.sampling.n_probs == 0 ? "not_enabled_for_request" : "unavailable"},
+            {"probability_reason", probability_reason},
+            {"token_id", identity_available ? json(record.token_id) : json(nullptr)},
+            {"token_identity_state", identity_available ? "available" : "not_captured"},
+            {"token_identity_reason", identity_available ? "content_capture_enabled" : "content_capture_disabled; token IDs are treated as response content"},
+            {"token_piece_base64", piece_available ? json(piece_base64) : json(nullptr)},
+            {"token_piece_state", piece_available ? "available" : "not_captured"},
+            {"token_piece_reason", piece_available
+                ? "authoritative_tokenizer_piece_bytes_reused_from_committed_server_output"
+                : "content_capture_disabled; tokenizer pieces are treated as response content"},
+            {"origin", origin},
+            {"origin_state", "available"},
+            {"origin_reason", mtp_linkage_available
+                ? "Classified by llama.cpp/llama-server while committing the speculative verification result."
+                : "The token was committed by ordinary target-model decoding."},
+            {"logical_step", mtp_linkage_available ? json(record.logical_step) : json(nullptr)},
+            {"actual_target_pass", mtp_linkage_available ? json(record.actual_target_pass) : json(nullptr)},
+            {"proposal_position", mtp_linkage_available ? json(record.proposal_position) : json(nullptr)},
+            {"accepted_depth", mtp_linkage_available ? json(record.accepted_depth) : json(nullptr)},
+            {"proposed_count", mtp_linkage_available ? json(record.proposed_count) : json(nullptr)},
+            {"replay_pass", mtp_linkage_available ? json(record.replay_pass) : json(nullptr)},
+            {"mtp_linkage_state", mtp_linkage_available ? "available" : "not_applicable"},
+            {"mtp_linkage_reason", mtp_linkage_available
+                ? "Zero-based logical-step, actual-target-pass, and proposal-position linkage retained at commit time."
+                : "MTP linkage does not apply to an ordinary target-model decode token."},
+        };
+    }
+
+    json telemetry_mtp_pass_record_json(
+            const server_slot & slot,
+            const telemetry_mtp_pass_record & record) const {
+        const char * outcome = record.outcome == TELEMETRY_MTP_PASS_FULL_ACCEPTANCE
+            ? "full_acceptance"
+            : record.outcome == TELEMETRY_MTP_PASS_PARTIAL_ACCEPTANCE
+                ? "partial_acceptance"
+                : "zero_acceptance";
+        json proposals = json::array();
+        for (const telemetry_mtp_proposal_record & proposal : record.proposals) {
+            const bool draft_identity_available = telemetry_request_content_enabled(slot)
+                && proposal.draft_token_id != LLAMA_TOKEN_NULL;
+            const bool target_identity_available = telemetry_request_content_enabled(slot)
+                && proposal.target_selected_token_id != LLAMA_TOKEN_NULL;
+            const bool target_selected = proposal.disposition != TELEMETRY_MTP_PROPOSAL_INVALIDATED_TAIL;
+            const std::string draft_piece_base64 = draft_identity_available
+                ? telemetry_token_piece_base64(slot, proposal.draft_token_id)
+                : std::string();
+            const std::string target_piece_base64 = target_identity_available
+                ? telemetry_token_piece_base64(slot, proposal.target_selected_token_id)
+                : std::string();
+            const bool probability_available = std::isfinite(proposal.target_selected_log_probability_ln);
+            const char * disposition = proposal.disposition == TELEMETRY_MTP_PROPOSAL_ACCEPTED
+                ? "accepted"
+                : proposal.disposition == TELEMETRY_MTP_PROPOSAL_FIRST_MISMATCH
+                    ? "first_mismatch"
+                    : "invalidated_tail";
+            const std::string probability_reason = probability_available
+                ? "raw_target_model_pre_sampler_selected_token_probability"
+                : !target_selected
+                    ? "position_was_not_evaluated_after_first_mismatch"
+                    : slot.task->params.sampling.n_probs == 0
+                        ? "request_did_not_enable_logprobs"
+                        : slot.response_probability.unavailable_reason.empty()
+                            ? "raw_target_selected_probability_not_retained"
+                            : slot.response_probability.unavailable_reason;
+            proposals.push_back({
+                {"position", proposal.position},
+                {"evaluated_actual_target_pass", proposal.evaluated_actual_target_pass},
+                {"disposition", disposition},
+                {"draft_token_id", draft_identity_available ? json(proposal.draft_token_id) : json(nullptr)},
+                {"draft_token_identity_state", draft_identity_available ? "available" : "not_captured"},
+                {"draft_token_identity_reason", draft_identity_available ? "content_capture_enabled" : "content_capture_disabled; token IDs are treated as response content"},
+                {"draft_token_piece_base64", draft_identity_available ? json(draft_piece_base64) : json(nullptr)},
+                {"draft_token_piece_state", draft_identity_available ? "available" : "not_captured"},
+                {"draft_token_piece_reason", draft_identity_available ? "authoritative_target_tokenizer_piece_bytes" : "content_capture_disabled; tokenizer pieces are treated as response content"},
+                {"target_selected_token_id", target_identity_available ? json(proposal.target_selected_token_id) : json(nullptr)},
+                {"target_selected_token_identity_state", !target_selected ? "not_applicable" : target_identity_available ? "available" : "not_captured"},
+                {"target_selected_token_identity_reason", !target_selected
+                    ? "position_was_not_evaluated_after_first_mismatch"
+                    : target_identity_available ? "content_capture_enabled" : "content_capture_disabled; token IDs are treated as response content"},
+                {"target_selected_token_piece_base64", target_identity_available ? json(target_piece_base64) : json(nullptr)},
+                {"target_selected_token_piece_state", !target_selected ? "not_applicable" : target_identity_available ? "available" : "not_captured"},
+                {"target_selected_token_piece_reason", !target_selected
+                    ? "position_was_not_evaluated_after_first_mismatch"
+                    : target_identity_available ? "authoritative_target_tokenizer_piece_bytes" : "content_capture_disabled; tokenizer pieces are treated as response content"},
+                {"target_selected_log_probability_ln", probability_available ? json(proposal.target_selected_log_probability_ln) : json(nullptr)},
+                {"target_selected_probability_state", probability_available ? "available" : !target_selected ? "not_applicable" : slot.task->params.sampling.n_probs == 0 ? "not_enabled_for_request" : "unavailable"},
+                {"target_selected_probability_reason", probability_reason},
+                {"committed_output_ordinal", proposal.committed_output_ordinal >= 0 ? json(proposal.committed_output_ordinal) : json(nullptr)},
+            });
+        }
+        const bool proposal_complete = record.proposals.size() == record.proposed_count;
+        const char * proposal_state = record.discarded
+            ? "not_applicable"
+            : proposal_complete
+                ? "available"
+                : "truncated";
+        const char * proposal_reason = record.discarded
+            ? "The logical proposal ledger is attached to the committing replay pass to avoid duplicate rows."
+            : proposal_complete
+                ? "Every draft position in this logical decision was retained."
+                : "The producer did not retain every draft position in this logical decision.";
+        return {
+            {"logical_step", record.logical_step},
+            {"actual_target_pass", record.actual_target_pass},
+            {"replay_of_actual_target_pass", record.replay_of_actual_target_pass >= 0
+                ? json(record.replay_of_actual_target_pass)
+                : json(nullptr)},
+            {"proposed_count", record.proposed_count},
+            {"accepted_depth", record.accepted_depth},
+            {"reached_rejected_tokens", record.reached_rejected_token_count},
+            {"invalidated_tokens", record.invalidated_token_count},
+            {"target_rows_evaluated", record.target_rows_evaluated},
+            {"committed_output_start_ordinal", record.committed_token_count > 0
+                ? json(record.committed_output_start_ordinal)
+                : json(nullptr)},
+            {"committed_token_count", record.committed_token_count},
+            {"outcome", outcome},
+            {"replay_pass", record.replay_pass},
+            {"discarded", record.discarded},
+            {"counts_as_logical_step", record.counts_as_logical_step},
+            {"proposal_state", proposal_state},
+            {"proposal_reason", proposal_reason},
+            {"proposals", std::move(proposals)},
+        };
+    }
+
+    json telemetry_token_candidate_decision_json(
+            const server_slot & slot,
+            const telemetry_token_candidate_decision & record) const {
+        json candidates = json::array();
+        size_t rank = 1;
+        for (const telemetry_token_candidate_value & candidate : record.target_candidates) {
+            const bool identity_available = telemetry_request_content_enabled(slot) && candidate.token_id != LLAMA_TOKEN_NULL;
+            const std::string token_piece_base64 = identity_available
+                ? telemetry_token_piece_base64(slot, candidate.token_id)
+                : std::string();
+            const bool probability_available = std::isfinite(candidate.log_probability_ln);
+            candidates.push_back({
+                {"rank", rank++},
+                {"token_id", identity_available ? json(candidate.token_id) : json(nullptr)},
+                {"token_identity_state", identity_available ? "available" : "not_captured"},
+                {"token_identity_reason", identity_available
+                    ? "content_capture_enabled"
+                    : "content_capture_disabled; candidate token IDs are treated as response content"},
+                {"token_piece_base64", identity_available ? json(token_piece_base64) : json(nullptr)},
+                {"token_piece_state", identity_available ? "available" : "not_captured"},
+                {"token_piece_reason", identity_available
+                    ? "authoritative_target_tokenizer_piece_bytes"
+                    : "content_capture_disabled; tokenizer pieces are treated as response content"},
+                {"log_probability_ln", probability_available ? json(candidate.log_probability_ln) : json(nullptr)},
+                {"probability_state", probability_available ? "available" : "unavailable"},
+                {"probability_reason", probability_available
+                    ? "raw_target_model_pre_sampler_probability"
+                    : "raw_target_probability_not_finite"},
+                {"target_selected", candidate.target_selected},
+                {"draft_proposed", candidate.draft_proposed},
+            });
+        }
+        const char * kind = record.kind == TELEMETRY_TOKEN_CANDIDATE_ACCEPTED
+            ? "accepted_draft_position"
+            : record.kind == TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS
+                ? "target_bonus"
+                : "first_mismatch";
+        const bool draft_identity_available = telemetry_request_content_enabled(slot) && record.draft_token_id != LLAMA_TOKEN_NULL;
+        const bool selected_identity_available = telemetry_request_content_enabled(slot) && record.target_selected_token_id != LLAMA_TOKEN_NULL;
+        const std::string draft_piece_base64 = draft_identity_available
+            ? telemetry_token_piece_base64(slot, record.draft_token_id)
+            : std::string();
+        const std::string selected_piece_base64 = selected_identity_available
+            ? telemetry_token_piece_base64(slot, record.target_selected_token_id)
+            : std::string();
+        return {
+            {"logical_step", record.logical_step},
+            {"actual_target_pass", record.actual_target_pass},
+            {"proposal_position", record.proposal_position},
+            {"related_output_ordinal", record.related_output_ordinal >= 0 ? json(record.related_output_ordinal) : json(nullptr)},
+            {"decision_kind", kind},
+            {"draft_token_id", draft_identity_available ? json(record.draft_token_id) : json(nullptr)},
+            {"draft_token_identity_state", draft_identity_available ? "available" : record.kind == TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS ? "not_applicable" : "not_captured"},
+            {"draft_token_identity_reason", draft_identity_available
+                ? "content_capture_enabled"
+                : record.kind == TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS
+                    ? "A target bonus has no draft-proposed token at this position."
+                    : "content_capture_disabled; candidate token IDs are treated as response content"},
+            {"draft_token_piece_base64", draft_identity_available ? json(draft_piece_base64) : json(nullptr)},
+            {"draft_token_piece_state", draft_identity_available ? "available" : record.kind == TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS ? "not_applicable" : "not_captured"},
+            {"draft_token_piece_reason", draft_identity_available
+                ? "authoritative_target_tokenizer_piece_bytes"
+                : record.kind == TELEMETRY_TOKEN_CANDIDATE_TARGET_BONUS
+                    ? "A target bonus has no draft-proposed tokenizer piece at this position."
+                    : "content_capture_disabled; tokenizer pieces are treated as response content"},
+            {"target_selected_token_id", selected_identity_available ? json(record.target_selected_token_id) : json(nullptr)},
+            {"target_selected_token_identity_state", selected_identity_available ? "available" : "not_captured"},
+            {"target_selected_token_identity_reason", selected_identity_available
+                ? "content_capture_enabled"
+                : "content_capture_disabled; candidate token IDs are treated as response content"},
+            {"target_selected_token_piece_base64", selected_identity_available ? json(selected_piece_base64) : json(nullptr)},
+            {"target_selected_token_piece_state", selected_identity_available ? "available" : "not_captured"},
+            {"target_selected_token_piece_reason", selected_identity_available
+                ? "authoritative_target_tokenizer_piece_bytes"
+                : "content_capture_disabled; tokenizer pieces are treated as response content"},
+            {"target_probability_state", record.probability_state},
+            {"target_probability_reason", record.probability_reason},
+            {"target_candidates", std::move(candidates)},
+            {"draft_candidates_state", "unsupported"},
+            {"draft_candidates_reason", "The current producer tier retains the draft proposal identity but does not retain a draft-model top-K distribution."},
+            {"draft_candidates", json::array()},
+        };
     }
 
     void telemetry_store_token_candidate_detail(server_slot & slot) {
@@ -12100,9 +12481,12 @@ void server_routes::init_routes() {
                     {"mtp_pass_record_schema_version", 2},
                     {"retained_linkage", json::array({"model_ready_monotonic_us", "model_position", "origin", "logical_step", "actual_target_pass", "proposal_position", "accepted_depth", "proposed_count", "replay_pass"})},
                     {"retained_mtp_proposal_fields", json::array({"position", "disposition", "evaluated_actual_target_pass", "draft_token_id", "draft_token_piece_base64", "target_selected_token_id", "target_selected_token_piece_base64", "target_selected_log_probability_ln", "committed_output_ordinal"})},
-                    {"maximum_captured_tokens", ctx_server.telemetry_output_tokens_limit()},
-                    {"maximum_captured_mtp_passes", ctx_server.telemetry_mtp_passes_limit()},
-                    {"maximum_captured_mtp_proposals", ctx_server.telemetry_mtp_proposals_limit()},
+                    {"durable_event_kinds", json::array({"output_token_detail", "mtp_pass_detail"})},
+                    {"durable_capture", "append_only_disk_journal_with_fixed_record_events_and_no_per_request_limit"},
+                    {"whole_request_event_cap", false},
+                    {"legacy_completion_cache_maximum_tokens", ctx_server.telemetry_output_tokens_limit()},
+                    {"legacy_completion_cache_maximum_mtp_passes", ctx_server.telemetry_mtp_passes_limit()},
+                    {"legacy_completion_cache_maximum_mtp_proposals", ctx_server.telemetry_mtp_proposals_limit()},
                     {"normal_request_telemetry_unaffected", false},
                 }},
                 {"output_token_candidates", {
@@ -12118,8 +12502,11 @@ void server_routes::init_routes() {
                     {"accepted_positions", "separate_request_opt_in"},
                     {"draft_top_k_state", "unsupported"},
                     {"draft_top_k_reason", "The current producer tier retains draft proposal identity but not the draft-model top-K distribution."},
-                    {"maximum_serialized_bytes_per_request", ctx_server.telemetry_token_candidate_max_bytes()},
-                    {"maximum_decisions_per_request", ctx_server.telemetry_token_candidate_decisions_limit()},
+                    {"durable_event_kind", "token_candidate_detail"},
+                    {"durable_capture", "append_only_disk_journal_with_one_record_per_eligible_decision_and_no_per_request_limit"},
+                    {"whole_request_event_cap", false},
+                    {"legacy_live_cache_maximum_serialized_bytes_per_request", ctx_server.telemetry_token_candidate_max_bytes()},
+                    {"legacy_live_cache_maximum_decisions_per_request", ctx_server.telemetry_token_candidate_decisions_limit()},
                     {"token_identity_policy", "token IDs and authoritative tokenizer-piece bytes require POST /props telemetry_control.request_content=true"},
                     {"normal_event_payload_contains_candidates", false},
                     {"normal_request_telemetry_unaffected", false},
@@ -12136,8 +12523,8 @@ void server_routes::init_routes() {
                 {"disk_journal", "append_only_uncapped"},
                 {"disk_journal_env", "LLAMA_TELEMETRY_SPOOL_DIR"},
                 {"request_capture_limit_bytes", 4 * 1024 * 1024},
-                {"output_token_record_limit", ctx_server.telemetry_output_tokens_limit()},
-                {"token_candidate_max_serialized_bytes", ctx_server.telemetry_token_candidate_max_bytes()},
+                {"legacy_completion_output_token_cache_limit", ctx_server.telemetry_output_tokens_limit()},
+                {"legacy_live_token_candidate_cache_max_serialized_bytes", ctx_server.telemetry_token_candidate_max_bytes()},
                 {"moe_activation_record_limit", ctx_server.telemetry_moe_activation_limit_value()},
                 {"moe_token_detail_activation_record_limit", ctx_server.telemetry_moe_activation_limit_value()},
                 {"moe_routing_chunk_max_serialized_bytes", ctx_server.telemetry_moe_chunk_limit_value()},
