@@ -2026,8 +2026,8 @@ public:
         return {
             {"state", primary_occupancy_available ? "available" : "partial"},
             {"reason", primary_occupancy_available
-                ? "Bounded causal KV-pressure events and lightweight primary occupancy are available."
-                : "Causal KV-pressure events are available, but primary occupancy is unavailable."},
+                ? "Bounded live KV-pressure events, disk-journal archive, and lightweight primary occupancy are available."
+                : "Causal KV-pressure events and disk-journal archive are available, but primary occupancy is unavailable."},
             {"owner", "llama.cpp/llama-server"},
             {"endpoint", "/telemetry/v1/kv-pressure"},
             {"schema_version", 1},
@@ -2035,6 +2035,7 @@ public:
             {"event_capacity", TELEMETRY_KV_PRESSURE_EVENT_CAPACITY},
             {"serialized_event_capacity_bytes", telemetry_kv_pressure_event_max_bytes},
             {"request_window_capacity", telemetry_kv_request_window_capacity},
+            {"disk_journal_archive", telemetry_journal.active()},
             {"event_kinds", json::array({
                 "utilization_sample",
                 "decode_wait_started",
@@ -6428,6 +6429,10 @@ private:
         event["props_generation"] = telemetry_kv_pressure_applied_props_generation;
         event["microbatch_generation"] = telemetry_kv_pressure_applied_microbatch_generation;
         event["sequence"] = telemetry_kv_pressure_next_sequence++;
+        telemetry_append({
+            {"event", "kv_pressure_event"},
+            {"kv_pressure_event", event},
+        });
         telemetry_kv_pressure_event_entry entry;
         entry.sequence = event.at("sequence").get<uint64_t>();
         entry.kind = event.at("kind").get<std::string>();
@@ -6455,6 +6460,19 @@ private:
             telemetry_kv_pressure_events.pop_front();
             telemetry_kv_pressure_dropped_events++;
         }
+    }
+
+    void telemetry_kv_archive_request_window(const telemetry_kv_request_window & window) {
+        telemetry_append({
+            {"event", "kv_pressure_request_window"},
+            {"kv_pressure_window", {
+                {"trace_id", window.trace_id},
+                {"request_start_monotonic_us", window.start_monotonic_us},
+                {"request_end_monotonic_us", window.end_monotonic_us > 0
+                    ? json(window.end_monotonic_us) : json(nullptr)},
+                {"kv_cursor", telemetry_kv_pressure_next_sequence - 1},
+            }},
+        });
     }
 
     void telemetry_kv_pressure_sample(int64_t monotonic_us, bool force) {
@@ -6516,6 +6534,7 @@ private:
             telemetry_kv_request_windows.pop_front();
         }
         telemetry_kv_pressure_sample(ggml_time_us(), true);
+        telemetry_kv_archive_request_window(telemetry_kv_request_windows.back());
     }
 
     void telemetry_kv_request_finished(const server_slot & slot) {
@@ -6523,13 +6542,21 @@ private:
             return;
         }
         GGML_ASSERT(slot.task);
+        const int64_t request_end_monotonic_us = slot.stats.t_finalization_start;
+        int64_t request_start_monotonic_us = slot.stats.t_arrival;
         for (auto it = telemetry_kv_request_windows.rbegin(); it != telemetry_kv_request_windows.rend(); ++it) {
             if (it->trace_id == slot.task->trace_id) {
-                it->end_monotonic_us = slot.stats.t_finalization_start;
+                it->end_monotonic_us = request_end_monotonic_us;
+                request_start_monotonic_us = it->start_monotonic_us;
                 break;
             }
         }
-        telemetry_kv_pressure_sample(slot.stats.t_finalization_start, true);
+        telemetry_kv_pressure_sample(request_end_monotonic_us, true);
+        telemetry_kv_archive_request_window({
+            slot.task->trace_id,
+            request_start_monotonic_us,
+            request_end_monotonic_us,
+        });
     }
 
     std::vector<telemetry_kv_wait_identity> telemetry_kv_wait_identities(int32_t off, int32_t n_tokens) const {
