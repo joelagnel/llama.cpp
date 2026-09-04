@@ -225,8 +225,8 @@ public:
             }
             active_ = true;
             writer_ = std::thread([this]() { writer_loop(); });
-            SRV_INF("telemetry journal: writing uncapped trace envelopes to %s (memory queue %zu MiB)\n",
-                path_.string().c_str(), pending_max_bytes_ / (1024 * 1024));
+            SRV_INF("telemetry journal: writing uncapped trace envelopes to %s (memory queue %zu MiB, flush interval %lld ms)\n",
+                path_.string().c_str(), pending_max_bytes_ / (1024 * 1024), (long long) FLUSH_INTERVAL.count());
         } catch (const std::exception & exception) {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -303,7 +303,9 @@ public:
         pending_.push_back({sequence, std::move(serialized)});
         pending_bytes_ += bytes;
         log_loss_locked(previous_dropped_events, "memory queue overrun");
-        cv_.notify_one();
+        if (pending_bytes_ >= flush_threshold_bytes()) {
+            cv_.notify_one();
+        }
     }
 
     loss_snapshot losses() const {
@@ -329,11 +331,14 @@ private:
             std::deque<pending_entry> batch;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait_for(lock, std::chrono::milliseconds(250), [this]() {
-                    return stopping_ || !pending_.empty();
+                cv_.wait_for(lock, FLUSH_INTERVAL, [this]() {
+                    return stopping_ || pending_bytes_ >= flush_threshold_bytes();
                 });
-                if (pending_.empty() && stopping_) {
-                    return;
+                if (pending_.empty()) {
+                    if (stopping_) {
+                        return;
+                    }
+                    continue;
                 }
                 batch.swap(pending_);
                 pending_bytes_ = 0;
@@ -381,6 +386,13 @@ private:
     }
 
     mutable std::mutex mutex_;
+    static constexpr std::chrono::milliseconds FLUSH_INTERVAL{100};
+    static constexpr size_t MIN_FLUSH_THRESHOLD_BYTES = 256 * 1024;
+
+    size_t flush_threshold_bytes() const {
+        return std::max(MIN_FLUSH_THRESHOLD_BYTES, pending_max_bytes_ / 4);
+    }
+
     std::condition_variable cv_;
     std::deque<pending_entry> pending_;
     std::filesystem::path path_;
