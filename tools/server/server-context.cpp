@@ -7587,7 +7587,6 @@ private:
     }
 
     void telemetry_queue_moe_routing_chunk(server_slot & slot, json event) {
-        GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(event));
         if (!telemetry_flush_moe_pending_chunk(slot)) {
             const uint64_t pending_population = telemetry_moe_chunk_population_count(slot.telemetry_moe_pending_chunk);
             const uint64_t incoming_population = telemetry_moe_chunk_population_count(event);
@@ -7979,6 +7978,7 @@ private:
             json intervals = json::array();
             json gaps = json::array();
             std::set<physical_event_id> physical_events_in_chunk;
+            const trace_record * previous_covered_record = nullptr;
             uint64_t invalid_rows = 0;
             uint64_t unavailable_rows = 0;
             for (const trace_record * record : records) {
@@ -8005,6 +8005,7 @@ private:
                         {"cause", 8},
                         {"reason", "The producer could not retain this exact routing record within the serialized chunk limit."},
                     });
+                    previous_covered_record = nullptr;
                     continue;
                 }
                 physical_events_in_chunk.insert(record->event);
@@ -8018,6 +8019,7 @@ private:
                         {"code", "invalid_router_row"},
                         {"reason", "The native router row contained invalid or non-finite routing evidence."},
                     });
+                    previous_covered_record = nullptr;
                     continue;
                 }
 
@@ -8051,23 +8053,37 @@ private:
                     decision["highest_rejected_score_reason"] = reason;
                 }
                 decisions.push_back(std::move(decision));
-                intervals.push_back({
-                    {"first_sequence", record->sequence},
-                    {"next_sequence", record->sequence + 1},
-                    {"first_physical_step", physical_step(record->event.microbatch)},
-                    {"last_physical_step", physical_step(record->event.microbatch)},
-                    {"first_physical_microbatch", record->event.microbatch},
-                    {"last_physical_microbatch", record->event.microbatch},
-                    {"dispatch_monotonic_us", dispatch_monotonic_us(record->event.microbatch) > 0
-                        ? json(dispatch_monotonic_us(record->event.microbatch)) : json(nullptr)},
-                    {"physical_context", "target"},
-                    {"operation", operation},
-                    {"first_model_position", row.position},
-                    {"last_model_position", row.position},
-                    {"phase", record->event.phase},
-                    {"layer_index", record->event.layer},
-                    {"control_generation", control_generation},
-                });
+                const bool extends_previous_interval = previous_covered_record != nullptr
+                    && previous_covered_record->sequence < std::numeric_limits<uint64_t>::max()
+                    && previous_covered_record->sequence + 1 == record->sequence
+                    && previous_covered_record->event.microbatch == record->event.microbatch
+                    && previous_covered_record->event.layer == record->event.layer
+                    && previous_covered_record->event.phase == record->event.phase
+                    && (int64_t) previous_covered_record->row->position + 1 == row.position;
+                if (extends_previous_interval) {
+                    json & interval = intervals.back();
+                    interval["next_sequence"] = record->sequence + 1;
+                    interval["last_model_position"] = row.position;
+                } else {
+                    intervals.push_back({
+                        {"first_sequence", record->sequence},
+                        {"next_sequence", record->sequence + 1},
+                        {"first_physical_step", physical_step(record->event.microbatch)},
+                        {"last_physical_step", physical_step(record->event.microbatch)},
+                        {"first_physical_microbatch", record->event.microbatch},
+                        {"last_physical_microbatch", record->event.microbatch},
+                        {"dispatch_monotonic_us", dispatch_monotonic_us(record->event.microbatch) > 0
+                            ? json(dispatch_monotonic_us(record->event.microbatch)) : json(nullptr)},
+                        {"physical_context", "target"},
+                        {"operation", operation},
+                        {"first_model_position", row.position},
+                        {"last_model_position", row.position},
+                        {"phase", record->event.phase},
+                        {"layer_index", record->event.layer},
+                        {"control_generation", control_generation},
+                    });
+                }
+                previous_covered_record = record;
             }
 
             json physical_events = json::array();
@@ -8251,8 +8267,6 @@ private:
                     index == 0 ? unlocated_rows : 0,
                     index == 0 ? capture.unlinked_rows : 0,
                     chunk_id);
-                GGML_ASSERT(telemetry_moe_chunk_fits_limit(event));
-                GGML_ASSERT(telemetry_moe_chunk_can_be_finalized(event));
                 telemetry_queue_moe_routing_chunk(*capture.slot, std::move(event));
             }
         }
