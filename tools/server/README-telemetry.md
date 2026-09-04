@@ -2,6 +2,8 @@
 
 The private-fork telemetry API exposes bounded, local inference events and low-cardinality aggregate metrics. It is independent of the Prometheus endpoint and is available without `--metrics`.
 
+Set `LLAMA_TELEMETRY=0` before starting llama-server to disable tracing for the entire process. This master-off path does not install physical-microbatch observers, start the disk journal, construct request lifecycle events, or scan prefill batches for token detail. Leave the variable unset, or set it to `1`, to retain lightweight request lifecycle tracing and authenticated opt-in advanced controls. Changing the value requires a server restart.
+
 On Windows, run `build-telemetry.ps1` from the repository root to configure and build a native x64 or ARM64 Release server. CUDA is enabled automatically when `nvcc.exe` is available; use `-Cuda On` to require it or `-Cuda Off` for a CPU build. Windows ARM64 uses `clang-cl` for llama.cpp's ARM CPU backend and the Visual Studio ARM64 compiler as nvcc's host compiler. Pass `-LlvmPath` when LLVM is not installed in a standard location and `-CudaArchitecture 121` for an RTX Spark/compute 12.1 build. `run-llama-telemetry.ps1` starts the matching native build with model, context, batching, speculative/MTP, Prometheus, and authenticated telemetry-control options.
 
 ```powershell
@@ -45,6 +47,8 @@ The model router proxies these routes to a selected model in the same way as the
 `telemetry_control` is a full replacement, not a patch. Its only accepted fields are `moe_routing`, `output_token_detail`, `token_candidates`, `prompt_perplexity`, `request_content`, `kv_pressure_detail`, and `native_gpu_gpm`; every omitted field is false, so `{}` explicitly disables every control. The reply returns the complete effective set, per-control applicability, a monotonically increasing generation, and the boundary at which each control takes effect. `moe_routing`, `kv_pressure_detail`, and `native_gpu_gpm` take effect at the next microbatch. The remaining request-scoped controls take effect for the next request. Last apply wins, and state survives until an explicit replacement or process restart.
 
 `GET /telemetry/v1/capabilities` advertises this static contract. `GET /telemetry/v1/snapshot` includes the current effective set and generation. Environment variables may still set telemetry bounds and buffer sizes, but they cannot enable a telemetry control.
+
+When the process was started with `LLAMA_TELEMETRY=0`, capabilities reports `tracing_enabled: false`, telemetry control reports unsupported, and `POST /props` cannot re-enable it. This preserves a clean no-tracing performance baseline until the process is restarted.
 
 When `LLAMA_TELEMETRY_SPOOL_DIR` is set, enabled KV-pressure samples and exact request windows are also written to the append-only telemetry journal. The live KV-pressure endpoint remains a bounded convenience cache, while a disk-journal reader can reconstruct completed request timelines without connecting to llama-server.
 

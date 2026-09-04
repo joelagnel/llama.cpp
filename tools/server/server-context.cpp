@@ -24,6 +24,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cinttypes>
@@ -1841,6 +1842,9 @@ public:
     }
 
     telemetry_control_state telemetry_control_current() const {
+        if (!telemetry_enabled) {
+            return {};
+        }
         std::lock_guard<std::mutex> lock(mutex_telemetry_control);
         return telemetry_control;
     }
@@ -1863,8 +1867,14 @@ public:
                 telemetry_control.native_gpu_gpm != next.native_gpu_gpm;
         next.generation = telemetry_control.generation + 1;
         telemetry_control = next;
+        if (next.output_token_detail || next.prompt_perplexity) {
+            telemetry_prompt_scan_armed.store(true, std::memory_order_release);
+        }
         if (microbatch_changed) {
             ++telemetry_microbatch_generation;
+            // Keep the callback armed after the first transition so a later all-off
+            // transition is still applied at an exact physical-microbatch boundary.
+            telemetry_microbatch_observer_armed.store(true, std::memory_order_release);
         }
         return {
             telemetry_control,
@@ -1917,6 +1927,13 @@ public:
     }
 
     json telemetry_control_capability_json() const {
+        if (!telemetry_enabled) {
+            return {
+                {"supported", false},
+                {"reason", "Tracing was disabled for this server process by LLAMA_TELEMETRY=0."},
+                {"enable_with", "Set LLAMA_TELEMETRY=1 and restart llama-server."},
+            };
+        }
         return {
             {"supported", true},
             {"route", "/props"},
@@ -2013,6 +2030,10 @@ public:
 
     const std::string & telemetry_instance_id() const {
         return telemetry_server_instance_id;
+    }
+
+    bool telemetry_is_enabled() const {
+        return telemetry_enabled;
     }
 
     json telemetry_gpu_capability_json() const {
@@ -2173,6 +2194,12 @@ private:
     std::deque<telemetry_token_candidate_block_entry> telemetry_token_candidate_blocks;
     std::deque<std::string> telemetry_token_candidate_expired_trace_ids;
     std::string telemetry_server_instance_id = "server-" + random_string();
+    const bool telemetry_enabled = []() {
+        const char * value = getenv("LLAMA_TELEMETRY");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    std::atomic<bool> telemetry_prompt_scan_armed { false };
+    std::atomic<bool> telemetry_microbatch_observer_armed { false };
 #ifdef LLAMA_SERVER_TEST_HOOKS
     // Allows the focused chunk-finalization test to run the real private
     // streaming path without loading a model.
@@ -2336,6 +2363,9 @@ private:
     llama_context_dispatch_decision telemetry_dispatch_pre(
             bool draft,
             llama_context_dispatch_operation /* operation */) {
+        if (!telemetry_microbatch_observer_armed.load(std::memory_order_acquire)) {
+            return {};
+        }
         const telemetry_microbatch_control_snapshot snapshot = telemetry_microbatch_control_current();
         const telemetry_control_state & control = snapshot.control;
         telemetry_apply_side_controls_pre(control, snapshot.microbatch_generation);
@@ -2508,6 +2538,13 @@ private:
         load_progress_data load_progress_spec  (this, "spec_model");
 
         const bool is_resume = sleeping;
+
+        const char * telemetry_enabled_env = getenv("LLAMA_TELEMETRY");
+        if (!is_resume) {
+            SRV_INF("telemetry: %s (LLAMA_TELEMETRY=%s)\n",
+                    telemetry_enabled ? "enabled" : "disabled",
+                    telemetry_enabled_env ? telemetry_enabled_env : "unset");
+        }
 
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
@@ -2789,18 +2826,20 @@ private:
         telemetry_control_draft = {};
         telemetry_target_has_moe = llama_model_n_expert(model_tgt) > 0;
         telemetry_draft_has_moe = model_dft && llama_model_n_expert(model_dft) > 0;
-        telemetry_capture_dispatch_clock_anchor();
-        telemetry_target_dispatch_binding = { this, false };
-        ctx_tgt->set_dispatch_observer({
-            &telemetry_target_dispatch_binding,
-            telemetry_dispatch_pre_callback,
-        });
-        if (ctx_dft) {
-            telemetry_draft_dispatch_binding = { this, true };
-            ctx_dft->set_dispatch_observer({
-                &telemetry_draft_dispatch_binding,
+        if (telemetry_enabled) {
+            telemetry_capture_dispatch_clock_anchor();
+            telemetry_target_dispatch_binding = { this, false };
+            ctx_tgt->set_dispatch_observer({
+                &telemetry_target_dispatch_binding,
                 telemetry_dispatch_pre_callback,
             });
+            if (ctx_dft) {
+                telemetry_draft_dispatch_binding = { this, true };
+                ctx_dft->set_dispatch_observer({
+                    &telemetry_draft_dispatch_binding,
+                    telemetry_dispatch_pre_callback,
+                });
+            }
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -2976,7 +3015,7 @@ private:
             telemetry_event_max_bytes = (size_t) mib * 1024 * 1024;
         }
         const char * telemetry_spool_dir_env = getenv("LLAMA_TELEMETRY_SPOOL_DIR");
-        if (telemetry_spool_dir_env && *telemetry_spool_dir_env) {
+        if (telemetry_enabled && telemetry_spool_dir_env && *telemetry_spool_dir_env) {
             try {
                 telemetry_journal.start(
                     std::filesystem::path(telemetry_spool_dir_env),
@@ -2985,8 +3024,10 @@ private:
             } catch (const std::exception & exception) {
                 SRV_ERR("telemetry journal: path resolution failed: %s\n", exception.what());
             }
-        } else {
+        } else if (telemetry_enabled) {
             SRV_INF("telemetry journal: disabled; set LLAMA_TELEMETRY_SPOOL_DIR to enable uncapped disk capture\n");
+        } else {
+            SRV_INF("telemetry journal: disabled with tracing master switch\n");
         }
         const char * telemetry_kv_pressure_buffer_env = getenv("LLAMA_TELEMETRY_KV_PRESSURE_BUFFER_MIB");
         if (telemetry_kv_pressure_buffer_env) {
@@ -3004,7 +3045,9 @@ private:
                 1,
                 std::min((int) TELEMETRY_KV_REQUEST_WINDOW_MAX_CAPACITY, atoi(telemetry_kv_request_window_env)));
         }
-        telemetry_kv_snapshot_capture(false);
+        if (telemetry_enabled) {
+            telemetry_kv_snapshot_capture(false);
+        }
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
@@ -6121,6 +6164,9 @@ private:
     }
 
     void telemetry_append_serialized(uint64_t sequence, std::string serialized) {
+        if (!telemetry_enabled) {
+            return;
+        }
         auto shared = std::make_shared<const std::string>(std::move(serialized));
         telemetry_event_entry entry;
         entry.sequence = sequence;
@@ -6148,6 +6194,9 @@ private:
     }
 
     void telemetry_append(json event) {
+        if (!telemetry_enabled) {
+            return;
+        }
         event["schema_version"] = 1;
         event["server_instance_id"] = telemetry_server_instance_id;
         const uint64_t sequence = telemetry_next_event_sequence();
@@ -6180,6 +6229,9 @@ private:
     }
 
     void telemetry_append_with_serialized_bytes(json event) {
+        if (!telemetry_enabled) {
+            return;
+        }
         const uint64_t sequence = telemetry_next_event_sequence();
         telemetry_append_serialized(sequence, telemetry_serialize_with_serialized_bytes(std::move(event), sequence));
     }
@@ -6194,6 +6246,9 @@ private:
             int32_t n_tokens,
             int64_t started_us,
             int64_t completed_us) {
+        if (!telemetry_enabled || !telemetry_prompt_scan_armed.load(std::memory_order_acquire)) {
+            return;
+        }
         struct prompt_token_ref {
             const server_batch::token * token = nullptr;
             int32_t batch_index = 0;
@@ -9674,6 +9729,9 @@ private:
     }
 
     void telemetry_on_start(server_slot & slot) {
+        if (!telemetry_enabled) {
+            return;
+        }
         if (telemetry_kv_pressure_active && telemetry_control_current().kv_pressure_detail) {
             telemetry_kv_request_started(slot);
         }
@@ -9706,6 +9764,9 @@ private:
     }
 
     void telemetry_on_first_token(const server_slot & slot) {
+        if (!telemetry_enabled) {
+            return;
+        }
         telemetry_append({
             {"event", "first_token"},
             {"trace_id", slot.task->trace_id},
@@ -9740,24 +9801,26 @@ private:
         const char * wait_outcome = std::strcmp(outcome, "cancelled") == 0
             ? "cancelled"
             : std::strcmp(outcome, "error") == 0 ? "failed" : "resumed";
-        if (telemetry_kv_pressure_active) {
-            telemetry_kv_wait_finish_request(slot, wait_outcome, slot.stats.t_finalization_start);
-            telemetry_kv_request_finished(slot);
+        if (telemetry_enabled) {
+            if (telemetry_kv_pressure_active) {
+                telemetry_kv_wait_finish_request(slot, wait_outcome, slot.stats.t_finalization_start);
+                telemetry_kv_request_finished(slot);
+            }
+            telemetry_record_moe_routing_final_marker(slot, outcome);
+            gpu_telemetry.record_operation(
+                SERVER_GPU_OPERATION_REQUEST,
+                slot.task->trace_id,
+                slot.id,
+                slot.stats.t_arrival,
+                slot.stats.t_finalization_start,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                SERVER_GPU_TIMING_REQUEST_LIFECYCLE_WINDOW);
+            telemetry_store_token_candidate_detail(slot);
         }
-        telemetry_record_moe_routing_final_marker(slot, outcome);
-        gpu_telemetry.record_operation(
-            SERVER_GPU_OPERATION_REQUEST,
-            slot.task->trace_id,
-            slot.id,
-            slot.stats.t_arrival,
-            slot.stats.t_finalization_start,
-            -1,
-            -1,
-            -1,
-            -1,
-            -1,
-            SERVER_GPU_TIMING_REQUEST_LIFECYCLE_WINDOW);
-        telemetry_store_token_candidate_detail(slot);
 
         metrics.n_requests_total++;
         if (std::strcmp(outcome, "success") == 0) {
@@ -9801,6 +9864,10 @@ private:
             finish_reason = "stop";
         } else if (slot.stop == STOP_TYPE_LIMIT) {
             finish_reason = "length";
+        }
+
+        if (!telemetry_enabled) {
+            return;
         }
 
         json sampling = slot.task->params.to_json(false);
@@ -12026,6 +12093,7 @@ void server_routes::init_routes() {
                 }},
                 {"content_events", {{"state", "conditional"}, {"enable_with", "POST /props telemetry_control.request_content=true plus request request_content=true"}}},
             }},
+            {"tracing_enabled", ctx_server.telemetry_is_enabled()},
             {"telemetry_control", ctx_server.telemetry_control_capability_json()},
             {"content_policy", {
                 {"default", "metadata_only"},
@@ -12351,6 +12419,12 @@ void server_routes::init_routes() {
         auto res = create_response();
         if (!params.endpoint_props) {
             res->error(format_error_response("This server does not support changing global properties. Start it with `--props`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (!ctx_server.telemetry_is_enabled()) {
+            res->error(format_error_response(
+                "Tracing is disabled for this server process by LLAMA_TELEMETRY=0.",
+                ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
         if (params.api_keys.empty()) {
