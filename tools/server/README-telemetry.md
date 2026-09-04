@@ -46,6 +46,8 @@ The model router proxies these routes to a selected model in the same way as the
 
 `telemetry_control` is a full replacement, not a patch. Its only accepted fields are `moe_routing`, `output_token_detail`, `token_candidates`, `prompt_perplexity`, `request_content`, `kv_pressure_detail`, and `native_gpu_gpm`; every omitted field is false, so `{}` explicitly disables every control. The reply returns the complete effective set, per-control applicability, a monotonically increasing generation, and the boundary at which each control takes effect. `moe_routing`, `kv_pressure_detail`, and `native_gpu_gpm` take effect at the next microbatch. The remaining request-scoped controls take effect for the next request. Last apply wins, and state survives until an explicit replacement or process restart.
 
+In router mode, an authenticated `POST /props` without `model` stores the full replacement as the default for model children started later and returns `effective_from: "next_model_load"`. This does not load a model. A request with `model` keeps the existing model-targeted behavior. The router removes inherited child-default variables and creates the internal child setting only from an accepted control request.
+
 `GET /telemetry/v1/capabilities` advertises this static contract. `GET /telemetry/v1/snapshot` includes the current effective set and generation. Environment variables may still set telemetry bounds and buffer sizes, but they cannot enable a telemetry control.
 
 When the process was started with `LLAMA_TELEMETRY=0`, capabilities reports `tracing_enabled: false`, telemetry control reports unsupported, and `POST /props` cannot re-enable it. This preserves a clean no-tracing performance baseline until the process is restarted.

@@ -387,7 +387,8 @@ static std::vector<std::string> get_child_environment() {
     env.erase(std::remove_if(env.begin(), env.end(), [](const std::string & entry) {
         return is_env_var(entry, "LLAMA_API_KEY")
             || is_env_var(entry, "LLAMA_ARG_API_KEY_FILE")
-            || is_env_var(entry, "LLAMA_ARG_ENDPOINT_PROPS");
+            || is_env_var(entry, "LLAMA_ARG_ENDPOINT_PROPS")
+            || is_env_var(entry, "LLAMA_TELEMETRY_CONTROL_DEFAULTS");
     }), env.end());
     return env;
 }
@@ -1233,6 +1234,12 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
+uint64_t server_models::set_child_telemetry_control_defaults(const json & control) {
+    std::lock_guard<std::mutex> lock(mutex);
+    child_telemetry_control_defaults = control;
+    return ++child_telemetry_control_generation;
+}
+
 void server_models::unload_lru() {
     if (base_params.models_max <= 0) {
         return; // no limit
@@ -1324,6 +1331,9 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+        if (child_telemetry_control_defaults.is_object()) {
+            child_env.push_back("LLAMA_TELEMETRY_CONTROL_DEFAULTS=" + child_telemetry_control_defaults.dump());
+        }
         if (base_params.endpoint_props && !base_params.api_keys.empty()) {
             if (child_api_key_file.empty()) {
                 child_api_key_file = create_child_api_key_file(base_params.api_keys);
@@ -2248,6 +2258,68 @@ void server_models_routes::init_routes() {
         // client may have dropped during the wait (page reload) and the session buffer must
         // still receive the generation for a later resume
         return models.proxy_request(req, method, name, true, waited && ticket != 0); // update last usage for POST request only
+    };
+
+    this->post_props = [this](const server_http_req & req) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception &) {
+            auto res = std::make_unique<server_http_res>();
+            res_err(res, format_error_response("request body must be valid JSON", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (body.contains("model")) {
+            return proxy_post(req);
+        }
+
+        auto res = std::make_unique<server_http_res>();
+        if (!body.is_object() || !body.contains("telemetry_control") || !body.at("telemetry_control").is_object()) {
+            res_err(res, format_error_response("telemetry_control must be an object", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const json & control = body.at("telemetry_control");
+        static const std::set<std::string> names = {
+            "moe_routing",
+            "output_token_detail",
+            "token_candidates",
+            "prompt_perplexity",
+            "request_content",
+            "kv_pressure_detail",
+            "native_gpu_gpm",
+        };
+        for (const auto & item : control.items()) {
+            if (names.count(item.key()) == 0 || !item.value().is_boolean()) {
+                res_err(res, format_error_response(
+                    "telemetry_control accepts only the documented boolean controls", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        const auto value = [&](const char * name) {
+            return control.contains(name) && control.at(name).get<bool>();
+        };
+        if (value("token_candidates") && !value("output_token_detail")) {
+            res_err(res, format_error_response(
+                "telemetry_control.token_candidates requires telemetry_control.output_token_detail=true",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        json effective = json::object();
+        for (const std::string & name : names) {
+            effective[name] = value(name.c_str());
+        }
+        const uint64_t generation = models.set_child_telemetry_control_defaults(effective);
+        SRV_INF("stored telemetry defaults generation=%" PRIu64 " for future model children\n", generation);
+        res_ok(res, {
+            {"success", true},
+            {"telemetry_control", {
+                {"effective", std::move(effective)},
+                {"effective_from", "next_model_load"},
+                {"generation", generation},
+            }},
+        });
+        return res;
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {

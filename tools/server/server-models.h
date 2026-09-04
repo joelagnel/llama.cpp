@@ -201,6 +201,8 @@ private:
     std::string bin_path;
     std::vector<std::string> base_env;
     std::string child_api_key_file;
+    json child_telemetry_control_defaults = nullptr;
+    uint64_t child_telemetry_control_generation = 0;
     common_preset base_preset; // base preset from llama-server CLI args
 
     // queue of requests waiting for a models_max slot
@@ -247,6 +249,8 @@ public:
 
     // return a copy of all model metadata (thread-safe)
     std::vector<server_model_meta> get_all_meta();
+
+    uint64_t set_child_telemetry_control_defaults(const json & control);
 
     struct load_options {
         server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
@@ -359,6 +363,7 @@ struct server_models_routes {
     void init_routes();
     // handlers using lambda function, so that they can capture `this` without `std::bind`
     server_http_context::handler_t get_router_props;
+    server_http_context::handler_t post_props;
     server_http_context::handler_t proxy_get;
     server_http_context::handler_t proxy_post;
     server_http_context::handler_t get_router_models;

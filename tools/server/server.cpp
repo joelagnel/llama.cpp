@@ -247,7 +247,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.get_telemetry_kv            = models_routes->proxy_get;
         routes.get_telemetry_kv_pressure   = models_routes->proxy_get;
         routes.get_telemetry_gpu           = models_routes->proxy_get;
-        routes.post_props                  = [&params, &ctx_http, proxy = models_routes->proxy_post](const server_http_req & req) {
+        routes.post_props                  = [&params, &ctx_http, proxy = models_routes->post_props](const server_http_req & req) {
             return telemetry_control_router_guard(params, ctx_http, req, proxy);
         };
         routes.post_completions            = models_routes->proxy_post;

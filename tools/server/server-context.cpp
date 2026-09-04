@@ -3057,6 +3057,27 @@ private:
                 1,
                 std::min((int) TELEMETRY_KV_REQUEST_WINDOW_MAX_CAPACITY, atoi(telemetry_kv_request_window_env)));
         }
+        const char * telemetry_control_defaults_env = getenv("LLAMA_TELEMETRY_CONTROL_DEFAULTS");
+        if (telemetry_enabled && getenv("LLAMA_SERVER_ROUTER_PORT") && telemetry_control_defaults_env && *telemetry_control_defaults_env) {
+            try {
+                const json defaults = json::parse(telemetry_control_defaults_env);
+                const auto value = [&](const char * name) {
+                    return defaults.contains(name) && defaults.at(name).is_boolean() && defaults.at(name).get<bool>();
+                };
+                telemetry_control_state control;
+                control.moe_routing = value("moe_routing");
+                control.output_token_detail = value("output_token_detail");
+                control.token_candidates = value("token_candidates");
+                control.prompt_perplexity = value("prompt_perplexity");
+                control.request_content = value("request_content");
+                control.kv_pressure_detail = value("kv_pressure_detail");
+                control.native_gpu_gpm = value("native_gpu_gpm");
+                telemetry_control_apply(control);
+                SRV_INF("telemetry control: applied router defaults\n");
+            } catch (const std::exception & exception) {
+                SRV_WRN("telemetry control: ignored invalid router defaults: %s\n", exception.what());
+            }
+        }
         if (telemetry_enabled) {
             telemetry_kv_snapshot_capture(false);
         }
