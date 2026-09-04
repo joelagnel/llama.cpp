@@ -9539,6 +9539,8 @@ private:
                 {"candidate_detail_eligible_decisions", 0},
                 {"candidate_detail_dropped_decisions", 0},
                 {"candidate_detail_stored_bytes", 0},
+                {"candidate_detail_target_top_k", slot.task->params.output_token_candidate_top_k},
+                {"candidate_detail_includes_accepted_positions", slot.task->params.output_token_candidate_include_accepted},
                 {"mtp_pass_records", json::array()},
                 {"records", json::array()},
             };
@@ -9805,6 +9807,8 @@ private:
             {"candidate_detail_eligible_decisions", slot.telemetry_token_candidate_eligible_count},
             {"candidate_detail_dropped_decisions", slot.telemetry_token_candidate_dropped_count},
             {"candidate_detail_stored_bytes", slot.telemetry_token_candidate_stored_bytes},
+            {"candidate_detail_target_top_k", slot.task->params.output_token_candidate_top_k},
+            {"candidate_detail_includes_accepted_positions", slot.task->params.output_token_candidate_include_accepted},
             {"mtp_pass_records", std::move(mtp_pass_records)},
             {"records", std::move(records)},
         };
