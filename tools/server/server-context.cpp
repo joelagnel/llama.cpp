@@ -9506,6 +9506,7 @@ private:
             return {
                 {"schema_version", 3},
                 {"mtp_pass_record_schema_version", 2},
+                {"durable_detail_storage", "append-only-disk-journal"},
                 {"state", "not_enabled_for_request"},
                 {"reason", "request_did_not_set_output_token_telemetry=true"},
                 {"population", "committed_generation_tokens"},
@@ -9771,6 +9772,7 @@ private:
         return {
             {"schema_version", 3},
             {"mtp_pass_record_schema_version", 2},
+            {"durable_detail_storage", "append-only-disk-journal"},
             {"state", state},
             {"reason", reason},
             {"population", "committed_generation_tokens"},
