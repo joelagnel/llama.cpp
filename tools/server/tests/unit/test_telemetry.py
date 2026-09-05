@@ -1244,6 +1244,16 @@ def test_telemetry_lifecycle_cache_and_cursor():
     assert capabilities.body["capabilities"]["moe_routing"]["state"] == "not_applicable"
     assert capabilities.body["capabilities"]["output_token_telemetry"]["state"] == "conditional"
     assert "POST /props telemetry_control.output_token_detail=true" in capabilities.body["capabilities"]["output_token_telemetry"]["enable_with"]
+    capability_configuration = capabilities.body["configuration"]
+    assert capability_configuration["target_generation_threads"] >= 1
+    assert capability_configuration["target_batch_threads"] >= 1
+    assert capability_configuration["target_kv_cache_type_k"]
+    assert capability_configuration["target_kv_cache_type_v"]
+    assert capability_configuration["draft_context_active"] is False
+    assert capability_configuration["draft_generation_threads"] is None
+    assert capability_configuration["draft_batch_threads"] is None
+    assert capability_configuration["draft_kv_cache_type_k"] is None
+    assert capability_configuration["draft_kv_cache_type_v"] is None
 
     invalid_cursor = server.make_request("GET", "/telemetry/v1/events?cursor=-1")
     assert invalid_cursor.status_code == 400
@@ -1271,6 +1281,7 @@ def test_telemetry_lifecycle_cache_and_cursor():
     first_token = next(candidate for candidate in live_events if candidate["event"] == "first_token")
     assert started["prompt_tokens"] > 0
     assert started["server_configuration"]["parallel_slots"] >= 1
+    assert started["server_configuration"] == capability_configuration
     assert first_token["prompt_tokens"] == first_token["reused_prompt_tokens"] + first_token["evaluated_prompt_tokens"]
     assert 0 < first_token["matched_prefix_tokens"] <= first_token["prompt_tokens"]
     assert first_token["reused_prompt_tokens"] > 0

@@ -7096,6 +7096,14 @@ private:
     }
 
     json telemetry_server_configuration() const {
+        // Read threads from the initialized contexts rather than echoing command-line
+        // inputs. This captures the post-default/post-processing values actually used
+        // by target and (when active) draft inference.
+        const bool target_context_active = ctx_tgt != nullptr;
+        const bool draft_context_active = ctx_dft != nullptr && spec != nullptr;
+        const auto cache_type_name = [](ggml_type type) {
+            return std::string(ggml_type_name(type));
+        };
         return {
             {"parallel_slots", params_base.n_parallel},
             {"logical_batch_size", params_base.n_batch},
@@ -7103,6 +7111,15 @@ private:
             {"context_size", params_base.n_ctx},
             {"continuous_batching", params_base.cont_batching},
             {"unified_kv", params_base.kv_unified},
+            {"target_generation_threads", target_context_active ? json(llama_n_threads(ctx_tgt)) : json(nullptr)},
+            {"target_batch_threads", target_context_active ? json(llama_n_threads_batch(ctx_tgt)) : json(nullptr)},
+            {"target_kv_cache_type_k", target_context_active ? json(cache_type_name(params_base.cache_type_k)) : json(nullptr)},
+            {"target_kv_cache_type_v", target_context_active ? json(cache_type_name(params_base.cache_type_v)) : json(nullptr)},
+            {"draft_context_active", draft_context_active},
+            {"draft_generation_threads", draft_context_active ? json(llama_n_threads(ctx_dft)) : json(nullptr)},
+            {"draft_batch_threads", draft_context_active ? json(llama_n_threads_batch(ctx_dft)) : json(nullptr)},
+            {"draft_kv_cache_type_k", draft_context_active ? json(cache_type_name(params_base.speculative.draft.cache_type_k)) : json(nullptr)},
+            {"draft_kv_cache_type_v", draft_context_active ? json(cache_type_name(params_base.speculative.draft.cache_type_v)) : json(nullptr)},
         };
     }
 
@@ -12406,14 +12423,7 @@ void server_routes::init_routes() {
                 {"event_clock", "unix_milliseconds_anchored_at_http_handler_dispatch_after_body_read"},
                 {"process_start_unix_s", ctx_server.get_metrics().t_start_unix},
             }},
-            {"configuration", {
-                {"parallel_slots", params.n_parallel},
-                {"logical_batch_size", params.n_batch},
-                {"physical_ubatch_size", params.n_ubatch},
-                {"context_size", params.n_ctx},
-                {"continuous_batching", params.cont_batching},
-                {"unified_kv", params.kv_unified},
-            }},
+            {"configuration", ctx_server.telemetry_server_configuration()},
             {"capabilities", {
                 {"request_lifecycle", {{"state", "available"}, {"version", 1}}},
                 {"ttft", {{"state", "available"}, {"semantics", "first_model_token_minus_http_handler_dispatch_after_body_read"}}},
