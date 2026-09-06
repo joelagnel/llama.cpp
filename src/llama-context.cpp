@@ -4495,6 +4495,10 @@ llama_memory_primary_occupancy llama_context::memory_primary_occupancy() const {
     return llama_memory_primary_occupancy_collect(memory.get());
 }
 
+llama_memory_primary_distribution llama_context::memory_primary_distribution() const {
+    return llama_memory_primary_distribution_collect(memory.get());
+}
+
 llama_memory_diagnostics llama_context::memory_diagnostics() const {
     return llama_memory_diagnostics_collect(memory.get());
 }
@@ -5453,6 +5457,10 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_memory_primary_occupancy llama_get_memory_primary_occupancy(const struct llama_context * ctx) {
     return ctx ? ctx->memory_primary_occupancy() : llama_memory_primary_occupancy {};
+}
+
+llama_memory_primary_distribution llama_get_memory_primary_distribution(const struct llama_context * ctx) {
+    return ctx ? ctx->memory_primary_distribution() : llama_memory_primary_distribution {};
 }
 
 llama_memory_diagnostics llama_get_memory_diagnostics(const struct llama_context * ctx) {

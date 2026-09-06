@@ -48,6 +48,7 @@
 #include <set>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -1222,6 +1223,10 @@ struct server_slot {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else {
+            telemetry_kv_owner_trace_id.clear();
+            telemetry_kv_owner_task_id = -1;
+            telemetry_kv_owner_prompt_tokens = 0;
         }
 
         return res;
@@ -1233,6 +1238,9 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+        telemetry_kv_owner_trace_id.clear();
+        telemetry_kv_owner_task_id = -1;
+        telemetry_kv_owner_prompt_tokens = 0;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -1254,6 +1262,9 @@ struct server_slot {
     uint64_t telemetry_assignment_ordinal = 0;
     uint64_t telemetry_prefill_pass_ordinal = 0;
     json telemetry_pending_completion_event;
+    std::string telemetry_kv_owner_trace_id;
+    int32_t telemetry_kv_owner_task_id = -1;
+    int64_t telemetry_kv_owner_prompt_tokens = 0;
 
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
@@ -1701,6 +1712,15 @@ struct server_slot {
         other.prompt_probability = prompt_probability;
 
         other.prompt = prompt.clone();
+        if (task) {
+            other.telemetry_kv_owner_trace_id = task->trace_id;
+            other.telemetry_kv_owner_task_id = task->id;
+            other.telemetry_kv_owner_prompt_tokens = other.prompt.n_tokens();
+        } else {
+            other.telemetry_kv_owner_trace_id.clear();
+            other.telemetry_kv_owner_task_id = -1;
+            other.telemetry_kv_owner_prompt_tokens = 0;
+        }
         other.init_sampler();
     }
 };
@@ -2150,6 +2170,7 @@ public:
                 "decode_retry",
                 "decode_wait_finished",
                 "idle_slot_evicted",
+                "idle_slot_reassigned",
                 "context_shift",
             })},
             {"decode_wait_semantics", "llama_decode_returned_1_no_kv_slot_available"},
@@ -2259,6 +2280,20 @@ private:
         uint64_t released_entries = 0;
         uint64_t memberships_removed = 0;
     };
+    struct telemetry_kv_slot_reassignment {
+        std::string previous_trace_id;
+        int32_t previous_task_id = -1;
+        std::string replacement_trace_id;
+        int32_t replacement_task_id = -1;
+        int64_t previous_prompt_tokens = 0;
+        int64_t replacement_prompt_tokens = 0;
+        int64_t reused_prefix_entries = 0;
+        bool previous_entries_available = false;
+        uint64_t previous_entries = 0;
+        uint64_t memberships_removed_before = 0;
+        bool memory_replaced = false;
+        bool capture_event = false;
+    };
     struct telemetry_kv_slot_snapshot {
         int32_t id = -1;
         std::vector<llama_token> tokens;
@@ -2319,6 +2354,7 @@ private:
     std::string telemetry_kv_primary_entry_semantics;
     telemetry_kv_boundary_snapshot telemetry_kv_boundary;
     telemetry_kv_wait_episode telemetry_kv_wait;
+    std::unordered_map<int32_t, telemetry_kv_slot_reassignment> telemetry_kv_pending_reassignments;
     std::vector<uint64_t> telemetry_slot_marks;
     uint64_t telemetry_slot_epoch = 0;
     mutable std::mutex mutex_telemetry_events;
@@ -3273,6 +3309,131 @@ private:
         return nullptr;
     }
 
+    uint64_t telemetry_kv_slot_entries(int32_t slot_id, bool & available) const {
+        const llama_memory_primary_distribution distribution = llama_get_memory_primary_distribution(ctx_tgt);
+        available = distribution.available;
+        uint64_t entries = 0;
+        if (!available) {
+            return 0;
+        }
+        for (const llama_memory_sequence_group & group : distribution.groups) {
+            if (std::find(group.sequence_ids.begin(), group.sequence_ids.end(), slot_id) != group.sequence_ids.end()) {
+                entries += group.entries;
+            }
+        }
+        return entries;
+    }
+
+    void telemetry_kv_prepare_slot_reassignment(server_slot & slot, const server_task & task) {
+        const bool reassignment = !params_base.kv_unified &&
+            !slot.is_processing() &&
+            !slot.telemetry_kv_owner_trace_id.empty() &&
+            slot.prompt.n_tokens() > 0 &&
+            slot.telemetry_kv_owner_trace_id != task.trace_id;
+        if (!reassignment) {
+            telemetry_kv_pending_reassignments.erase(slot.id);
+            return;
+        }
+
+        const bool capture_event = telemetry_kv_pressure_active &&
+            telemetry_control_current().kv_pressure_detail;
+        bool previous_entries_available = false;
+        const uint64_t previous_entries = capture_event
+            ? telemetry_kv_slot_entries(slot.id, previous_entries_available)
+            : 0;
+        const llama_memory_diagnostics diagnostics = capture_event
+            ? llama_get_memory_diagnostics(ctx_tgt)
+            : llama_memory_diagnostics();
+        telemetry_kv_pending_reassignments[slot.id] = {
+            slot.telemetry_kv_owner_trace_id,
+            slot.telemetry_kv_owner_task_id,
+            task.trace_id,
+            task.id,
+            slot.telemetry_kv_owner_prompt_tokens,
+            (int64_t) task.tokens.size(),
+            (int64_t) slot.prompt.tokens.get_common_prefix(task.tokens),
+            previous_entries_available,
+            previous_entries,
+            diagnostics.churn.memberships_removed,
+            false,
+            capture_event,
+        };
+    }
+
+    void telemetry_kv_mark_slot_memory_replaced(int32_t slot_id) {
+        const auto pending = telemetry_kv_pending_reassignments.find(slot_id);
+        if (pending != telemetry_kv_pending_reassignments.end()) {
+            pending->second.memory_replaced = true;
+        }
+    }
+
+    void telemetry_kv_cancel_slot_reassignment(int32_t slot_id) {
+        telemetry_kv_pending_reassignments.erase(slot_id);
+    }
+
+    void telemetry_kv_complete_slot_reassignment(
+            server_slot & slot,
+            int64_t reused_prefix_entries,
+            uint64_t memberships_removed_before) {
+        const auto pending = telemetry_kv_pending_reassignments.find(slot.id);
+        if (pending == telemetry_kv_pending_reassignments.end()) {
+            return;
+        }
+
+        const telemetry_kv_slot_reassignment reassignment = pending->second;
+        telemetry_kv_pending_reassignments.erase(pending);
+        slot.telemetry_kv_owner_trace_id = reassignment.replacement_trace_id;
+        slot.telemetry_kv_owner_task_id = reassignment.replacement_task_id;
+        slot.telemetry_kv_owner_prompt_tokens = slot.prompt.n_tokens();
+
+        if (!reassignment.capture_event || !telemetry_kv_pressure_active ||
+                !telemetry_control_current().kv_pressure_detail) {
+            return;
+        }
+
+        const uint64_t reused_entries = reassignment.previous_entries_available
+            ? std::min<uint64_t>(reassignment.previous_entries, std::max<int64_t>(0, reused_prefix_entries))
+            : 0;
+        const llama_memory_diagnostics diagnostics_after = llama_get_memory_diagnostics(ctx_tgt);
+        const uint64_t memberships_removed = diagnostics_after.churn.memberships_removed >=
+                memberships_removed_before
+            ? diagnostics_after.churn.memberships_removed - memberships_removed_before
+            : 0;
+        const uint64_t released_entries = reassignment.previous_entries_available
+            ? reassignment.previous_entries - reused_entries
+            : 0;
+        const bool memberships_removed_available = !reassignment.memory_replaced ||
+            released_entries == 0 || memberships_removed > 0;
+        telemetry_kv_pressure_append({
+            {"kind", "idle_slot_reassigned"},
+            {"cause", "slot_reassignment"},
+            {"eviction_reason", "dedicated non-unified KV slot reassigned to replacement work"},
+            {"trace_id", reassignment.replacement_trace_id},
+            {"task_id", reassignment.replacement_task_id},
+            {"slot_id", slot.id},
+            {"role", "target"},
+            {"victim_slot_id", slot.id},
+            {"victim_trace_id", reassignment.previous_trace_id},
+            {"victim_task_id", reassignment.previous_task_id},
+            {"victim_prompt_tokens", reassignment.previous_prompt_tokens},
+            {"replacement_prompt_tokens", reassignment.replacement_prompt_tokens},
+            {"reused_prefix_entries", reused_entries},
+            {"released_entries_state", reassignment.previous_entries_available ? "available" : "unavailable"},
+            {"released_entries_reason", reassignment.previous_entries_available
+                ? "retained physical entries minus the reused prefix"
+                : "primary sequence distribution was unavailable before reassignment"},
+            {"released_entries", reassignment.previous_entries_available
+                ? json(released_entries)
+                : json(nullptr)},
+            {"memberships_removed_state", memberships_removed_available ? "available" : "unavailable"},
+            {"memberships_removed_reason", memberships_removed_available
+                ? "monotonic memory-backend churn delta"
+                : "prompt-cache state replacement did not expose a membership-removal delta"},
+            {"memberships_removed", memberships_removed_available ? json(memberships_removed) : json(nullptr)},
+        });
+        telemetry_kv_pressure_sample(ggml_time_us(), true);
+    }
+
     server_slot * get_available_slot(server_task & task) {
         server_slot * ret = nullptr;
 
@@ -3368,6 +3529,7 @@ private:
         }
 
         if (ret) {
+            telemetry_kv_prepare_slot_reassignment(*ret, task);
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -3383,6 +3545,7 @@ private:
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
+                telemetry_kv_mark_slot_memory_replaced(ret->id);
 
                 prompt_cache->update();
 
@@ -3402,9 +3565,7 @@ private:
         }
         result.victim_slot_id = slot.id;
         result.victim_prompt_tokens = slot.prompt.n_tokens();
-        if (slot.task_prev) {
-            result.victim_trace_id = slot.task_prev->trace_id;
-        }
+        result.victim_trace_id = slot.telemetry_kv_owner_trace_id;
         const llama_memory_primary_occupancy occupancy_before = llama_get_memory_primary_occupancy(ctx_tgt);
         const llama_memory_diagnostics diagnostics_before = llama_get_memory_diagnostics(ctx_tgt);
         slot.prompt_clear();
@@ -3582,6 +3743,15 @@ private:
             : SLOT_STATE_STARTED;
 
         telemetry_on_start(slot);
+
+        const auto pending_reassignment = telemetry_kv_pending_reassignments.find(slot.id);
+        if (pending_reassignment != telemetry_kv_pending_reassignments.end() &&
+                pending_reassignment->second.memory_replaced) {
+            telemetry_kv_complete_slot_reassignment(
+                slot,
+                pending_reassignment->second.reused_prefix_entries,
+                pending_reassignment->second.memberships_removed_before);
+        }
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -3821,7 +3991,14 @@ private:
             case ERROR_TYPE_NOT_SUPPORTED: category = "not_supported"; break;
             case ERROR_TYPE_UNAVAILABLE: category = "unavailable"; break;
             case ERROR_TYPE_EXCEED_CONTEXT_SIZE: category = "context_size"; break;
-            case ERROR_TYPE_SERVER: break;
+            case ERROR_TYPE_SERVER:
+                // A shared unified KV pool can run out after request admission,
+                // so this remains an HTTP server error while telemetry retains
+                // the precise performance-diagnostic category.
+                if (error == "Context size has been exceeded.") {
+                    category = "context_size";
+                }
+                break;
         }
         telemetry_finalize(slot, "error", error, category);
         const int64_t t_handoff = send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx, slot.task->trace_id);
@@ -4104,7 +4281,9 @@ private:
             parent_task.child_tasks[idx].t_slot_start = parent_task.t_slot_start;
             parent_task.child_tasks[idx].t_cache_start = parent_task.t_cache_start;
             int id_child = parent_task.child_tasks[idx].id;
+            telemetry_kv_prepare_slot_reassignment(*slot, parent_task.child_tasks[idx]);
             if (!launch_slot_with_task(*slot, std::move(parent_task.child_tasks[idx]))) {
+                telemetry_kv_cancel_slot_reassignment(slot->id);
                 SRV_ERR("failed to launch slot with child task, id_task = %d\n", id_child);
                 release_slots();
                 return false;
@@ -4229,10 +4408,12 @@ private:
                             break;
                         }
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
+                            telemetry_kv_cancel_slot_reassignment(slot->id);
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
                         }
                     } else if (!launch_slot_with_task(*slot, std::move(task))) {
+                        telemetry_kv_cancel_slot_reassignment(slot->id);
                         SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                         break; // drop the task
                     }
@@ -5345,7 +5526,14 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
+                    const auto pending_reassignment = telemetry_kv_pending_reassignments.find(slot.id);
+                    const uint64_t memberships_removed_before =
+                        pending_reassignment != telemetry_kv_pending_reassignments.end() &&
+                            pending_reassignment->second.capture_event
+                        ? llama_get_memory_diagnostics(ctx_tgt).churn.memberships_removed
+                        : 0;
                     slot.mem.seq_rm(slot.id, p0, -1);
+                    telemetry_kv_complete_slot_reassignment(slot, p0, memberships_removed_before);
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -5776,7 +5964,14 @@ private:
 
                     GGML_ASSERT(child->state == SLOT_STATE_WAIT_OTHER);
 
+                    const auto pending_reassignment = telemetry_kv_pending_reassignments.find(child->id);
+                    const uint64_t memberships_removed_before =
+                        pending_reassignment != telemetry_kv_pending_reassignments.end() &&
+                            pending_reassignment->second.capture_event
+                        ? llama_get_memory_diagnostics(ctx_tgt).churn.memberships_removed
+                        : 0;
                     slot.copy_state_to(*child);
+                    telemetry_kv_complete_slot_reassignment(*child, 0, memberships_removed_before);
                     child->state = SLOT_STATE_DONE_PROMPT;
                 }
             }
@@ -6655,14 +6850,95 @@ private:
         telemetry_kv_pressure_last_sample_us = monotonic_us;
 
         const llama_memory_primary_occupancy occupancy = llama_get_memory_primary_occupancy(ctx_tgt);
+        const llama_memory_primary_distribution distribution = llama_get_memory_primary_distribution(ctx_tgt);
         const bool valid = occupancy.available && occupancy.capacity_entries > 0 &&
             occupancy.used_entries <= occupancy.capacity_entries;
+        const bool distribution_valid = valid && distribution.available &&
+            distribution.capacity_entries == occupancy.capacity_entries &&
+            distribution.used_entries == occupancy.used_entries;
         const char * state = valid ? "available" : occupancy.available ? "no_data" : "unsupported";
         const char * reason = valid
             ? "authoritative lightweight primary memory occupancy"
             : occupancy.available
                 ? "the primary memory component has no usable capacity"
                 : "the active memory backend does not expose primary occupancy";
+        const char * distribution_state = distribution_valid
+            ? "available"
+            : distribution.available ? "no_data" : "unsupported";
+        const char * distribution_reason = distribution_valid
+            ? "exact physical primary-memory groups by complete sequence membership"
+            : distribution.available
+                ? "the physical distribution did not match primary occupancy"
+                : "the active memory backend does not expose sequence distribution";
+
+        const auto slot_phase = [](slot_state state) -> const char * {
+            switch (state) {
+                case SLOT_STATE_WAIT_OTHER:        return "waiting_for_parent";
+                case SLOT_STATE_STARTED:           return "starting";
+                case SLOT_STATE_PROCESSING_PROMPT: return "prefill";
+                case SLOT_STATE_DONE_PROMPT:       return "prefill_complete";
+                case SLOT_STATE_GENERATING:        return "decode";
+                case SLOT_STATE_IDLE:              return "idle";
+            }
+            return "unknown";
+        };
+        json distribution_groups = json::array();
+        if (distribution_valid) {
+            for (const llama_memory_sequence_group & group : distribution.groups) {
+                json members = json::array();
+                for (const llama_seq_id sequence_id : group.sequence_ids) {
+                    const server_slot * slot = sequence_id >= 0 && (size_t) sequence_id < slots.size()
+                        ? &slots[(size_t) sequence_id]
+                        : nullptr;
+                    const auto pending = slot
+                        ? telemetry_kv_pending_reassignments.find(slot->id)
+                        : telemetry_kv_pending_reassignments.end();
+                    const bool retained_pending = pending != telemetry_kv_pending_reassignments.end() &&
+                        !pending->second.memory_replaced;
+                    const bool active = slot && slot->is_processing() && !retained_pending;
+                    const std::string * trace_id = retained_pending
+                        ? &pending->second.previous_trace_id
+                        : active && slot->task
+                            ? &slot->task->trace_id
+                            : slot && !slot->telemetry_kv_owner_trace_id.empty()
+                                ? &slot->telemetry_kv_owner_trace_id
+                                : nullptr;
+                    const int32_t task_id = retained_pending
+                        ? pending->second.previous_task_id
+                        : active && slot->task
+                            ? slot->task->id
+                            : slot ? slot->telemetry_kv_owner_task_id : -1;
+                    const int64_t prompt_tokens = retained_pending
+                        ? pending->second.previous_prompt_tokens
+                        : active && slot
+                            ? slot->prompt.n_tokens()
+                            : slot ? slot->telemetry_kv_owner_prompt_tokens : 0;
+                    members.push_back({
+                        {"slot_id", slot ? json(slot->id) : json(nullptr)},
+                        {"trace_id", trace_id && !trace_id->empty() ? json(*trace_id) : json(nullptr)},
+                        {"task_id", task_id >= 0 ? json(task_id) : json(nullptr)},
+                        {"lifecycle", retained_pending ? "retained_idle" : active ? "active" : trace_id ? "retained_idle" : "unknown"},
+                        {"phase", retained_pending ? json("idle") : slot ? json(slot_phase(slot->state)) : json("unknown")},
+                        {"prompt_tokens", prompt_tokens > 0 ? json(prompt_tokens) : json(nullptr)},
+                    });
+                }
+                if (members.empty()) {
+                    members.push_back({
+                        {"slot_id", nullptr},
+                        {"trace_id", nullptr},
+                        {"task_id", nullptr},
+                        {"lifecycle", "unknown"},
+                        {"phase", "unknown"},
+                        {"prompt_tokens", nullptr},
+                    });
+                }
+                distribution_groups.push_back({
+                    {"entries", group.entries},
+                    {"shared", group.sequence_ids.size() > 1},
+                    {"members", std::move(members)},
+                });
+            }
+        }
         telemetry_kv_pressure_append({
             {"kind", "utilization_sample"},
             {"monotonic_us", monotonic_us},
@@ -6675,6 +6951,10 @@ private:
             {"used_entries", valid ? json(occupancy.used_entries) : json(nullptr)},
             {"free_entries", valid ? json(occupancy.capacity_entries - occupancy.used_entries) : json(nullptr)},
             {"utilization", valid ? json((double) occupancy.used_entries / occupancy.capacity_entries) : json(nullptr)},
+            {"distribution_state", distribution_state},
+            {"distribution_reason", distribution_reason},
+            {"shared_entries", distribution_valid ? json(distribution.shared_entries) : json(nullptr)},
+            {"distribution_groups", std::move(distribution_groups)},
         });
     }
 
@@ -6699,7 +6979,9 @@ private:
         while (telemetry_kv_request_windows.size() > telemetry_kv_request_window_capacity) {
             telemetry_kv_request_windows.pop_front();
         }
-        telemetry_kv_pressure_sample(ggml_time_us(), true);
+        if (telemetry_kv_pending_reassignments.find(slot.id) == telemetry_kv_pending_reassignments.end()) {
+            telemetry_kv_pressure_sample(ggml_time_us(), true);
+        }
         telemetry_kv_archive_request_window(telemetry_kv_request_windows.back());
     }
 
@@ -10477,6 +10759,18 @@ private:
     }
 
     void telemetry_on_release(server_slot & slot) {
+        const bool is_child = slot.task && slot.task->is_child();
+        const bool unresolved_reassignment = telemetry_kv_pending_reassignments.erase(slot.id) > 0;
+        if (!is_child && !unresolved_reassignment && slot.task && slot.prompt.n_tokens() > 0) {
+            slot.telemetry_kv_owner_trace_id = slot.task->trace_id;
+            slot.telemetry_kv_owner_task_id = slot.task->id;
+            slot.telemetry_kv_owner_prompt_tokens = slot.prompt.n_tokens();
+        }
+        if (!is_child && telemetry_kv_pressure_active && telemetry_control_current().kv_pressure_detail) {
+            // release() has already transitioned the slot to idle, while task and
+            // prompt identity are still available for an exact retained-state sample.
+            telemetry_kv_pressure_sample(slot.stats.t_release, true);
+        }
         if (!slot.telemetry_finalized || slot.telemetry_pending_completion_event.is_null()) {
             return;
         }

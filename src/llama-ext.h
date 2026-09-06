@@ -315,6 +315,23 @@ struct llama_memory_primary_occupancy {
     uint64_t used_entries = 0;
 };
 
+// Exact physical-entry groups in the logical primary memory component. Each
+// used entry belongs to exactly one group, keyed by the complete set of
+// sequences that reference it. Summing group entry counts therefore yields
+// used_entries without double-counting shared prefixes.
+struct llama_memory_sequence_group {
+    std::vector<llama_seq_id> sequence_ids;
+    uint64_t entries = 0;
+};
+
+struct llama_memory_primary_distribution {
+    bool available = false;
+    uint64_t capacity_entries = 0;
+    uint64_t used_entries = 0;
+    uint64_t shared_entries = 0;
+    std::vector<llama_memory_sequence_group> groups;
+};
+
 // A copy of memory data collected at one context boundary. A shallow snapshot
 // has only primary occupancy. Set include_diagnostics for a deep snapshot.
 struct llama_memory_snapshot {
@@ -324,6 +341,7 @@ struct llama_memory_snapshot {
 };
 
 LLAMA_API llama_memory_primary_occupancy llama_get_memory_primary_occupancy(const struct llama_context * ctx);
+LLAMA_API llama_memory_primary_distribution llama_get_memory_primary_distribution(const struct llama_context * ctx);
 LLAMA_API llama_memory_diagnostics llama_get_memory_diagnostics(const struct llama_context * ctx);
 LLAMA_API llama_memory_snapshot llama_get_memory_snapshot(
         const struct llama_context * ctx,

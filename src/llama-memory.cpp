@@ -120,6 +120,109 @@ llama_memory_primary_occupancy llama_memory_primary_occupancy_collect(const llam
     return {};
 }
 
+static llama_memory_primary_distribution kv_primary_distribution(const llama_kv_cache & kv) {
+    llama_memory_primary_distribution result;
+    result.available = true;
+    result.capacity_entries = (uint64_t) kv.get_size() * kv.get_n_stream();
+
+    std::map<std::vector<llama_seq_id>, uint64_t> groups;
+    for (uint32_t stream = 0; stream < kv.get_n_stream(); ++stream) {
+        const auto & cells = kv.get_cells_by_stream(stream);
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i)) {
+                continue;
+            }
+
+            std::vector<llama_seq_id> sequence_ids;
+            const int fanout = cells.seq_count(i);
+            sequence_ids.reserve((size_t) fanout);
+            if (fanout == 1) {
+                sequence_ids.push_back(cells.seq_get(i));
+            } else {
+                int remaining = fanout;
+                for (llama_seq_id seq_id = 0; remaining > 0 && seq_id < LLAMA_MAX_SEQ; ++seq_id) {
+                    if (cells.seq_has(i, seq_id)) {
+                        sequence_ids.push_back(seq_id);
+                        --remaining;
+                    }
+                }
+            }
+
+            result.used_entries++;
+            if (sequence_ids.size() > 1) {
+                result.shared_entries++;
+            }
+            groups[std::move(sequence_ids)]++;
+        }
+    }
+
+    result.groups.reserve(groups.size());
+    for (auto & [sequence_ids, entries] : groups) {
+        result.groups.push_back({ std::move(sequence_ids), entries });
+    }
+    return result;
+}
+
+static llama_memory_primary_distribution recurrent_primary_distribution(const llama_memory_recurrent & memory) {
+    llama_memory_primary_distribution result;
+    result.available = true;
+    result.capacity_entries = memory.size;
+
+    std::map<std::vector<llama_seq_id>, uint64_t> groups;
+    for (const auto & cell : memory.cells) {
+        if (cell.is_empty()) {
+            continue;
+        }
+
+        std::vector<llama_seq_id> sequence_ids(cell.seq_id.begin(), cell.seq_id.end());
+        result.used_entries++;
+        if (sequence_ids.size() > 1) {
+            result.shared_entries++;
+        }
+        groups[std::move(sequence_ids)]++;
+    }
+
+    result.groups.reserve(groups.size());
+    for (auto & [sequence_ids, entries] : groups) {
+        result.groups.push_back({ std::move(sequence_ids), entries });
+    }
+    return result;
+}
+
+llama_memory_primary_distribution llama_memory_primary_distribution_collect(const llama_memory_i * memory) {
+    if (!memory) {
+        return {};
+    }
+    if (const auto * kv = dynamic_cast<const llama_kv_cache *>(memory)) {
+        return kv_primary_distribution(*kv);
+    }
+    if (const auto * recurrent = dynamic_cast<const llama_memory_recurrent *>(memory)) {
+        return recurrent_primary_distribution(*recurrent);
+    }
+    if (const auto * iswa = dynamic_cast<const llama_kv_cache_iswa *>(memory)) {
+        return llama_memory_primary_distribution_collect(iswa->get_base());
+    }
+    if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory)) {
+        return llama_memory_primary_distribution_collect(hybrid->get_mem_attn());
+    }
+    if (const auto * hybrid_iswa = dynamic_cast<const llama_memory_hybrid_iswa *>(memory)) {
+        return llama_memory_primary_distribution_collect(hybrid_iswa->get_mem_attn());
+    }
+    if (const auto * dsa = dynamic_cast<const llama_kv_cache_dsa *>(memory)) {
+        return llama_memory_primary_distribution_collect(dsa->get_mla());
+    }
+    if (const auto * dsa_iswa = dynamic_cast<const llama_kv_cache_dsa_iswa *>(memory)) {
+        return llama_memory_primary_distribution_collect(dsa_iswa->get_dsa());
+    }
+    if (const auto * msa = dynamic_cast<const llama_kv_cache_msa *>(memory)) {
+        return llama_memory_primary_distribution_collect(msa->get_base());
+    }
+    if (const auto * dsv4 = dynamic_cast<const llama_kv_cache_dsv4 *>(memory)) {
+        return llama_memory_primary_distribution_collect(dsv4->get_raw());
+    }
+    return {};
+}
+
 static llama_memory_component_diagnostics kv_component_diagnostics(
         const llama_kv_cache & kv,
         std::string name,
