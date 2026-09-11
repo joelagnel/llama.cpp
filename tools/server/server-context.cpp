@@ -17,6 +17,7 @@
 #include "src/llama-ext.h"
 #include "src/llama-context.h"
 #include "src/llama-graph.h"
+#include "src/llama-model.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -2299,13 +2300,27 @@ private:
         std::vector<llama_token> tokens;
         std::string compatibility;
     };
+    struct telemetry_kv_routed_expert_payload {
+        bool applicable = false;
+        bool available = false;
+        std::map<ggml_backend_buffer_type_t, size_t> by_buffer_type;
+    };
     struct telemetry_kv_boundary_snapshot {
         llama_memory_snapshot memory;
         llama_memory_breakdown breakdown;
+        llama_memory_breakdown draft_breakdown;
+        telemetry_kv_routed_expert_payload target_cpu_routed_expert_payload;
+        telemetry_kv_routed_expert_payload draft_cpu_routed_expert_payload;
+        int64_t timestamp_unix_ms = 0;
         int64_t monotonic_us = 0;
         uint64_t resident_slot_tokens = 0;
+        size_t prompt_cache_payload_bytes = 0;
+        size_t active_checkpoint_payload_bytes = 0;
         size_t represented_slots = 0;
         size_t multimodal_sequences_skipped = 0;
+        bool draft_active = false;
+        bool draft_shares_target_model = false;
+        bool prompt_cache_active = false;
         std::vector<telemetry_kv_slot_snapshot> slots;
         bool available = false;
     };
@@ -2353,6 +2368,8 @@ private:
     std::string telemetry_kv_primary_memory_kind;
     std::string telemetry_kv_primary_entry_semantics;
     telemetry_kv_boundary_snapshot telemetry_kv_boundary;
+    telemetry_kv_routed_expert_payload telemetry_target_cpu_routed_expert_payload;
+    telemetry_kv_routed_expert_payload telemetry_draft_cpu_routed_expert_payload;
     telemetry_kv_wait_episode telemetry_kv_wait;
     std::unordered_map<int32_t, telemetry_kv_slot_reassignment> telemetry_kv_pending_reassignments;
     std::vector<uint64_t> telemetry_slot_marks;
@@ -3214,6 +3231,10 @@ private:
             }
         }
         if (telemetry_enabled) {
+            telemetry_target_cpu_routed_expert_payload = telemetry_kv_routed_expert_payload_capture(llama_get_model(ctx_tgt));
+            telemetry_draft_cpu_routed_expert_payload = ctx_dft && llama_get_model(ctx_tgt) != llama_get_model(ctx_dft)
+                ? telemetry_kv_routed_expert_payload_capture(llama_get_model(ctx_dft))
+                : telemetry_kv_routed_expert_payload {};
             telemetry_kv_snapshot_capture(false);
         }
         if (params_base.cache_idle_slots) {
@@ -6706,16 +6727,87 @@ private:
         };
     }
 
+    static telemetry_kv_routed_expert_payload telemetry_kv_routed_expert_payload_capture(const llama_model * model) {
+        telemetry_kv_routed_expert_payload result;
+        if (model == nullptr || llama_model_n_expert(model) <= 0) {
+            return result;
+        }
+
+        result.applicable = true;
+        bool complete = true;
+        std::set<const ggml_tensor *> tensors;
+        for (const llama_layer & layer : model->layers) {
+            const ggml_tensor * const layer_tensors[] = {
+                layer.ffn_norm_exps,
+                layer.ffn_gate_exps,
+                layer.ffn_down_exps,
+                layer.ffn_up_exps,
+                layer.ffn_gate_up_exps,
+                layer.ffn_gate_exps_b,
+                layer.ffn_down_exps_b,
+                layer.ffn_up_exps_b,
+                layer.ffn_gate_up_exps_b,
+                layer.ffn_gate_exps_s,
+                layer.ffn_down_exps_s,
+                layer.ffn_up_exps_s,
+                layer.ffn_gate_exps_in_s,
+                layer.ffn_down_exps_in_s,
+                layer.ffn_up_exps_in_s,
+                layer.ffn_gate_chexps,
+                layer.ffn_down_chexps,
+                layer.ffn_up_chexps,
+            };
+            for (const ggml_tensor * tensor : layer_tensors) {
+                if (tensor == nullptr) {
+                    continue;
+                }
+                tensors.insert(tensor);
+            }
+        }
+
+        for (const ggml_tensor * tensor : tensors) {
+            if (tensor->buffer == nullptr) {
+                complete = false;
+                continue;
+            }
+            const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+            if (ggml_backend_buft_is_host(buft)) {
+                result.by_buffer_type[buft] += ggml_nbytes(tensor);
+            }
+        }
+
+        result.available = complete && !tensors.empty();
+        if (!result.available) {
+            result.by_buffer_type.clear();
+        }
+        return result;
+    }
+
     void telemetry_kv_snapshot_capture(bool include_diagnostics) {
         telemetry_kv_boundary_snapshot snapshot;
+        snapshot.timestamp_unix_ms = telemetry_wall_unix_ms();
+        snapshot.monotonic_us = ggml_time_us();
         snapshot.memory = llama_get_memory_snapshot(ctx_tgt, include_diagnostics);
         snapshot.breakdown = llama_get_memory_breakdown(ctx_tgt);
-        snapshot.monotonic_us = ggml_time_us();
+        snapshot.draft_active = ctx_dft != nullptr;
+        snapshot.draft_shares_target_model = snapshot.draft_active &&
+            llama_get_model(ctx_tgt) == llama_get_model(ctx_dft);
+        if (snapshot.draft_active) {
+            snapshot.draft_breakdown = llama_get_memory_breakdown(ctx_dft);
+        }
+        snapshot.target_cpu_routed_expert_payload = telemetry_target_cpu_routed_expert_payload;
+        snapshot.draft_cpu_routed_expert_payload = telemetry_draft_cpu_routed_expert_payload;
+        snapshot.prompt_cache_active = prompt_cache != nullptr;
+        snapshot.prompt_cache_payload_bytes = prompt_cache ? prompt_cache->size() : 0;
         snapshot.available = true;
 
         for (const auto & slot : slots) {
             snapshot.resident_slot_tokens += slot.prompt.n_tokens();
             snapshot.represented_slots += slot.prompt.n_tokens() > 0 ? 1 : 0;
+            snapshot.active_checkpoint_payload_bytes += slot.spec_ckpt.size();
+            for (const auto & checkpoint : slot.prompt.checkpoints) {
+                snapshot.active_checkpoint_payload_bytes += checkpoint.size();
+            }
             if (!include_diagnostics) {
                 continue;
             }
@@ -11190,6 +11282,174 @@ private:
         };
     }
 
+    static json telemetry_memory_buffer_type_json(ggml_backend_buffer_type_t buft) {
+        const bool is_host = ggml_backend_buft_is_host(buft);
+        json result = {
+            {"buffer_type", ggml_backend_buft_name(buft)},
+            {"memory_location", is_host ? "host" : "device"},
+        };
+        if (auto * device = ggml_backend_buft_get_device(buft)) {
+            result["device"] = ggml_backend_dev_name(device);
+        } else {
+            result["device"] = "host";
+        }
+        return result;
+    }
+
+    static json telemetry_kv_routed_expert_payload_json(
+            const telemetry_kv_routed_expert_payload & payload,
+            const char * unavailable_reason) {
+        if (!payload.applicable) {
+            return {
+                {"applicability", "not_applicable"},
+                {"state", "not_applicable"},
+                {"reason", unavailable_reason},
+                {"source", "llama_model routed-expert tensor buffer metadata"},
+                {"basis", "host-backed ggml tensor payload bytes; a non-additive subset of model_bytes"},
+                {"payload_bytes", nullptr},
+                {"by_buffer_type", json::array()},
+            };
+        }
+        if (!payload.available) {
+            return {
+                {"applicability", "applicable"},
+                {"state", "not_captured"},
+                {"reason", "routed-expert tensor placement was not fully available"},
+                {"source", "llama_model routed-expert tensor buffer metadata"},
+                {"basis", "host-backed ggml tensor payload bytes; a non-additive subset of model_bytes"},
+                {"payload_bytes", nullptr},
+                {"by_buffer_type", json::array()},
+            };
+        }
+
+        size_t total = 0;
+        json by_buffer_type = json::array();
+        for (const auto & [buft, bytes] : payload.by_buffer_type) {
+            json row = telemetry_memory_buffer_type_json(buft);
+            row["routed_expert_tensor_payload_bytes"] = bytes;
+            by_buffer_type.push_back(std::move(row));
+            total += bytes;
+        }
+        return {
+            {"applicability", "applicable"},
+            {"state", "available"},
+            {"reason", "all routed-expert tensor placements were inspected"},
+            {"source", "llama_model routed-expert tensor buffer metadata"},
+            {"basis", "host-backed ggml tensor payload bytes; a non-additive subset of model_bytes"},
+            {"payload_bytes", total},
+            {"by_buffer_type", std::move(by_buffer_type)},
+        };
+    }
+
+    static json telemetry_kv_memory_breakdown_json(const telemetry_kv_boundary_snapshot & snapshot) {
+        std::set<ggml_backend_buffer_type_t> buffer_types;
+        for (const auto & item : snapshot.breakdown) {
+            buffer_types.insert(item.first);
+        }
+        for (const auto & item : snapshot.draft_breakdown) {
+            buffer_types.insert(item.first);
+        }
+
+        json by_buffer_type = json::array();
+        for (const ggml_backend_buffer_type_t buft : buffer_types) {
+            const auto target = snapshot.breakdown.find(buft);
+            const auto draft = snapshot.draft_breakdown.find(buft);
+            const llama_memory_breakdown_data target_data = target == snapshot.breakdown.end()
+                ? llama_memory_breakdown_data {}
+                : target->second;
+            const llama_memory_breakdown_data draft_data = draft == snapshot.draft_breakdown.end()
+                ? llama_memory_breakdown_data {}
+                : draft->second;
+            json row = telemetry_memory_buffer_type_json(buft);
+            row["availability"] = "available";
+            row["reason"] = "allocated backend buffer sizes at the server-process boundary";
+            row["source"] = "llama_get_memory_breakdown";
+            row["model_bytes"] = target_data.model;
+            row["context_bytes"] = target_data.context;
+            row["compute_bytes"] = target_data.compute;
+            row["draft_model_bytes"] = snapshot.draft_shares_target_model ? 0 : draft_data.model;
+            row["draft_context_bytes"] = draft_data.context;
+            row["draft_compute_bytes"] = draft_data.compute;
+            by_buffer_type.push_back(std::move(row));
+        }
+
+        const json prompt_cache_metric = snapshot.prompt_cache_active
+            ? json {
+                {"applicability", "applicable"},
+                {"state", "available"},
+                {"reason", "RAM prompt cache is enabled"},
+                {"source", "server_prompt_cache::size"},
+                {"basis", "retained serialized payload bytes; excludes container metadata and allocator capacity"},
+            }
+            : json {
+                {"applicability", "not_applicable"},
+                {"state", "not_applicable"},
+                {"reason", "RAM prompt cache is disabled"},
+                {"source", "server_prompt_cache::size"},
+                {"basis", "retained serialized payload bytes; excludes container metadata and allocator capacity"},
+            };
+        const json active_checkpoint_metric = {
+            {"applicability", "applicable"},
+            {"state", "available"},
+            {"reason", "active slot checkpoints were inspected at the server-process boundary"},
+            {"source", "common_prompt_checkpoint::size"},
+            {"basis", "retained serialized payload bytes; excludes container metadata and allocator capacity"},
+        };
+
+        return {
+            {"schema_version", 1},
+            {"scope", "server_process_boundary"},
+            {"availability", snapshot.available ? "available" : "not_captured"},
+            {"reason", snapshot.available
+                ? "immutable snapshot captured on the server thread without synchronization"
+                : "no server-process boundary snapshot is available"},
+            {"source", "llama_get_memory_breakdown and server retained-state metadata"},
+            {"timestamp_unix_ms", snapshot.timestamp_unix_ms},
+            {"monotonic_us", snapshot.monotonic_us},
+            {"draft_active", snapshot.draft_active},
+            {"draft_shares_target_model", snapshot.draft_shares_target_model},
+            {"by_buffer_type", std::move(by_buffer_type)},
+            {"cpu_retained_payload", {
+                {"memory_location", "host"},
+                {"applicability", "applicable"},
+                {"state", "available"},
+                {"reason", "server-retained serialized payloads at the same boundary"},
+                {"source", "server_prompt_cache::size and common_prompt_checkpoint::size"},
+                {"basis", "retained serialized payload bytes; excludes container metadata and allocator capacity"},
+                {"prompt_cache_payload_bytes", snapshot.prompt_cache_payload_bytes},
+                {"active_checkpoint_payload_bytes", snapshot.active_checkpoint_payload_bytes},
+                {"metric_states", {
+                    {"prompt_cache_payload_bytes", prompt_cache_metric},
+                    {"active_checkpoint_payload_bytes", active_checkpoint_metric},
+                }},
+            }},
+            {"cpu_routed_expert_tensor_payload", {
+                {"target", telemetry_kv_routed_expert_payload_json(
+                    snapshot.target_cpu_routed_expert_payload,
+                    "the target model has no routed MoE experts")},
+                {"draft", snapshot.draft_active && !snapshot.draft_shares_target_model
+                    ? telemetry_kv_routed_expert_payload_json(
+                        snapshot.draft_cpu_routed_expert_payload,
+                        "the draft model has no routed MoE experts")
+                    : telemetry_kv_routed_expert_payload_json(
+                        telemetry_kv_routed_expert_payload {},
+                        snapshot.draft_active
+                            ? "the draft context shares target model weights"
+                            : "no draft context is active")},
+            }},
+            {"unmeasured", {
+                {"server_allocator_and_driver_overhead", {
+                    {"state", "not_measured"},
+                    {"reason", "not represented by llama backend buffer allocations"},
+                }},
+                {"process_residency", {
+                    {"state", "not_measured"},
+                    {"reason", "backend allocation totals are not process working-set or device-residency measurements"},
+                }},
+            }},
+        };
+    }
+
     json telemetry_snapshot_json() {
         int active_slots = 0;
         uint64_t resident_slot_tokens = 0;
@@ -11555,6 +11815,7 @@ private:
                 {"total_bytes", total.total()},
                 {"by_buffer_type", std::move(devices)},
             }},
+            {"memory_breakdown", telemetry_kv_memory_breakdown_json(snapshot)},
             {"slot_metadata", {
                 {"state", "available"},
                 {"reason", "bounded server-slot metadata; resident token count is explicitly an upper bound"},

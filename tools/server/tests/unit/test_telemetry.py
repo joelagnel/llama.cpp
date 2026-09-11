@@ -1809,6 +1809,7 @@ def test_prometheus_histograms_are_cumulative():
 
 
 def test_structured_forward_and_kv_diagnostics_are_measured():
+    server.cache_ram = 0
     server.start()
     response = server.make_request(
         "POST",
@@ -1851,6 +1852,40 @@ def test_structured_forward_and_kv_diagnostics_are_measured():
     assert kv.body["allocated"]["state"] == "available"
     assert kv.body["allocated"]["reason"]
     assert kv.body["allocated"]["total_bytes"] > 0
+    memory = kv.body["memory_breakdown"]
+    assert memory["schema_version"] == 1
+    assert memory["scope"] == "server_process_boundary"
+    assert memory["availability"] == "available"
+    assert memory["timestamp_unix_ms"] > 0
+    assert memory["monotonic_us"] > 0
+    assert memory["draft_active"] is False
+    assert memory["draft_shares_target_model"] is False
+    assert memory["by_buffer_type"]
+    assert sum(row["model_bytes"] for row in memory["by_buffer_type"]) == kv.body["allocated"]["model_bytes"]
+    assert sum(row["context_bytes"] for row in memory["by_buffer_type"]) == kv.body["allocated"]["context_bytes"]
+    assert sum(row["compute_bytes"] for row in memory["by_buffer_type"]) == kv.body["allocated"]["compute_bytes"]
+    for row in memory["by_buffer_type"]:
+        assert row["availability"] == "available"
+        assert row["source"] == "llama_get_memory_breakdown"
+        assert row["memory_location"] in ("host", "device")
+        assert isinstance(row["device"], str)
+        assert row["draft_model_bytes"] == 0
+        assert row["draft_context_bytes"] == 0
+        assert row["draft_compute_bytes"] == 0
+    retained_payload = memory["cpu_retained_payload"]
+    assert retained_payload["memory_location"] == "host"
+    assert retained_payload["state"] == "available"
+    assert retained_payload["prompt_cache_payload_bytes"] == 0
+    assert retained_payload["active_checkpoint_payload_bytes"] >= 0
+    assert retained_payload["metric_states"]["prompt_cache_payload_bytes"]["state"] == "not_applicable"
+    assert retained_payload["metric_states"]["active_checkpoint_payload_bytes"]["state"] == "available"
+    target_experts = memory["cpu_routed_expert_tensor_payload"]["target"]
+    assert target_experts["state"] == "not_applicable"
+    assert target_experts["payload_bytes"] is None
+    assert target_experts["by_buffer_type"] == []
+    assert memory["cpu_routed_expert_tensor_payload"]["draft"]["state"] == "not_applicable"
+    assert memory["unmeasured"]["server_allocator_and_driver_overhead"]["state"] == "not_measured"
+    assert memory["unmeasured"]["process_residency"]["state"] == "not_measured"
     assert kv.body["slot_metadata"]["state"] == "available"
     assert kv.body["slot_metadata"]["reason"]
     assert kv.body["live_occupancy"]["state"] == "available"
@@ -2922,6 +2957,11 @@ def test_native_gpu_gpm_capability_and_bounded_endpoint():
 def test_speculative_invariants_and_ttft(monkeypatch):
     configure_embedded_mtp_fixture(server)
     server.start()
+    memory = server.make_request("GET", "/telemetry/v1/kv").body["memory_breakdown"]
+    assert memory["draft_active"] is True
+    assert memory["draft_shares_target_model"] is True
+    assert sum(row["draft_model_bytes"] for row in memory["by_buffer_type"]) == 0
+    assert sum(row["draft_context_bytes"] for row in memory["by_buffer_type"]) > 0
     apply_telemetry_control(output_token_detail=True)
     content_enabled = (
         server.make_request("GET", "/telemetry/v1/capabilities")
