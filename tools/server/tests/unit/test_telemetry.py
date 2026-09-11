@@ -1817,6 +1817,10 @@ def test_structured_forward_and_kv_diagnostics_are_measured():
         data={"prompt": "physical forward and kv diagnostics", "n_predict": 3},
     )
     assert response.status_code == 200
+    terminal = completed_event(response.body["trace_id"])
+    terminal_memory = terminal["memory_breakdown"]
+    assert terminal_memory["scope"] == "server_process_boundary"
+    assert terminal_memory["availability"] == "available"
 
     snapshot = server.make_request("GET", "/telemetry/v1/snapshot")
     assert snapshot.status_code == 200
@@ -1846,6 +1850,10 @@ def test_structured_forward_and_kv_diagnostics_are_measured():
     assert live["free_entries"] == live["capacity_entries"] - live["used_entries"]
     assert snapshot.body["kv"]["physical_prefix_sharing"]["state"] == "not_collected"
     assert snapshot.body["kv"]["churn"]["state"] == "not_collected"
+
+    shallow_kv = server.make_request("GET", "/telemetry/v1/kv")
+    assert shallow_kv.status_code == 200
+    assert shallow_kv.body["memory_breakdown"] == terminal_memory
 
     kv = server.make_request("GET", "/telemetry/v1/kv?detail=deep")
     assert kv.status_code == 200
@@ -2992,6 +3000,12 @@ def test_speculative_invariants_and_ttft(monkeypatch):
     )
     assert response.status_code == 200
     event = completed_event(response.body["trace_id"])
+    terminal_memory = event["memory_breakdown"]
+    assert terminal_memory["draft_active"] is True
+    assert terminal_memory["draft_shares_target_model"] is True
+    assert sum(row["draft_model_bytes"] for row in terminal_memory["by_buffer_type"]) == 0
+    terminal_kv = server.make_request("GET", "/telemetry/v1/kv")
+    assert terminal_kv.body["memory_breakdown"] == terminal_memory
     assert_rich_diagnostics_finish_by_last_generation_work(event)
     speculative = event["speculative"]
     assert event["timings"]["ttft_ms"] > 0

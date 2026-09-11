@@ -10768,6 +10768,7 @@ private:
             {"sampling", std::move(sampling)},
             {"server_configuration", telemetry_server_configuration()},
             {"lifecycle_clock", telemetry_lifecycle_clock_json(slot)},
+            {"memory_breakdown", telemetry_kv_memory_breakdown_snapshot_json()},
             {"speculative", {
                 {"draft_tokens", slot.stats.n_draft_tokens},
                 {"accepted_tokens", slot.stats.n_draft_accepted},
@@ -11449,6 +11450,12 @@ private:
         };
     }
 
+    json telemetry_kv_memory_breakdown_snapshot_json() const {
+        return telemetry_kv_boundary.available
+            ? telemetry_kv_memory_breakdown_json(telemetry_kv_boundary)
+            : json(nullptr);
+    }
+
     json telemetry_snapshot_json() {
         int active_slots = 0;
         uint64_t resident_slot_tokens = 0;
@@ -11814,9 +11821,7 @@ private:
                 {"total_bytes", total.total()},
                 {"by_buffer_type", std::move(devices)},
             }},
-            {"memory_breakdown", snapshot.available
-                ? telemetry_kv_memory_breakdown_json(snapshot)
-                : json(nullptr)},
+            {"memory_breakdown", telemetry_kv_memory_breakdown_snapshot_json()},
             {"slot_metadata", {
                 {"state", "available"},
                 {"reason", "bounded server-slot metadata; resident token count is explicitly an upper bound"},
