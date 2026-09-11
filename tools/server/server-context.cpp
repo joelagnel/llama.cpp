@@ -2046,7 +2046,7 @@ public:
             {"route", "/props"},
             {"method", "POST"},
             {"requires_props", true},
-            {"requires_authentication", true},
+            {"requires_authentication", !params_base.api_keys.empty()},
             {"requires_loopback", true},
             {"replacement_semantics", "full"},
             {"features", {
@@ -13167,10 +13167,6 @@ void server_routes::init_routes() {
             res->error(format_error_response(
                 "Tracing is disabled for this server process by LLAMA_TELEMETRY=0.",
                 ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
-        if (params.api_keys.empty()) {
-            res->error(format_error_response("Telemetry control requires a configured API key.", ERROR_TYPE_PERMISSION));
             return res;
         }
         if (!ctx_http.telemetry_control_is_loopback_listener()) {

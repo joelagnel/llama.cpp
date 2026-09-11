@@ -99,13 +99,6 @@ static server_http_res_ptr telemetry_control_router_guard(
             "This server does not support changing global properties. Start it with `--props`", ERROR_TYPE_NOT_SUPPORTED)}});
         return res;
     }
-    if (params.api_keys.empty()) {
-        auto res = std::make_unique<server_http_res>();
-        res->status = 403;
-        res->data = safe_json_to_str({{"error", format_error_response(
-            "Telemetry control requires a configured API key.", ERROR_TYPE_PERMISSION)}});
-        return res;
-    }
     if (!ctx_http.telemetry_control_is_loopback_listener()) {
         auto res = std::make_unique<server_http_res>();
         res->status = 403;

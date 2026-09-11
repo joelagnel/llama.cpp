@@ -214,6 +214,35 @@ def test_rejected_props_writes_leave_the_control_snapshot_unchanged():
     assert "trace_id" not in boundary
 
 
+def test_props_allows_a_keyless_loopback_listener_only():
+    server = ServerPreset.tinyllama2()
+    server.server_props = True
+    server.start()
+    try:
+        capabilities = server.make_request("GET", "/telemetry/v1/capabilities")
+        assert capabilities.status_code == 200
+        assert capabilities.body["telemetry_control"]["requires_authentication"] is False
+
+        accepted = server.make_request(
+            "POST", "/props", data={"telemetry_control": {"output_token_detail": True}}
+        )
+        assert accepted.status_code == 200
+        assert accepted.body["telemetry_control"]["effective"]["output_token_detail"] is True
+    finally:
+        server.stop()
+
+    server = ServerPreset.tinyllama2()
+    server.server_props = True
+    server.server_host = "0.0.0.0"
+    server.request_host = "127.0.0.1"
+    server.start()
+    try:
+        rejected = server.make_request("POST", "/props", data={"telemetry_control": {}})
+        assert rejected.status_code == 403
+    finally:
+        server.stop()
+
+
 def test_overwritten_microbatch_controls_do_not_emit_a_fake_boundary():
     server = _controlled_server()
     server.start()
@@ -755,8 +784,8 @@ def test_props_requires_auth_props_api_key_and_loopback_listener():
     server = ServerPreset.router()
     server.server_props = True
     server.start()
-    key_missing = server.make_request("POST", "/props", data={"model": "unused", "telemetry_control": {}})
-    assert key_missing.status_code == 403
+    keyless_loopback = server.make_request("POST", "/props", data={"telemetry_control": {}})
+    assert keyless_loopback.status_code == 200
     server.stop()
 
     server = ServerPreset.router()

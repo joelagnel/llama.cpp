@@ -1334,15 +1334,15 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (child_telemetry_control_defaults.is_object()) {
             child_env.push_back("LLAMA_TELEMETRY_CONTROL_DEFAULTS=" + child_telemetry_control_defaults.dump());
         }
-        if (base_params.endpoint_props && !base_params.api_keys.empty()) {
-            if (child_api_key_file.empty()) {
-                child_api_key_file = create_child_api_key_file(base_params.api_keys);
-            }
-            // Child servers are loopback-only, but retain the same guard and
-            // auth middleware for model-targeted POST /props requests.
+        if (base_params.endpoint_props) {
             child_args.push_back("--props");
-            child_args.push_back("--api-key-file");
-            child_args.push_back(child_api_key_file);
+            if (!base_params.api_keys.empty()) {
+                if (child_api_key_file.empty()) {
+                    child_api_key_file = create_child_api_key_file(base_params.api_keys);
+                }
+                child_args.push_back("--api-key-file");
+                child_args.push_back(child_api_key_file);
+            }
         }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
