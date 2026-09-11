@@ -11886,8 +11886,11 @@ json server_context_impl::test_native_dispatch_loss_timeline() {
         row.row_index = 0;
         row.ubatch_token_index = 0;
         row.token_index = 0;
-        row.token = 1;
-        row.position = 0;
+        // Media dispatches use the synthetic token map below. Keep the test
+        // row identical to that map so the production identity guard admits
+        // this intentionally routable fixture.
+        row.token = LLAMA_TOKEN_NULL;
+        row.position = slot.prompt.tokens.pos_next();
         row.row_identity_status = LLAMA_MOE_ROUTING_VALUE_STATUS_VALID;
         row.selected_experts_status = LLAMA_MOE_ROUTING_VALUE_STATUS_VALID;
         row.selected_score = 1.0f;

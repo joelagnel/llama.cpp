@@ -3363,8 +3363,10 @@ llama_moe_routing_test_row_position_mapping llama_context::test_map_moe_routing_
     // two tokens and must preserve the original indices.
     static constexpr std::array<llama_seq_id, n_reordered_tokens> sequence_ids =
         {{ 0, 1, 2, 0, 1, 2, 0, 2, 0 }};
+    static constexpr std::array<llama_pos, n_reordered_tokens> source_positions =
+        {{ 100, 200, 300, 101, 201, 301, 102, 302, 103 }};
     for (uint32_t token = 0; token < n_reordered_tokens; ++token) {
-        reordered_positions[token] = 100 + (llama_pos) token;
+        reordered_positions[token] = source_positions[token];
         reordered_n_seq_id[token] = 1;
         reordered_seq_ids[token] = sequence_ids[token];
         reordered_seq_ptrs[token] = &reordered_seq_ids[token];
@@ -3397,7 +3399,7 @@ llama_moe_routing_test_row_position_mapping llama_context::test_map_moe_routing_
             result.reordered_rows_preserve_source_indices =
                 identity.ubatch_token_index == (int32_t) row &&
                 identity.token_index == expected_all[row] &&
-                identity.position == 100 + expected_all[row] &&
+                identity.position == source_positions[expected_all[row]] &&
                 identity.status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID;
         }
 
@@ -3408,7 +3410,7 @@ llama_moe_routing_test_row_position_mapping llama_context::test_map_moe_routing_
             const auto & identity = compacted_rows[row];
             result.reordered_output_rows_preserve_source_indices =
                 identity.token_index == expected_output[row] &&
-                identity.position == 100 + expected_output[row] &&
+                identity.position == source_positions[expected_output[row]] &&
                 identity.status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID;
         }
 
