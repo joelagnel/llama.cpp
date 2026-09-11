@@ -533,10 +533,22 @@ static bool test_dispatch_observer(llama_model * model, const common_params & pa
     abort.requested = false;
     llama_set_abort_callback(ctx_interleaved.get(), nullptr, nullptr);
 
-    // DSV4 raw memory retains the aborted position when rollback snapshots are disabled.
-    // The failed graph has no dispatch evidence, but recovery must continue at the next position.
+    // An aborted graph has no dispatch evidence. Its last ubatch may have
+    // been rolled back, so recover from the memory position actually retained
+    // by this context rather than assuming a DSV4-specific outcome.
+    const llama_memory_t memory = llama_get_memory(ctx_interleaved.get());
+    if (memory == nullptr) {
+        fprintf(stderr, "%s: abort recovery did not retain sequence memory\n", __func__);
+        return false;
+    }
+    const llama_pos retained_pos_max = llama_memory_seq_pos_max(memory, 0);
+    if (retained_pos_max < 0) {
+        fprintf(stderr, "%s: abort recovery did not retain sequence memory\n", __func__);
+        return false;
+    }
+    const llama_pos recovery_pos = retained_pos_max + 1;
     for (llama_token token = 1; token <= 8; ++token) {
-        if (!decode_one(ctx_interleaved.get(), 544 + token, 544 + token)) {
+        if (!decode_one(ctx_interleaved.get(), token, recovery_pos + token - 1)) {
             fprintf(stderr, "%s: post-failure decode recovery failed\n", __func__);
             return false;
         }
