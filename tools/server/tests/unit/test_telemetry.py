@@ -1351,7 +1351,7 @@ def test_telemetry_lifecycle_cache_and_cursor():
     ]) == 1
 
 
-def test_output_token_telemetry_is_bounded_opt_in_with_independent_probability_and_identity(monkeypatch):
+def test_output_token_telemetry_is_opt_in_with_uncapped_durable_detail_and_bounded_completion_cache(monkeypatch):
     monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKEN_LIMIT", "32")
     server.start()
     apply_telemetry_control(output_token_detail=True)
@@ -1360,11 +1360,14 @@ def test_output_token_telemetry_is_bounded_opt_in_with_independent_probability_a
     assert capabilities.status_code == 200
     capability = capabilities.body["capabilities"]["output_token_telemetry"]
     assert capability["state"] == "conditional"
-    assert capability["maximum_captured_tokens"] == 32
+    assert capability["durable_capture"] == "append_only_disk_journal_with_fixed_record_events_and_no_per_request_limit"
+    assert capability["whole_request_event_cap"] is False
+    assert "maximum_captured_tokens" not in capability
+    assert capability["legacy_completion_cache_maximum_tokens"] == 32
     assert capability["record_schema_version"] == 3
     assert capability["mtp_pass_record_schema_version"] == 2
-    assert capability["maximum_captured_mtp_passes"] == 512
-    assert capability["maximum_captured_mtp_proposals"] == 512
+    assert capability["legacy_completion_cache_maximum_mtp_passes"] == 512
+    assert capability["legacy_completion_cache_maximum_mtp_proposals"] == 512
     assert set(capability["retained_mtp_proposal_fields"]) >= {
         "position",
         "disposition",
@@ -1482,10 +1485,16 @@ def test_output_token_telemetry_is_bounded_opt_in_with_independent_probability_a
     assert capped["probability_state"] == "not_enabled_for_request"
     assert len(capped["records"]) == 32
     assert [record["ordinal"] for record in capped["records"]] == list(range(32))
+    durable_records = [
+        event["output_token_record"]
+        for event in trace_events(capped_response.body["trace_id"])
+        if event["event"] == "output_token_detail"
+    ]
+    assert [record["ordinal"] for record in durable_records] == list(range(40))
 
 
 @pytest.mark.parametrize("configured_limit,expected_limit", [(8192, 8192), (8193, 8192)])
-def test_output_token_limit_accepts_8192_and_clamps_larger_values(monkeypatch, configured_limit, expected_limit):
+def test_output_token_legacy_completion_cache_limit_accepts_8192_and_clamps_larger_values(monkeypatch, configured_limit, expected_limit):
     monkeypatch.setenv("LLAMA_TELEMETRY_OUTPUT_TOKEN_LIMIT", str(configured_limit))
     server.start()
     apply_telemetry_control(output_token_detail=True)
@@ -1493,9 +1502,11 @@ def test_output_token_limit_accepts_8192_and_clamps_larger_values(monkeypatch, c
     capability = server.make_request(
         "GET", "/telemetry/v1/capabilities"
     ).body["capabilities"]["output_token_telemetry"]
-    assert capability["maximum_captured_tokens"] == expected_limit
-    assert capability["maximum_captured_mtp_passes"] == 512
-    assert capability["maximum_captured_mtp_proposals"] == 512
+    assert capability["whole_request_event_cap"] is False
+    assert "maximum_captured_tokens" not in capability
+    assert capability["legacy_completion_cache_maximum_tokens"] == expected_limit
+    assert capability["legacy_completion_cache_maximum_mtp_passes"] == 512
+    assert capability["legacy_completion_cache_maximum_mtp_proposals"] == 512
 
 
 def test_output_token_identity_follows_the_separate_content_policy(monkeypatch):
