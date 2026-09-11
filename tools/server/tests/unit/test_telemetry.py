@@ -535,6 +535,7 @@ def test_kv_pressure_future_cursor_resets_to_high_water_mark():
 
 
 def test_kv_pressure_reports_exact_global_primary_occupancy_after_decode():
+    server.cache_ram = "0"
     start_kv_pressure_server()
 
     response = kv_pressure_request(
