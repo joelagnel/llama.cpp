@@ -26,6 +26,7 @@ KV_PRESSURE_EVENT_KINDS = {
     "decode_retry",
     "decode_wait_finished",
     "idle_slot_evicted",
+    "idle_slot_reassigned",
     "context_shift",
 }
 
