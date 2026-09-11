@@ -11815,7 +11815,9 @@ private:
                 {"total_bytes", total.total()},
                 {"by_buffer_type", std::move(devices)},
             }},
-            {"memory_breakdown", telemetry_kv_memory_breakdown_json(snapshot)},
+            {"memory_breakdown", snapshot.available
+                ? telemetry_kv_memory_breakdown_json(snapshot)
+                : json(nullptr)},
             {"slot_metadata", {
                 {"state", "available"},
                 {"reason", "bounded server-slot metadata; resident token count is explicitly an upper bound"},

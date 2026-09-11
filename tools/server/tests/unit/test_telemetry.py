@@ -1910,6 +1910,16 @@ def test_structured_forward_and_kv_diagnostics_are_measured():
     assert capabilities["moe_routing"]["state"] == "not_applicable"
 
 
+def test_kv_memory_breakdown_is_null_without_a_boundary(monkeypatch):
+    monkeypatch.setenv("LLAMA_TELEMETRY", "0")
+    server.start()
+
+    kv = server.make_request("GET", "/telemetry/v1/kv")
+    assert kv.status_code == 200
+    assert kv.body["allocated"]["state"] == "available"
+    assert kv.body["memory_breakdown"] is None
+
+
 def test_response_probability_invariant():
     server.start()
     response = server.make_request(
