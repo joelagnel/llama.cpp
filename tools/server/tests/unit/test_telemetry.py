@@ -2354,22 +2354,28 @@ def test_moe_routing_chunk_subrecord_capacity_preserves_bounded_coverage(monkeyp
         )
         assert response.status_code == 200
 
-        events = server.make_request(
-            "GET", "/telemetry/v1/events?cursor=0&limit=512", headers=auth
+        events_http = requests.get(
+            f"http://{server.server_host}:{server.server_port}/telemetry/v1/events?cursor=0&limit=512",
+            headers=auth,
+            timeout=60,
         )
+        assert events_http.status_code == 200
+        events = events_http.json()
         chunks = [
-            event for event in events.body["events"]
+            event for event in events["events"]
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
         ]
+        raw_chunks = [
+            raw
+            for raw in raw_telemetry_event_envelopes(events_http.content)
+            if (event := json.loads(raw)).get("event") == "moe_routing_chunk"
+            and event.get("trace_id") == response.body["trace_id"]
+        ]
         assert len(chunks) > 1
+        assert [json.loads(raw)["sequence"] for raw in raw_chunks] == [chunk["sequence"] for chunk in chunks]
         assert all(chunk["schema_version"] == 3 for chunk in chunks)
         assert all(chunk["serialized_bytes"] <= 3700 for chunk in chunks)
-        assert all(
-            chunk["serialized_bytes"] == len(
-                json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            )
-            for chunk in chunks
-        )
+        assert all(chunk["serialized_bytes"] == len(raw) for raw, chunk in zip(raw_chunks, chunks))
         assert [chunk["is_final_for_trace"] for chunk in chunks] == [False] * (len(chunks) - 1) + [True]
         assert all(chunk["availability"] == 0 and not chunk["gaps"] for chunk in chunks)
         assert not any(chunk.get("unlocated_coverage_loss") for chunk in chunks)
