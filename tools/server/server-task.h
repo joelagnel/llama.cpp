@@ -685,9 +685,17 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    size_t size_total = 0;
+
+    size_t tokens_total = 0;
+
     size_t size() const;
 
     size_t n_tokens() const;
+
+    std::list<server_prompt_cache_state>::iterator erase(std::list<server_prompt_cache_state>::iterator it);
+
+    void pop_front();
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 

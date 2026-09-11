@@ -568,6 +568,12 @@ def test_kv_pressure_reports_exact_global_primary_occupancy_after_decode():
     assert sample["utilization"] == pytest.approx(
         sample["used_entries"] / sample["capacity_entries"], rel=1e-12
     )
+    assert sample["prompt_cache_state"] == "disabled"
+    assert sample["prompt_cache_reason"] == "cache_ram_disabled"
+    assert sample["prompt_cache_used_bytes"] is None
+    assert sample["prompt_cache_capacity_bytes"] is None
+    assert sample["prompt_cache_tokens"] is None
+    assert sample["prompt_cache_entries"] is None
     assert sample["component"] == primary["name"]
     assert sample["memory_kind"] == primary["kind"]
     assert sample["entry_semantics"] == primary["entry_semantics"]
@@ -1064,13 +1070,22 @@ def test_kv_pressure_emergency_eviction_separates_trigger_and_victim_identity():
     assert finished["wait_duration_us"] == finished["monotonic_us"] - started["monotonic_us"]
 
 
-def test_kv_pressure_proactive_idle_cache_policy_is_not_pressure_recovery(tmp_path):
+@pytest.mark.parametrize(
+    ("cache_ram", "prompt_cache_reason", "prompt_cache_capacity_bytes"),
+    [
+        (100, "bounded", 100 * 1024 * 1024),
+        (-1, "unlimited", None),
+    ],
+)
+def test_kv_pressure_proactive_idle_cache_policy_is_not_pressure_recovery(
+    tmp_path, cache_ram, prompt_cache_reason, prompt_cache_capacity_bytes
+):
     server.n_ctx = 256
     server.n_batch = 32
     server.n_ubatch = 32
     server.n_slots = 2
     server.kv_unified = True
-    server.cache_ram = 100
+    server.cache_ram = cache_ram
     server.debug = True
     server.log_path = str(tmp_path / "server.log")
     start_kv_pressure_server()
@@ -1116,6 +1131,16 @@ def test_kv_pressure_proactive_idle_cache_policy_is_not_pressure_recovery(tmp_pa
     assert eviction.get("episode_id") is None
     assert eviction["victim_slot_id"] == 0
     assert eviction["victim_trace_id"] == victim.body["trace_id"]
+
+    samples = [event for event in batch["events"] if event["kind"] == "utilization_sample"]
+    assert samples
+    sample = samples[-1]
+    assert sample["prompt_cache_state"] == "available"
+    assert sample["prompt_cache_reason"] == prompt_cache_reason
+    assert sample["prompt_cache_used_bytes"] > 0
+    assert sample["prompt_cache_capacity_bytes"] == prompt_cache_capacity_bytes
+    assert sample["prompt_cache_tokens"] > 0
+    assert sample["prompt_cache_entries"] > 0
 
 
 def terminal_event(trace_id, expected_event, expected_outcome):

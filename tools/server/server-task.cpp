@@ -1854,23 +1854,22 @@ json server_task_result_apply_lora::to_json() {
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {
-    size_t res = 0;
-
-    for (const auto & state : states) {
-        res += state.size();
-    }
-
-    return res;
+    return size_total;
 }
 
 size_t server_prompt_cache::n_tokens() const {
-    size_t res = 0;
+    return tokens_total;
+}
 
-    for (const auto & state : states) {
-        res += state.prompt.n_tokens();
-    }
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase(std::list<server_prompt_cache_state>::iterator it) {
+    size_total -= it->size();
+    tokens_total -= it->prompt.n_tokens();
 
-    return res;
+    return states.erase(it);
+}
+
+void server_prompt_cache::pop_front() {
+    erase(states.begin());
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
@@ -1906,7 +1905,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
-            it = states.erase(it);
+            it = erase(it);
         } else {
             ++it;
         }
@@ -1918,7 +1917,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            pop_front();
         }
     }
 
@@ -1951,6 +1950,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.drft =*/ std::move(state_data_dft),
         },
     });
+
+    size_total += state_size_new;
+    tokens_total += prompt.n_tokens();
 
     return &states.back();
 }
@@ -2003,6 +2005,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
             data.clear();
             data.shrink_to_fit();
+            size_total -= size;
         }
 
         {
@@ -2021,8 +2024,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 data.clear();
                 data.shrink_to_fit();
+                size_total -= size;
             }
         }
+
+        size_total -= it_best->size();
+        tokens_total -= it_best->prompt.n_tokens();
 
         prompt = std::move(it_best->prompt);
 
@@ -2037,7 +2044,7 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            pop_front();
         }
     }
 
@@ -2052,7 +2059,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            pop_front();
         }
     }
 

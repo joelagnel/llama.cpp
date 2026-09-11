@@ -6851,6 +6851,12 @@ private:
 
         const llama_memory_primary_occupancy occupancy = llama_get_memory_primary_occupancy(ctx_tgt);
         const llama_memory_primary_distribution distribution = llama_get_memory_primary_distribution(ctx_tgt);
+        const bool prompt_cache_available = prompt_cache != nullptr;
+        const bool prompt_cache_bounded = prompt_cache_available && prompt_cache->limit_size > 0;
+        const char * prompt_cache_state = prompt_cache_available ? "available" : "disabled";
+        const char * prompt_cache_reason = prompt_cache_available
+            ? prompt_cache_bounded ? "bounded" : "unlimited"
+            : "cache_ram_disabled";
         const bool valid = occupancy.available && occupancy.capacity_entries > 0 &&
             occupancy.used_entries <= occupancy.capacity_entries;
         const bool distribution_valid = valid && distribution.available &&
@@ -6951,6 +6957,12 @@ private:
             {"used_entries", valid ? json(occupancy.used_entries) : json(nullptr)},
             {"free_entries", valid ? json(occupancy.capacity_entries - occupancy.used_entries) : json(nullptr)},
             {"utilization", valid ? json((double) occupancy.used_entries / occupancy.capacity_entries) : json(nullptr)},
+            {"prompt_cache_state", prompt_cache_state},
+            {"prompt_cache_reason", prompt_cache_reason},
+            {"prompt_cache_used_bytes", prompt_cache_available ? json(prompt_cache->size()) : json(nullptr)},
+            {"prompt_cache_capacity_bytes", prompt_cache_bounded ? json(prompt_cache->limit_size) : json(nullptr)},
+            {"prompt_cache_tokens", prompt_cache_available ? json(prompt_cache->n_tokens()) : json(nullptr)},
+            {"prompt_cache_entries", prompt_cache_available ? json(prompt_cache->states.size()) : json(nullptr)},
             {"distribution_state", distribution_state},
             {"distribution_reason", distribution_reason},
             {"shared_entries", distribution_valid ? json(distribution.shared_entries) : json(nullptr)},
