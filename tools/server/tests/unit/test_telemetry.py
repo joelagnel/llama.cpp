@@ -2319,7 +2319,7 @@ def test_moe_routing_chunk_byte_cap_splits_canonical_envelopes(monkeypatch):
         server.stop()
 
 
-def test_moe_routing_chunk_subrecord_capacity_fails_closed(monkeypatch):
+def test_moe_routing_chunk_subrecord_capacity_preserves_bounded_coverage(monkeypatch):
     global server
 
     api_key = "moe-routing-subrecord-cap-test-key"
@@ -2361,28 +2361,28 @@ def test_moe_routing_chunk_subrecord_capacity_fails_closed(monkeypatch):
             event for event in events.body["events"]
             if event["event"] == "moe_routing_chunk" and event["trace_id"] == response.body["trace_id"]
         ]
-        assert len(chunks) == 1
-        chunk = chunks[0]
-        assert chunk["schema_version"] == 3
-        assert chunk["is_final_for_trace"] is True
-        assert chunk["availability"] == 1
-        assert not chunk.get("decisions", [])
-        assert not chunk.get("invalid_records", [])
-        assert not chunk.get("gaps", [])
-        loss = chunk["unlocated_coverage_loss"]
-        assert loss["count"] > 0
-        assert loss["state"] == "loss"
-        assert loss["classification"] == "serialized_capacity_reservation"
-        assert loss["coordinate_state"] == "unavailable"
-        assert loss["physical_context"] == "target"
-        assert loss["operation"] == "decode"
-        assert loss["props_generation"] == 1
-        assert loss["microbatch_generation"] == 1
-        assert loss["application_epoch"] > 0
-        assert "first_physical_step" not in loss
-        assert "next_physical_step" not in loss
-        assert "first_dispatch_monotonic_us" not in loss
-        assert "last_dispatch_monotonic_us" not in loss
+        assert len(chunks) > 1
+        assert all(chunk["schema_version"] == 3 for chunk in chunks)
+        assert all(chunk["serialized_bytes"] <= 3700 for chunk in chunks)
+        assert all(
+            chunk["serialized_bytes"] == len(
+                json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            )
+            for chunk in chunks
+        )
+        assert [chunk["is_final_for_trace"] for chunk in chunks] == [False] * (len(chunks) - 1) + [True]
+        assert all(chunk["availability"] == 0 and not chunk["gaps"] for chunk in chunks)
+        assert not any(chunk.get("unlocated_coverage_loss") for chunk in chunks)
+
+        represented = []
+        for chunk in chunks:
+            chunk_sequences = sorted(
+                [decision["sequence"] for decision in chunk["decisions"]]
+                + [invalid["sequence"] for invalid in chunk["invalid_records"]]
+            )
+            assert chunk_sequences == list(range(chunk["first_sequence"], chunk["next_sequence"]))
+            represented.extend(chunk_sequences)
+        assert represented == list(range(chunks[0]["first_sequence"], chunks[-1]["next_sequence"]))
     finally:
         server.stop()
 
