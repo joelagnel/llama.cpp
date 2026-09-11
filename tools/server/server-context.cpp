@@ -8341,6 +8341,14 @@ private:
             for (const int32_t slot_id : candidate_slots) {
                 server_slot & slot = slots[slot_id];
                 slot.telemetry_moe_chunk_capture_started = true;
+                // This row may belong to any candidate trace, so retain no
+                // token or position claim. Each candidate instead receives a
+                // coordinate-free partial marker stating its evidence could
+                // not be disambiguated. Without this count, a final marker
+                // would be Partial without an explicit loss signal.
+                ++slot.telemetry_moe_chunk_unlocated_pending;
+                ++slot.telemetry_moe_chunk_unlocated_rows;
+                ++slot.telemetry_moe_chunk_unlinked_rows;
                 slot.telemetry_moe_chunk_attribution_ambiguous = true;
             }
         };

@@ -204,6 +204,19 @@ static void test_canonical_event_coverage_serialization(testing & t) {
         t.assert_true(!event.contains("unlocated_coverage_loss"));
     });
 
+    t.test("ambiguous identity mismatch carries coordinate-free loss", [](testing & t) {
+        server_moe_routing_chunk_coverage coverage;
+        coverage.unlinked_rows = 1;
+        coverage.unlocated_rows = 1;
+        coverage.attribution_ambiguous = true;
+        const json event = serialize_moe_routing_final_coverage(coverage);
+        t.assert_equal(1U, event.at("availability").get<uint32_t>());
+        t.assert_equal(1ULL, event.at("unlocated_coverage_loss").at("count").get<uint64_t>());
+        const std::string reason = event.at("reason").get<std::string>();
+        t.assert_true(reason.find("unlinked routing rows") != std::string::npos);
+        t.assert_true(reason.find("could not be attributed") != std::string::npos);
+    });
+
     t.test("interrupted and source-unavailable final events retain distinct evidence", [](testing & t) {
         server_moe_routing_chunk_coverage interrupted;
         interrupted.interrupted = true;
