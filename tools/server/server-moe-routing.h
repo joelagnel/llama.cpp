@@ -33,6 +33,16 @@ inline bool server_moe_routing_weight_is_usable(float effective_weight) {
     return std::isfinite(effective_weight) && effective_weight >= 0.0f;
 }
 
+// A native row is attributable only when the logical batch index resolves to
+// the exact token and primary position that native capture retained.
+inline bool server_moe_routing_identity_matches(
+        int32_t native_token,
+        int32_t native_position,
+        int32_t batch_token,
+        int32_t batch_position) {
+    return native_token == batch_token && native_position == batch_position;
+}
+
 inline server_moe_routing_capture_result server_moe_routing_capture(
         server_moe_routing_capture_counts & counts,
         bool valid,

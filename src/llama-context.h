@@ -49,10 +49,16 @@ struct llama_context_dispatch_decision {
 using llama_context_dispatch_pre_callback = llama_context_dispatch_decision (*) (
         void * user_data,
         llama_context_dispatch_operation operation);
+using llama_context_dispatch_moe_routing_may_capture_callback = bool (*) (
+        void * user_data,
+        llama_context_dispatch_operation operation);
 
 struct llama_context_dispatch_observer {
     void * user_data = nullptr;
     llama_context_dispatch_pre_callback pre = nullptr;
+    // Called before batch splitting so an active routing capture can retain
+    // exact caller-batch provenance without allocating on disabled paths.
+    llama_context_dispatch_moe_routing_may_capture_callback moe_routing_may_capture = nullptr;
 };
 
 struct llama_context_dispatch_notice {
@@ -379,7 +385,6 @@ private:
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
     void extract_moe_routing(
             const llm_graph_result * res,
-            size_t token_offset,
             uint32_t physical_ubatch_index,
             const llama_ubatch & ubatch);
     void clear_moe_routing_readback();
@@ -500,7 +505,6 @@ private:
     static size_t map_moe_routing_row_identities(
             std::vector<moe_routing_row_identity> & identities,
             size_t row_count,
-            size_t token_offset,
             const llama_ubatch & ubatch);
 
     struct moe_routing_capture {
@@ -544,6 +548,7 @@ private:
     uint64_t dispatch_physical_step = 0;
     uint64_t dispatch_first_physical_step = 0;
     uint64_t dispatch_last_physical_step = 0;
+    bool dispatch_moe_routing_source_indices = false;
     uint64_t moe_routing_capture_logical_call = 0;
     llama_context_dispatch_decision moe_routing_capture_decision;
     llama_context_dispatch_operation moe_routing_capture_operation = LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE;

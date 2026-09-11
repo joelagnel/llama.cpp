@@ -2509,6 +2509,18 @@ private:
         };
     }
 
+    bool telemetry_dispatch_moe_routing_may_capture(
+            bool draft,
+            llama_context_dispatch_operation /* operation */) const {
+        if (!telemetry_microbatch_observer_armed.load(std::memory_order_acquire)) {
+            return false;
+        }
+        const telemetry_microbatch_control_snapshot snapshot = telemetry_microbatch_control_current();
+        const telemetry_dispatch_scope_state * scope = telemetry_dispatch_scope;
+        return !draft && scope && scope->target_moe_routing_permitted &&
+            snapshot.control.moe_routing && telemetry_target_has_moe;
+    }
+
     static llama_context_dispatch_decision telemetry_dispatch_pre_callback(
             void * user_data,
             llama_context_dispatch_operation operation) {
@@ -2517,6 +2529,15 @@ private:
         return binding && binding->server
             ? binding->server->telemetry_dispatch_pre(binding->draft, operation)
             : llama_context_dispatch_decision {};
+    }
+
+    static bool telemetry_dispatch_moe_routing_may_capture_callback(
+            void * user_data,
+            llama_context_dispatch_operation operation) {
+        const telemetry_dispatch_observer_binding * binding =
+            static_cast<const telemetry_dispatch_observer_binding *>(user_data);
+        return binding && binding->server &&
+            binding->server->telemetry_dispatch_moe_routing_may_capture(binding->draft, operation);
     }
 
     class telemetry_dispatch_scope_guard {
@@ -2956,12 +2977,14 @@ private:
             ctx_tgt->set_dispatch_observer({
                 &telemetry_target_dispatch_binding,
                 telemetry_dispatch_pre_callback,
+                telemetry_dispatch_moe_routing_may_capture_callback,
             });
             if (ctx_dft) {
                 telemetry_draft_dispatch_binding = { this, true };
                 ctx_dft->set_dispatch_observer({
                     &telemetry_draft_dispatch_binding,
                     telemetry_dispatch_pre_callback,
+                    telemetry_dispatch_moe_routing_may_capture_callback,
                 });
             }
         }
@@ -8330,6 +8353,14 @@ private:
             }
             const server_batch::token & token = *token_map[(size_t) row.token_index];
             if (token.id_slot < 0 || token.id_slot >= (int32_t) slots.size()) {
+                record_unmappable_row();
+                continue;
+            }
+            if (!server_moe_routing_identity_matches(
+                    (int32_t) row.token,
+                    (int32_t) row.position,
+                    (int32_t) token.token,
+                    (int32_t) token.pos)) {
                 record_unmappable_row();
                 continue;
             }

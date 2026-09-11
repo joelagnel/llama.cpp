@@ -77,6 +77,21 @@ struct dispatch_script {
         }
         return script->decisions[script->next++];
     }
+
+    static bool moe_routing_may_capture(
+            void * user_data,
+            llama_context_dispatch_operation operation) {
+        const dispatch_script * script = static_cast<const dispatch_script *>(user_data);
+        if (operation != LLAMA_CONTEXT_DISPATCH_OPERATION_DECODE) {
+            return false;
+        }
+        for (size_t index = script->next; index < script->decisions.size(); ++index) {
+            if (script->decisions[index].native_moe_routing_enabled) {
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 static bool has_explicit_gpu_layers(int argc, char ** argv) {
@@ -96,7 +111,8 @@ static bool expect_empty_moe_routing_observer(llama_context * ctx, const char * 
     if (observer.enabled || observer.reserve_pending || observer.graph_reserve_invalidations != 0 ||
             observer.graph_reserves != 0 || observer.graph_output_extractions != 0 ||
             observer.capture_slot_allocations != 0 || observer.readback_allocations != 0 || observer.readback_copies != 0 ||
-            observer.synchronizations != 0 || observer.batch_peer_reads != 0) {
+            observer.synchronizations != 0 || observer.batch_peer_reads != 0 ||
+            observer.source_index_allocations != 0) {
         fprintf(stderr, "%s: unexpected MoE work in %s\n", __func__, phase);
         return false;
     }
@@ -114,7 +130,7 @@ static bool expect_enabled_moe_routing_observer(llama_context * ctx) {
     if (!observer.enabled || observer.reserve_pending || observer.graph_reserves == 0 ||
             observer.graph_output_extractions == 0 || observer.capture_slot_allocations == 0 || observer.readback_allocations == 0 ||
             observer.readback_copies == 0 || observer.synchronizations == 0 ||
-            observer.batch_peer_reads == 0) {
+            observer.batch_peer_reads == 0 || observer.source_index_allocations == 0) {
         fprintf(stderr, "%s: missing enabled MoE work\n", __func__);
         return false;
     }
@@ -279,8 +295,11 @@ static bool test_moe_routing_primary_position_mapping() {
         llama_context::test_map_moe_routing_primary_positions();
     if (result.all_row_count != 40 || result.output_row_count != 20 ||
             !result.all_rows_use_primary_positions || !result.output_rows_use_primary_positions ||
-            !result.all_rows_are_unique || !result.output_rows_are_unique) {
-        fprintf(stderr, "%s: four-plane row-position mapping was not exact\n", __func__);
+            !result.all_rows_are_unique || !result.output_rows_are_unique ||
+            !result.reordered_rows_preserve_source_indices ||
+            !result.reordered_output_rows_preserve_source_indices ||
+            !result.missing_source_indices_are_unavailable) {
+        fprintf(stderr, "%s: routing row provenance mapping was not exact\n", __func__);
         return false;
     }
     return true;
@@ -302,7 +321,7 @@ static bool test_dispatch_observer(llama_model * model, const common_params & pa
         { 1, 2, 2, 0, false, true,  true },
         { 1, 3, 3, 1, true,  true,  true },
     }};
-    ctx->set_dispatch_observer({ &script, dispatch_script::pre });
+    ctx->set_dispatch_observer({ &script, dispatch_script::pre, dispatch_script::moe_routing_may_capture });
     llama_moe_routing_test_observer_reset(ctx.get());
     if (!decode_many(ctx.get(), 1, 0, 6)) {
         fprintf(stderr, "%s: scripted multi-ubatch decode failed\n", __func__);
@@ -357,7 +376,7 @@ static bool test_dispatch_observer(llama_model * model, const common_params & pa
         { 1, 3, 3, 1, true, true, true },
         { 1, 3, 3, 1, true, true, true },
     }};
-    ctx_multi->set_dispatch_observer({ &steady, dispatch_script::pre });
+    ctx_multi->set_dispatch_observer({ &steady, dispatch_script::pre, dispatch_script::moe_routing_may_capture });
     if (!decode_unequal_sequences(ctx_multi.get())) {
         fprintf(stderr, "%s: unequal-sequence decode failed\n", __func__);
         return false;
@@ -385,7 +404,7 @@ static bool test_dispatch_observer(llama_model * model, const common_params & pa
     for (uint64_t generation = 1; generation <= 36; ++generation) {
         changing.decisions.push_back({ 1, generation, generation, 1, true, true, true });
     }
-    ctx_loss->set_dispatch_observer({ &changing, dispatch_script::pre });
+    ctx_loss->set_dispatch_observer({ &changing, dispatch_script::pre, dispatch_script::moe_routing_may_capture });
     if (!decode_many(ctx_loss.get(), 1, 0, 72)) {
         fprintf(stderr, "%s: queue-loss decode failed\n", __func__);
         return false;
@@ -426,7 +445,7 @@ static bool test_dispatch_observer(llama_model * model, const common_params & pa
         saturating.decisions.push_back({ 1, generation, generation,
             (uint8_t) (generation % 2 ? 1 : 33), true, true, true });
     }
-    ctx_saturation->set_dispatch_observer({ &saturating, dispatch_script::pre });
+    ctx_saturation->set_dispatch_observer({ &saturating, dispatch_script::pre, dispatch_script::moe_routing_may_capture });
     if (!decode_many(ctx_saturation.get(), 1, 0, 620)) {
         fprintf(stderr, "%s: saturation decode failed\n", __func__);
         return false;
@@ -499,7 +518,7 @@ static bool test_dispatch_observer(llama_model * model, const common_params & pa
         interleaved.decisions.push_back({ 1, generation, generation,
             (uint8_t) (generation % 2 ? 1 : 33), true, true, true });
     }
-    ctx_interleaved->set_dispatch_observer({ &interleaved, dispatch_script::pre });
+    ctx_interleaved->set_dispatch_observer({ &interleaved, dispatch_script::pre, dispatch_script::moe_routing_may_capture });
     if (!decode_many(ctx_interleaved.get(), 1, 0, 544)) {
         fprintf(stderr, "%s: interleaved saturation decode failed\n", __func__);
         return false;

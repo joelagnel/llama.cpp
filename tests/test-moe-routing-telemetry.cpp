@@ -45,6 +45,9 @@ static void test_record_validation(testing & t) {
     t.test("valid assignment", [](testing & t) {
         t.assert_true(server_moe_routing_assignment_is_valid(2, 3, 4, 4));
         t.assert_true(server_moe_routing_weight_is_usable(0.25f));
+        t.assert_true(server_moe_routing_identity_matches(42, 19, 42, 19));
+        t.assert_true(!server_moe_routing_identity_matches(42, 19, 43, 19));
+        t.assert_true(!server_moe_routing_identity_matches(42, 19, 42, 20));
     });
 
     t.test("non-finite weight remains unavailable", [](testing & t) {

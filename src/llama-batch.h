@@ -61,11 +61,19 @@ struct llama_ubatch {
         std::vector<int32_t>        seq_idx;
         std::vector<int8_t>         output;
 
+        // Optional provenance for diagnostics whose rows must link back to
+        // the caller's logical batch after a split has reordered it.
+        std::vector<int32_t>         source_token_index;
+
         std::vector<llama_seq_id> seq_id_data;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // [n_tokens] original index in the logical caller batch. This is kept
+    // only while an active diagnostic needs exact row provenance.
+    int32_t * source_token_index = nullptr;
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch
@@ -81,7 +89,8 @@ public:
             const llama_memory_i * memory,
             uint32_t n_embd,
             uint32_t n_seq_max,
-            bool output_all);
+            bool output_all,
+            bool track_moe_routing_source_indices = false);
 
     const llama_batch & get_batch() const;
 
@@ -114,6 +123,9 @@ public:
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
 
+    uint64_t moe_routing_source_index_allocations() const;
+    void reset_moe_routing_source_index_allocations();
+
 private:
     void clear();
 
@@ -136,6 +148,8 @@ private:
     uint32_t n_embd;
     uint32_t n_seq_max;
     uint32_t n_outputs;
+    bool track_moe_routing_source_indices = false;
+    uint64_t n_moe_routing_source_index_allocations = 0;
 
     std::array<llama_seq_id, 1> seq_id_0 = {{ 0 }}; // default sequence id
 

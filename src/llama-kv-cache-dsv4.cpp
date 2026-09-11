@@ -118,6 +118,9 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
     data->seq_id_unq.assign(ubatch.seq_id_unq, ubatch.seq_id_unq + ubatch.n_seqs_unq);
     data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
     data->output.assign(n_tokens, 0);
+    if (ubatch.source_token_index != nullptr) {
+        data->source_token_index.reserve(n_tokens);
+    }
     if (ubatch.token) {
         data->token.reserve(n_tokens);
     }
@@ -136,6 +139,9 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
             const uint32_t dst = data->n_seq_id.size();
             if (ubatch.token) {
                 data->token.push_back(ubatch.token[i]);
+            }
+            if (ubatch.source_token_index != nullptr) {
+                data->source_token_index.push_back(ubatch.source_token_index[i]);
             }
             for (uint32_t p = 0; p < ubatch.n_pos; ++p) {
                 data->pos[(size_t) p*n_tokens + dst] = ubatch.pos[(size_t) p*ubatch.n_tokens + i];
@@ -166,6 +172,9 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
         /*.output       =*/ data->output.data(),
         /*.data         =*/ data,
     };
+    res.source_token_index = data->source_token_index.empty()
+        ? nullptr
+        : data->source_token_index.data();
 
     return res;
 }

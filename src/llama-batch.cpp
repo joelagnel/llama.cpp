@@ -28,10 +28,12 @@ bool llama_batch_allocr::init(
         const llama_memory_i * memory,
         uint32_t n_embd,
         uint32_t n_seq_max,
-        bool output_all) {
+        bool output_all,
+        bool track_moe_routing_source_indices) {
     clear();
 
     batch = batch_inp;
+    this->track_moe_routing_source_indices = track_moe_routing_source_indices;
 
     this->vocab = &vocab;
 
@@ -448,6 +450,14 @@ uint32_t llama_batch_allocr::get_n_outputs() const {
     return n_outputs;
 }
 
+uint64_t llama_batch_allocr::moe_routing_source_index_allocations() const {
+    return n_moe_routing_source_index_allocations;
+}
+
+void llama_batch_allocr::reset_moe_routing_source_index_allocations() {
+    n_moe_routing_source_index_allocations = 0;
+}
+
 uint32_t llama_batch_allocr::get_n_used() const {
     return n_used;
 }
@@ -722,6 +732,7 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
 
 void llama_batch_allocr::clear() {
     n_outputs = 0;
+    track_moe_routing_source_indices = false;
 
     batch = {};
 
@@ -764,6 +775,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->seq_id_unq.resize(0);
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
+    if (track_moe_routing_source_indices) {
+        udata->source_token_index.resize(n_tokens);
+        ++n_moe_routing_source_index_allocations;
+    }
 
     udata->seq_id_data.reserve(n_tokens);
 
@@ -789,6 +804,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         udata->n_seq_id[i] = batch.n_seq_id[idxs[i]];
         udata->output[i]   = batch.logits[idxs[i]];
+        if (track_moe_routing_source_indices) {
+            udata->source_token_index[i] = idxs[i];
+        }
 
         for (int s = 0; s < udata->n_seq_id[i]; ++s) {
             const llama_seq_id seq_id = batch.seq_id[idxs[i]][s];
@@ -833,6 +851,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.output       =*/ udata->output.data(),
         /*.data         =*/ std::move(udata),
     };
+    res.source_token_index = track_moe_routing_source_indices
+        ? res.data->source_token_index.data()
+        : nullptr;
 
     if (debug > 0) {
         LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);

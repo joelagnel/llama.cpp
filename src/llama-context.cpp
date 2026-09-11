@@ -1342,6 +1342,10 @@ void llama_context::dispatch_begin(llama_context_dispatch_operation operation) {
     dispatch_decision = {};
     dispatch_first_physical_step = 0;
     dispatch_last_physical_step = 0;
+    const bool may_capture_moe_routing = dispatch_observer.moe_routing_may_capture != nullptr
+        ? dispatch_observer.moe_routing_may_capture(dispatch_observer.user_data, operation)
+        : cparams.moe_routing;
+    dispatch_moe_routing_source_indices = model.hparams.n_expert > 0 && may_capture_moe_routing;
     ++dispatch_logical_call;
 
     if (dispatch_observer.pre == nullptr) {
@@ -1915,12 +1919,14 @@ const llama_moe_routing_readback * llama_context::get_moe_routing_readback() {
 #ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
 void llama_context::reset_moe_routing_test_observer() {
     moe_routing_test_observer = {};
+    balloc->reset_moe_routing_source_index_allocations();
 }
 
 llama_moe_routing_test_observer llama_context::get_moe_routing_test_observer() const {
     auto result = moe_routing_test_observer;
     result.enabled = cparams.moe_routing;
     result.reserve_pending = sched_need_reserve;
+    result.source_index_allocations = balloc->moe_routing_source_index_allocations();
     return result;
 }
 #endif
@@ -2185,8 +2191,14 @@ int llama_context::encode(const llama_batch & batch_inp) {
     const int64_t n_embd = hparams.n_embd_inp_enc();
     const int64_t n_vocab = model.vocab.n_tokens();
 
+    dispatch_begin(LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE);
+    const auto dispatch_guard_deleter = [this](void *) { dispatch_finish(); };
+    std::unique_ptr<void, decltype(dispatch_guard_deleter)> dispatch_guard(this, dispatch_guard_deleter);
+
     // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd,
+            cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true,
+            dispatch_moe_routing_source_indices)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -2211,9 +2223,6 @@ int llama_context::encode(const llama_batch & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
 
-    dispatch_begin(LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE);
-    const auto dispatch_guard_deleter = [this](void *) { dispatch_finish(); };
-    std::unique_ptr<void, decltype(dispatch_guard_deleter)> dispatch_guard(this, dispatch_guard_deleter);
     dispatch_pre_ubatch();
 
     n_queued_tokens += n_tokens;
@@ -2333,7 +2342,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 #ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
         ++moe_routing_test_observer.graph_output_extractions;
 #endif
-        extract_moe_routing(res, 0, 0, ubatch);
+        extract_moe_routing(res, 0, ubatch);
     }
     dispatch_success(0);
 
@@ -2481,7 +2490,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all,
+            dispatch_moe_routing_source_indices)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -2745,7 +2755,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 #ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
             ++moe_routing_test_observer.graph_output_extractions;
 #endif
-            extract_moe_routing(res, n_tokens_prev, physical_ubatch_index, ubatch);
+            extract_moe_routing(res, physical_ubatch_index, ubatch);
         }
         dispatch_success(physical_ubatch_index);
 
@@ -3036,18 +3046,23 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 size_t llama_context::map_moe_routing_row_identities(
         std::vector<moe_routing_row_identity> & identities,
         size_t row_count,
-        size_t token_offset,
         const llama_ubatch & ubatch) {
     identities.resize(row_count);
+    const auto make_identity = [&](size_t token) {
+        const bool source_available = ubatch.source_token_index != nullptr;
+        return moe_routing_row_identity {
+            (int32_t) token,
+            source_available ? ubatch.source_token_index[token] : -1,
+            ubatch.token ? ubatch.token[token] : -1,
+            ubatch.pos ? ubatch.pos[token] : -1,
+            source_available
+                ? LLAMA_MOE_ROUTING_VALUE_STATUS_VALID
+                : LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE,
+        };
+    };
     if (row_count == ubatch.n_tokens) {
         for (size_t token = 0; token < row_count; ++token) {
-            identities[token] = {
-                (int32_t) token,
-                (int32_t) (token_offset + token),
-                ubatch.token ? ubatch.token[token] : -1,
-                ubatch.pos ? ubatch.pos[token] : -1,
-                LLAMA_MOE_ROUTING_VALUE_STATUS_VALID,
-            };
+            identities[token] = make_identity(token);
         }
         return row_count;
     }
@@ -3064,20 +3079,13 @@ size_t llama_context::map_moe_routing_row_identities(
         if (row == row_count) {
             break;
         }
-        identities[row++] = {
-            (int32_t) token,
-            (int32_t) (token_offset + token),
-            ubatch.token ? ubatch.token[token] : -1,
-            ubatch.pos ? ubatch.pos[token] : -1,
-            LLAMA_MOE_ROUTING_VALUE_STATUS_VALID,
-        };
+        identities[row++] = make_identity(token);
     }
     return row;
 }
 
 void llama_context::extract_moe_routing(
         const llm_graph_result * res,
-        size_t token_offset,
         uint32_t physical_ubatch_index,
         const llama_ubatch & ubatch) {
     const auto & outputs = res->get_moe_routing_outputs();
@@ -3214,13 +3222,13 @@ void llama_context::extract_moe_routing(
             moe_routing_test_observer.batch_peer_reads += capture.token_count;
 #endif
             map_moe_routing_row_identities(
-                capture.row_identities, capture.token_count, token_offset, ubatch);
+                capture.row_identities, capture.token_count, ubatch);
         } else if (ubatch.output != nullptr) {
 #ifdef LLAMA_MOE_ROUTING_TEST_HOOKS
             moe_routing_test_observer.batch_peer_reads += ubatch.n_tokens;
 #endif
             const size_t mapped_rows = map_moe_routing_row_identities(
-                capture.row_identities, capture.token_count, token_offset, ubatch);
+                capture.row_identities, capture.token_count, ubatch);
             if (mapped_rows != capture.token_count) {
                 LLAMA_LOG_WARN("%s: cannot map %zu MoE layer %d rows to %u batch tokens\n",
                         __func__, capture.token_count, output.layer_index, ubatch.n_tokens);
@@ -3266,15 +3274,17 @@ llama_moe_routing_test_row_position_mapping llama_context::test_map_moe_routing_
     std::array<llama_token, n_tokens> tokens;
     std::array<llama_pos, n_tokens*n_pos> positions;
     std::array<int8_t, n_tokens> output;
+    std::array<int32_t, n_tokens> source_indices;
     for (uint32_t token = 0; token < n_tokens; ++token) {
         tokens[token] = (llama_token) (token + 1);
         positions[token] = (llama_pos) token;
         output[token] = (token % 2) == 0;
+        source_indices[token] = token_offset + (int32_t) token;
         for (uint32_t plane = 1; plane < n_pos; ++plane) {
             positions[plane*n_tokens + token] = (llama_pos) (1000*plane + token);
         }
     }
-    const llama_ubatch ubatch = {
+    llama_ubatch ubatch = {
         /*.b_equal_seqs =*/ false,
         /*.n_tokens     =*/ n_tokens,
         /*.n_seq_tokens =*/ n_tokens,
@@ -3291,6 +3301,7 @@ llama_moe_routing_test_row_position_mapping llama_context::test_map_moe_routing_
         /*.output       =*/ output.data(),
         /*.data         =*/ {},
     };
+    ubatch.source_token_index = source_indices.data();
 
     const auto validate = [](const std::vector<moe_routing_row_identity> & identities,
                              uint32_t source_stride, uint32_t * count, bool * primary, bool * unique) {
@@ -3329,14 +3340,89 @@ llama_moe_routing_test_row_position_mapping llama_context::test_map_moe_routing_
 
     llama_moe_routing_test_row_position_mapping result;
     std::vector<moe_routing_row_identity> all_rows;
-    map_moe_routing_row_identities(all_rows, n_tokens, token_offset, ubatch);
+    map_moe_routing_row_identities(all_rows, n_tokens, ubatch);
     validate(all_rows, 1, &result.all_row_count, &result.all_rows_use_primary_positions,
         &result.all_rows_are_unique);
 
     std::vector<moe_routing_row_identity> output_rows;
-    map_moe_routing_row_identities(output_rows, n_tokens/2, token_offset, ubatch);
+    map_moe_routing_row_identities(output_rows, n_tokens/2, ubatch);
     validate(output_rows, 2, &result.output_row_count, &result.output_rows_use_primary_positions,
         &result.output_rows_are_unique);
+
+    // split_equal() concatenates each sequence's source indices. Routing row
+    // identities must retain those source indices, rather than synthesize an
+    // offset from the physical ubatch row.
+    static constexpr uint32_t n_reordered_tokens = 9;
+    std::array<llama_pos, n_reordered_tokens> reordered_positions;
+    std::array<int32_t, n_reordered_tokens> reordered_n_seq_id;
+    std::array<llama_seq_id, n_reordered_tokens> reordered_seq_ids;
+    std::array<llama_seq_id *, n_reordered_tokens> reordered_seq_ptrs;
+    std::array<int8_t, n_reordered_tokens> reordered_output = {};
+    // Three deliberately unequal sequences: seq 0 has four tokens, seq 1
+    // has two, and seq 2 has three. The first equal split takes their leading
+    // two tokens and must preserve the original indices.
+    static constexpr std::array<llama_seq_id, n_reordered_tokens> sequence_ids =
+        {{ 0, 1, 2, 0, 1, 2, 0, 2, 0 }};
+    for (uint32_t token = 0; token < n_reordered_tokens; ++token) {
+        reordered_positions[token] = 100 + (llama_pos) token;
+        reordered_n_seq_id[token] = 1;
+        reordered_seq_ids[token] = sequence_ids[token];
+        reordered_seq_ptrs[token] = &reordered_seq_ids[token];
+    }
+    // The first equal split is [0, 3, 1, 4, 2, 5]. Its compacted output
+    // population is [0, 4, 2], deliberately neither contiguous nor sorted.
+    reordered_output[0] = 1;
+    reordered_output[2] = 1;
+    reordered_output[4] = 1;
+    const llama_batch reordered_batch = {
+        /*.n_tokens =*/ (int32_t) n_reordered_tokens,
+        /*.token    =*/ nullptr,
+        /*.embd     =*/ nullptr,
+        /*.pos      =*/ reordered_positions.data(),
+        /*.n_seq_id =*/ reordered_n_seq_id.data(),
+        /*.seq_id   =*/ reordered_seq_ptrs.data(),
+        /*.logits   =*/ reordered_output.data(),
+    };
+    llama_vocab reordered_vocab;
+    llama_batch_allocr reordered_allocr(1);
+    if (reordered_allocr.init(reordered_batch, reordered_vocab, nullptr, 0, 3, false, true)) {
+        llama_ubatch reordered_ubatch = reordered_allocr.split_equal(6, true, 0);
+        static constexpr std::array<int32_t, 6> expected_all = {{ 0, 3, 1, 4, 2, 5 }};
+        static constexpr std::array<int32_t, 3> expected_output = {{ 0, 4, 2 }};
+        std::vector<moe_routing_row_identity> reordered_rows;
+        map_moe_routing_row_identities(reordered_rows, expected_all.size(), reordered_ubatch);
+        result.reordered_rows_preserve_source_indices = reordered_rows.size() == expected_all.size();
+        for (size_t row = 0; row < reordered_rows.size() && result.reordered_rows_preserve_source_indices; ++row) {
+            const auto & identity = reordered_rows[row];
+            result.reordered_rows_preserve_source_indices =
+                identity.ubatch_token_index == (int32_t) row &&
+                identity.token_index == expected_all[row] &&
+                identity.position == 100 + expected_all[row] &&
+                identity.status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID;
+        }
+
+        std::vector<moe_routing_row_identity> compacted_rows;
+        map_moe_routing_row_identities(compacted_rows, expected_output.size(), reordered_ubatch);
+        result.reordered_output_rows_preserve_source_indices = compacted_rows.size() == expected_output.size();
+        for (size_t row = 0; row < compacted_rows.size() && result.reordered_output_rows_preserve_source_indices; ++row) {
+            const auto & identity = compacted_rows[row];
+            result.reordered_output_rows_preserve_source_indices =
+                identity.token_index == expected_output[row] &&
+                identity.position == 100 + expected_output[row] &&
+                identity.status == LLAMA_MOE_ROUTING_VALUE_STATUS_VALID;
+        }
+
+        reordered_ubatch.source_token_index = nullptr;
+        map_moe_routing_row_identities(reordered_rows, expected_all.size(), reordered_ubatch);
+        result.missing_source_indices_are_unavailable = true;
+        for (const auto & identity : reordered_rows) {
+            if (identity.token_index != -1 ||
+                    identity.status != LLAMA_MOE_ROUTING_VALUE_STATUS_SOURCE_UNAVAILABLE) {
+                result.missing_source_indices_are_unavailable = false;
+                break;
+            }
+        }
+    }
     return result;
 }
 #endif

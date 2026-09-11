@@ -220,6 +220,7 @@ struct llama_moe_routing_test_observer {
     uint64_t device_to_host_copies = 0;
     uint64_t synchronizations = 0;
     uint64_t batch_peer_reads = 0;
+    uint64_t source_index_allocations = 0;
 };
 
 struct llama_moe_routing_test_row_position_mapping {
@@ -229,6 +230,9 @@ struct llama_moe_routing_test_row_position_mapping {
     bool output_rows_use_primary_positions = false;
     bool all_rows_are_unique = false;
     bool output_rows_are_unique = false;
+    bool reordered_rows_preserve_source_indices = false;
+    bool reordered_output_rows_preserve_source_indices = false;
+    bool missing_source_indices_are_unavailable = false;
 };
 
 LLAMA_API void llama_moe_routing_test_observer_reset(struct llama_context * ctx);
