@@ -6738,7 +6738,6 @@ private:
         std::set<const ggml_tensor *> tensors;
         for (const llama_layer & layer : model->layers) {
             const ggml_tensor * const layer_tensors[] = {
-                layer.ffn_norm_exps,
                 layer.ffn_gate_exps,
                 layer.ffn_down_exps,
                 layer.ffn_up_exps,
