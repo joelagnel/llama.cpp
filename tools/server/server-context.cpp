@@ -3189,9 +3189,9 @@ private:
                 SRV_ERR("telemetry journal: path resolution failed: %s\n", exception.what());
             }
         } else if (telemetry_enabled) {
-            SRV_INF("telemetry journal: disabled; set LLAMA_TELEMETRY_SPOOL_DIR to enable uncapped disk capture\n");
+            SRV_INF("%s", "telemetry journal: disabled; set LLAMA_TELEMETRY_SPOOL_DIR to enable uncapped disk capture\n");
         } else {
-            SRV_INF("telemetry journal: disabled with tracing master switch\n");
+            SRV_INF("%s", "telemetry journal: disabled with tracing master switch\n");
         }
         const char * telemetry_kv_pressure_buffer_env = getenv("LLAMA_TELEMETRY_KV_PRESSURE_BUFFER_MIB");
         if (telemetry_kv_pressure_buffer_env) {
@@ -3225,7 +3225,7 @@ private:
                 control.kv_pressure_detail = value("kv_pressure_detail");
                 control.native_gpu_gpm = value("native_gpu_gpm");
                 telemetry_control_apply(control);
-                SRV_INF("telemetry control: applied router defaults\n");
+                SRV_INF("%s", "telemetry control: applied router defaults\n");
             } catch (const std::exception & exception) {
                 SRV_WRN("telemetry control: ignored invalid router defaults: %s\n", exception.what());
             }
