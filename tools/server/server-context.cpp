@@ -6863,8 +6863,8 @@ private:
             uint64_t microbatch_generation,
             const telemetry_control_state & control) {
         if (!control.kv_pressure_detail || !telemetry_kv_pressure_active ||
-                !telemetry_kv_pressure_pending_initialize ||
-                telemetry_kv_pressure_pending_generation != microbatch_generation) {
+                (telemetry_kv_pressure_pending_initialize &&
+                 telemetry_kv_pressure_pending_generation != microbatch_generation)) {
             return;
         }
 
@@ -6877,6 +6877,11 @@ private:
 
         telemetry_kv_pressure_applied_props_generation = props_generation;
         telemetry_kv_pressure_applied_microbatch_generation = microbatch_generation;
+        // Unrelated control changes also advance the microbatch generation.
+        // Rebind active KV capture without resetting its request or wait state.
+        if (!telemetry_kv_pressure_pending_initialize) {
+            return;
+        }
         telemetry_kv_pressure_pending_initialize = false;
         telemetry_kv_pressure_pending_generation = 0;
         llama_synchronize(ctx_tgt);
