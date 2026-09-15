@@ -345,6 +345,25 @@ public:
         return seq_cells_range(seq_id, first, last) && seq_cell_count[seq_id] == last - first;
     }
 
+    // Return one physical cell for this sequence whose logical position is in
+    // [p0, p1). This uses the per-sequence position index, so callers that
+    // repeatedly remove the returned cell only visit matching entries instead
+    // of scanning the entire (potentially unified) KV pool.
+    bool seq_pos_find(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint32_t & cell) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & positions = seq_pos[seq_id];
+        const auto it = positions.lower_bound({ p0, 0 });
+
+        if (it == positions.end() || it->first >= p1) {
+            return false;
+        }
+
+        cell = it->second;
+        return true;
+    }
+
     // the token of the cell of sequence seq_id at the largest position <= p
     // when several cells share that position, the one with the highest index wins
     // return LLAMA_TOKEN_NULL if the sequence has no cell at or before p
