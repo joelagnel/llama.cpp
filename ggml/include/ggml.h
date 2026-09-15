@@ -2508,6 +2508,12 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Hint that K/V use a single pool shared by multiple logical sequences.
+    // Backends may use this to skip fully-masked interior cache regions.
+    GGML_API void ggml_flash_attn_ext_set_kv_unified(
+            struct ggml_tensor * a,
+            bool                 kv_unified);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

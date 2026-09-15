@@ -718,6 +718,70 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// Generate one 32-bit skip word per CUDA block. Each warp scans one KV tile at
+// a time, and the warps collectively cover all 32 bits without atomics or a
+// separate memset. This is particularly important for decode, where a serial
+// scan of a long unified KV cache would otherwise dominate the attention work.
+template <int ncols1, int nwarps = 8>
+__launch_bounds__(nwarps*WARP_SIZE, 1)
+static __global__ void flash_attn_mask_to_KV_skip(
+        const half2 * mask_ptr, uint32_t * KV_skip_ptr, const int64_t s31, const int64_t s33,
+        const int ne01, const int ne03, const int ne11, const int nbatch_fa,
+        const int n_kv_blocks, const int n_block_words) {
+    const int tid      = threadIdx.x;
+    const int lane     = tid % WARP_SIZE;
+    const int warp     = tid / WARP_SIZE;
+    const int sequence = blockIdx.z;
+    const int jt       = blockIdx.y;
+    const int iw       = blockIdx.x;
+
+    const int mask_tile     = sequence*gridDim.y + jt;
+
+    const half2 * GGML_CUDA_RESTRICT mask = mask_ptr + int64_t(sequence % ne03)*s33;
+    uint32_t * GGML_CUDA_RESTRICT KV_skip =
+        KV_skip_ptr + int64_t(mask_tile)*n_block_words;
+
+    __shared__ int skip_bits[32];
+
+    ggml_cuda_pdl_sync();
+
+#pragma unroll
+    for (int bit = warp; bit < 32; bit += nwarps) {
+        const int kb = iw*32 + bit;
+        int all_inf = kb < n_kv_blocks;
+
+        const int i0 = kb*nbatch_fa;
+        const int i1 = min(i0 + nbatch_fa, ne11);
+
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            const int j_vram = (jt*ncols1 + j) % ne01;
+            for (int i = i0/2 + lane; i < (i1 + 1)/2; i += WARP_SIZE) {
+                const float2 tmp = __half22float2(mask[int64_t(j_vram)*s31 + i]);
+                all_inf = all_inf && int(isinf(tmp.x) && tmp.x < 0.0f) &&
+                    (2*i + 1 >= i1 || int(isinf(tmp.y) && tmp.y < 0.0f));
+            }
+        }
+
+        all_inf = warp_reduce_all(all_inf);
+
+        if (lane == 0) {
+            skip_bits[bit] = all_inf;
+        }
+    }
+
+    __syncthreads();
+
+    if (tid == 0) {
+        uint32_t skip_word = 0;
+#pragma unroll
+        for (int bit = 0; bit < 32; ++bit) {
+            skip_word |= uint32_t(skip_bits[bit]) << bit;
+        }
+        KV_skip[iw] = skip_word;
+    }
+}
+
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
@@ -976,7 +1040,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const bool use_block_skip = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1109,7 +1173,8 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+            (use_block_skip || Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1119,10 +1184,27 @@ void launch_fattn(
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
-        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+        const int n_kv_blocks  = (K->ne[1] + nbatch_fa - 1) / nbatch_fa;
+        const int n_block_words = use_block_skip ? (n_kv_blocks + 31) / 32 : 0;
+
+        KV_max.alloc(size_t(ne_KV_max) * (1 + n_block_words));
+        if (use_block_skip) {
+            constexpr int nwarps_KV_skip = 8;
+            const dim3 blocks_num_KV_skip(n_block_words, ntiles_x, Q->ne[3]);
+            const dim3 block_dim_KV_skip(nwarps_KV_skip*WARP_SIZE, 1, 1);
+            uint32_t * KV_skip_ptr = (uint32_t *) (KV_max.ptr + ne_KV_max);
+
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params(blocks_num_KV_skip, block_dim_KV_skip, 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_skip<ncols1, nwarps_KV_skip>, launch_params,
+                (const half2 *) mask->data, KV_skip_ptr, s31, s33,
+                int(Q->ne[1]), int(mask->ne[3]), int(K->ne[1]), nbatch_fa, n_kv_blocks, n_block_words);
+        } else {
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
+                (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1151,6 +1233,9 @@ void launch_fattn(
         };
 
         const int  max_blocks   = max_blocks_per_sm*nsm;
+        // A fully skipped Stream-K partition is a valid neutral partial result:
+        // max = -FLT_MAX/2, rowsum = 0, and VKQ = 0. The fixup kernels already
+        // combine that representation correctly with non-empty partitions.
         const bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
 
         blocks_num.x = ntiles_dst;
@@ -1159,16 +1244,22 @@ void launch_fattn(
 
         if(use_stream_k) {
             const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
-            // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
-            // Only do this if the occupancy loss from rounding is acceptable.
+            // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks.
+            // For the legacy path, only do this if the occupancy loss from rounding is acceptable.
             const int nblocks_stream_k_rounded = (nblocks_stream_k_raw / ntiles_dst) * ntiles_dst;
             const int max_efficiency_loss_percent = 5;
             const int efficiency_loss_percent = nblocks_stream_k_rounded > 0
                 ? 100 * (nblocks_stream_k_raw - nblocks_stream_k_rounded) / nblocks_stream_k_raw
                 : 100;
-            const int nblocks_stream_k = efficiency_loss_percent <= max_efficiency_loss_percent
+            // The block-skip kernel uses a strided worker mapping when every
+            // output tile has the same number of CTAs. This spreads live unified-
+            // KV blocks across all workers instead of concentrating them in the
+            // CTA whose contiguous partition happens to contain the sequence.
+            const int nblocks_stream_k = use_block_skip && nblocks_stream_k_rounded > ntiles_dst
                 ? nblocks_stream_k_rounded
-                : nblocks_stream_k_raw;
+                : efficiency_loss_percent <= max_efficiency_loss_percent
+                    ? nblocks_stream_k_rounded
+                    : nblocks_stream_k_raw;
 
             blocks_num.x = nblocks_stream_k;
         }

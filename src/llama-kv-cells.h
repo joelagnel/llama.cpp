@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -51,6 +52,9 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_cell_count[s] = 0;
+            seq_cell_first[s] = 0;
+            seq_cell_last [s] = 0;
         }
     }
 
@@ -318,6 +322,29 @@ public:
         return seq[i].test(seq_id);
     }
 
+    // Return the smallest half-open physical range containing a sequence. The
+    // normal KQ mask handles any holes inside the range. Bounds are maintained
+    // incrementally, including speculative-decoding rollback.
+    bool seq_cells_range(llama_seq_id seq_id, uint32_t & first, uint32_t & last) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        if (seq_cell_count[seq_id] == 0) {
+            first = 0;
+            last  = 0;
+            return false;
+        }
+
+        first = seq_cell_first[seq_id];
+        last  = seq_cell_last [seq_id];
+
+        return true;
+    }
+
+    bool seq_cells_contiguous(llama_seq_id seq_id, uint32_t & first, uint32_t & last) const {
+        return seq_cells_range(seq_id, first, last) && seq_cell_count[seq_id] == last - first;
+    }
+
     // the token of the cell of sequence seq_id at the largest position <= p
     // when several cells share that position, the one with the highest index wins
     // return LLAMA_TOKEN_NULL if the sequence has no cell at or before p
@@ -523,16 +550,47 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
+    // Cached physical ranges for fast compact attention views. A sequence can
+    // be fragmented even when its logical positions are ordered, so these are
+    // tracked independently of seq_pos.
+    uint32_t seq_cell_count[LLAMA_MAX_SEQ] = {};
+    uint32_t seq_cell_first[LLAMA_MAX_SEQ] = {};
+    uint32_t seq_cell_last [LLAMA_MAX_SEQ] = {};
+
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
         const auto n = seq_pos[s].erase({ pos[i], i });
         assert(n == 1);
         GGML_UNUSED(n);
+
+        assert(seq_cell_count[s] > 0);
+        --seq_cell_count[s];
+        if (seq_cell_count[s] == 0) {
+            seq_cell_first[s] = 0;
+            seq_cell_last [s] = 0;
+        } else if (i == seq_cell_first[s]) {
+            do {
+                ++seq_cell_first[s];
+            } while (seq_cell_first[s] < seq_cell_last[s] && !seq[seq_cell_first[s]].test(s));
+        } else if (i + 1 == seq_cell_last[s]) {
+            do {
+                --seq_cell_last[s];
+            } while (seq_cell_last[s] > seq_cell_first[s] && !seq[seq_cell_last[s] - 1].test(s));
+        }
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
         seq_pos[s].insert({ pos[i], i });
+
+        if (seq_cell_count[s] == 0) {
+            seq_cell_first[s] = i;
+            seq_cell_last [s] = i + 1;
+        } else {
+            seq_cell_first[s] = std::min(seq_cell_first[s], i);
+            seq_cell_last [s] = std::max(seq_cell_last [s], i + 1);
+        }
+        ++seq_cell_count[s];
     }
 
     // remove cell i
