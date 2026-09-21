@@ -2850,10 +2850,8 @@ bool llama_kv_cache_context::apply() {
     kv_offset = 0;
     attn_compact = false;
 
-    // A single active sequence commonly occupies one contiguous run inside a
-    // unified cache. Present that run as a compact, padded tensor view so dense
-    // FlashAttention does exactly the same amount of work as a split cache.
-    // Fragmented and multi-sequence batches retain the general mask-based path.
+    // Crop a single sequence's attention view to its padded physical range.
+    // The attention mask still excludes holes and cells belonging to other sequences.
     const auto & ubatch = ubatches[i_cur];
     if (getenv("LLAMA_DISABLE_KV_COMPACT_VIEW") == nullptr &&
             kv->is_unified() && ubatch.n_seqs_unq == 1 && ubatch.n_tokens > 0) {

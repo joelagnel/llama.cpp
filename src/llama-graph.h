@@ -319,6 +319,18 @@ public:
     const llama_cparams cparams;
 };
 
+// View offsets and attention hints are captured when the graph is built.
+struct llm_graph_kv_view {
+    llm_graph_kv_view() = default;
+    explicit llm_graph_kv_view(const llama_kv_cache_context * mctx);
+
+    bool can_reuse(const llama_kv_cache_context * mctx) const;
+
+private:
+    uint32_t offset = 0;
+    bool compact = false;
+};
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
@@ -346,7 +358,7 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    uint32_t kv_offset = 0; // physical unified-KV cell at which the compact attention view starts
+    llm_graph_kv_view kv_view;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -391,7 +403,7 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    uint32_t kv_offset = 0; // physical unified-KV cell at which the compact attention view starts
+    llm_graph_kv_view kv_view;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -434,8 +446,8 @@ public:
 
     ggml_tensor * self_k_rot_lid = nullptr;
 
-    uint32_t kv_offset_mla = 0; // physical unified-KV cell at which the compact MLA view starts
-    uint32_t kv_offset_lid = 0; // physical unified-KV cell at which the compact indexer view starts
+    llm_graph_kv_view kv_view_mla;
+    llm_graph_kv_view kv_view_lid;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -486,7 +498,7 @@ public:
 
     ggml_tensor * self_k_idxs_idx = nullptr; // I64 [n_batch]
 
-    uint32_t kv_offset_idx = 0; // physical unified-KV cell at which the compact indexer view starts
+    llm_graph_kv_view kv_view_idx;
 
     const llama_kv_cache_msa_context * mctx_msa;
 };
@@ -525,8 +537,8 @@ public:
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    uint32_t kv_offset     = 0; // physical unified-KV cell at which the compact base view starts
-    uint32_t kv_offset_swa = 0; // physical unified-KV cell at which the compact SWA view starts
+    llm_graph_kv_view kv_view;
+    llm_graph_kv_view kv_view_swa;
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
@@ -570,8 +582,8 @@ public:
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    uint32_t kv_offset     = 0; // physical unified-KV cell at which the compact base view starts
-    uint32_t kv_offset_swa = 0; // physical unified-KV cell at which the compact SWA view starts
+    llm_graph_kv_view kv_view;
+    llm_graph_kv_view kv_view_swa;
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_k_rot_swa = nullptr;

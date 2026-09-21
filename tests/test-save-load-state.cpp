@@ -7,6 +7,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -773,11 +774,151 @@ static const std::vector<const char *> test_names = {
     "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf",
 };
 
-// Run the full save/load test suite (tests 1-9) for a single model.
-// Returns the per-test results.
-static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
-    test_suite suite;
+// Test 9: differential numerical fixture test for compact views after restoring disjoint sequences.
+// This is opt-in: a fixed logit tolerance is not a general state-equivalence oracle for arbitrary models.
+static bool test_kv_compact_view(llama_model * model, const common_params & params, const llama_tokens & tokens) {
+    struct compact_env {
+        const bool present = std::getenv("LLAMA_DISABLE_KV_COMPACT_VIEW") != nullptr;
+        const std::string previous = present ? std::getenv("LLAMA_DISABLE_KV_COMPACT_VIEW") : "";
 
+        static void set(const char * value) {
+#ifdef _WIN32
+            const int result = _putenv_s("LLAMA_DISABLE_KV_COMPACT_VIEW", value ? value : "");
+#else
+            const int result = value ? setenv("LLAMA_DISABLE_KV_COMPACT_VIEW", value, 1) : unsetenv("LLAMA_DISABLE_KV_COMPACT_VIEW");
+#endif
+            GGML_ASSERT(result == 0);
+        }
+
+        ~compact_env() { set(present ? previous.c_str() : nullptr); }
+    } env;
+
+    GGML_ASSERT(!tokens.empty());
+    LOG("\n=== Test 9: compact KV views ===\n");
+
+    constexpr int n_prefix = 252;
+    constexpr int n_replay = 4;
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    char architecture[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
+    std::vector<std::vector<float>> expected;
+
+    for (bool compact : { false, true }) {
+        compact_env::set(compact ? nullptr : "1");
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_ctx = 1024;
+        cparams.n_seq_max = 3;
+        cparams.n_batch = 256;
+        cparams.n_ubatch = std::min(cparams.n_ubatch, cparams.n_batch);
+        cparams.kv_unified = true;
+        auto ctx = llama_context_ptr{llama_init_from_model(model, cparams)};
+        if (!ctx) {
+            return false;
+        }
+
+        const auto decode = [&](llama_seq_id seq, int first, int count) {
+            llama_batch_ptr batch(count, 0, 1);
+            for (int p = first; p < first + count; ++p) {
+                // The Llama fixture also checks positions beyond the compact view.
+                const llama_pos pos = p + (seq == 2 && std::strcmp(architecture, "llama") == 0 ? 512 : 0);
+                common_batch_add(batch.get(), tokens[(p + seq) % tokens.size()], pos, { seq }, p == first + count - 1);
+            }
+            return llama_decode(ctx.get(), batch.get()) == 0;
+        };
+
+        size_t row = 0;
+        const auto check_logits = [&](llama_seq_id seq, int pos) {
+            const float * logits = llama_get_logits_ith(ctx.get(), -1);
+            if (!logits) {
+                return false;
+            }
+            if (!compact) {
+                expected.emplace_back(logits, logits + n_vocab);
+            } else {
+                for (int token = 0; token < n_vocab; ++token) {
+                    const float ref = expected[row][token];
+                    const float actual = logits[token];
+                    // Different attention tile layouts can change floating-point reduction order.
+                    const float tolerance = 1e-3f + 1e-4f * std::fabs(ref);
+                    if (!std::isfinite(ref) || !std::isfinite(actual) || std::fabs(ref - actual) > tolerance) {
+                        LOG_ERR("%s: logits differ for sequence %d, position %d, token %d: %g != %g\n", __func__, seq, pos, token, (double) actual, (double) ref);
+                        return false;
+                    }
+                }
+            }
+            ++row;
+            return true;
+        };
+
+        // Each sequence occupies its own 256-cell interval. Save before its last four tokens.
+        std::vector<uint8_t> states[3];
+        for (llama_seq_id seq = 0; seq < 3; ++seq) {
+            if (!decode(seq, 0, n_prefix)) {
+                LOG_ERR("%s: prefix decode failed for sequence %d\n", __func__, seq);
+                return false;
+            }
+            states[seq].resize(llama_state_seq_get_size(ctx.get(), seq));
+            if (states[seq].empty() || llama_state_seq_get_data(ctx.get(), states[seq].data(), states[seq].size(), seq) != states[seq].size()) {
+                return false;
+            }
+            if (!decode(seq, n_prefix, n_replay)) {
+                return false;
+            }
+        }
+
+        // Alternate offsets 256, 512, 256 while retaining identical tensor shapes.
+        for (llama_seq_id seq : { 1, 2, 1 }) {
+            if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), seq, -1, -1) ||
+                llama_state_seq_set_data(ctx.get(), states[seq].data(), states[seq].size(), seq) != states[seq].size()) {
+                LOG_ERR("%s: restore failed for sequence %d\n", __func__, seq);
+                return false;
+            }
+            for (int p = n_prefix; p < n_prefix + n_replay; ++p) {
+                if (!decode(seq, p, 1)) {
+                    return false;
+                }
+                // QSA's ratio-1 tail fills the extra top-k slots here, avoiding a cutoff within a tied block.
+                if (p == n_prefix + n_replay - 2 && !check_logits(seq, p)) {
+                    return false;
+                }
+            }
+        }
+
+        if (std::strcmp(architecture, "llama") != 0) {
+            continue;
+        }
+
+        // Grow the occupied pool through restore without changing sequence 0's view shape or offset.
+        llama_memory_clear(llama_get_memory(ctx.get()), false);
+        if (llama_state_seq_set_data(ctx.get(), states[0].data(), states[0].size(), 0) != states[0].size() ||
+            !decode(0, n_prefix, n_replay - 1) ||
+            !decode(0, n_prefix + n_replay - 1, 1) || !check_logits(0, n_prefix + n_replay - 1)) {
+            return false;
+        }
+        if (llama_state_seq_set_data(ctx.get(), states[1].data(), states[1].size(), 1) != states[1].size() ||
+            !llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1) ||
+            llama_state_seq_set_data(ctx.get(), states[0].data(), states[0].size(), 0) != states[0].size()) {
+            return false;
+        }
+        const int32_t reused_before = llama_perf_context(ctx.get()).n_reused;
+        if (!decode(0, n_prefix, 1) || !check_logits(0, n_prefix)) {
+            return false;
+        }
+        if (compact && llama_perf_context(ctx.get()).n_reused != reused_before) {
+            LOG_ERR("%s: reused graph after the compact attention hint changed\n", __func__);
+            return false;
+        }
+    }
+
+    LOG("PASS\n");
+    return true;
+}
+
+
+// Run the full save/load test suite (tests 1-9, plus the opt-in compact-view test) for a single model.
+// Returns the per-test results.
+static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params, bool test_compact_view) {
+    test_suite suite;
     struct common_params params = base_params;
     params.model.path = model_path;
 
@@ -786,7 +927,7 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
 
     if (model == nullptr) {
         LOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
-        suite.results.assign(test_names.size(), test_status::SKIP);
+        suite.results.assign(test_names.size() + (test_compact_view ? 1 : 0), test_status::SKIP);
         return suite;
     }
 
@@ -852,6 +993,10 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
     // Test 9: state restore failure
     suite.results.push_back(test_state_restore_failure(model, params, tokens) ? test_status::PASS : test_status::FAIL);
 
+    if (test_compact_view) {
+        suite.results.push_back(test_kv_compact_view(model, params, tokens) ? test_status::PASS : test_status::FAIL);
+    }
+
     return suite;
 }
 
@@ -875,12 +1020,15 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    // extract our own --models DIR option before handing the rest to the common arg parser
+    // Extract test-specific options before handing the rest to the common arg parser.
     std::string models_dir;
+    bool test_compact_view = false;
     std::vector<char *> filtered_argv;
     filtered_argv.push_back(argv[0]);
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--models") == 0) {
+        if (strcmp(argv[i], "--test-kv-compact-view") == 0) {
+            test_compact_view = true;
+        } else if (strcmp(argv[i], "--models") == 0) {
             if (i + 1 >= argc) {
                 LOG_ERR("%s: --models requires a directory argument\n", __func__);
                 return 1;
@@ -915,6 +1063,10 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
 
+    if (test_compact_view) {
+        LOG_INF("%s: compact KV differential-logit fixture regression enabled\n", __func__);
+    }
+
     if (!models_dir.empty()) {
         // run the suite over every dummy model in the directory
         if (!std::filesystem::exists(models_dir) || !std::filesystem::is_directory(models_dir)) {
@@ -945,8 +1097,13 @@ int main(int argc, char ** argv) {
         // silence everything but the table itself (LOG has verbosity LOG_LEVEL_OUTPUT = 0)
         common_log_set_verbosity_thold(0);
 
+        auto active_test_names = test_names;
+        if (test_compact_view) {
+            active_test_names.push_back("compact");
+        }
+
         LOG("%-*s", (int) name_width, "Model");
-        for (const auto & name : test_names) {
+        for (const auto & name : active_test_names) {
             LOG("  %-*s", col_width(name), name);
         }
         LOG("\n");
@@ -960,10 +1117,10 @@ int main(int argc, char ** argv) {
             LOG("%-*s", (int) name_width, name.c_str());
             common_log_flush(common_log_main());
 
-            const test_suite suite = run_save_load_tests_for_model(model_path, params);
+            const test_suite suite = run_save_load_tests_for_model(model_path, params, test_compact_view);
 
             for (size_t i = 0; i < suite.results.size(); i++) {
-                LOG("  %s%*s", test_status_str(suite.results[i]), col_width(test_names[i]) - 4, "");
+                LOG("  %s%*s", test_status_str(suite.results[i]), col_width(active_test_names[i]) - 4, "");
             }
             LOG("\n");
             common_log_flush(common_log_main());
@@ -984,7 +1141,7 @@ int main(int argc, char ** argv) {
     }
 
     // single-model mode
-    const test_suite suite = run_save_load_tests_for_model(params.model.path, params);
+    const test_suite suite = run_save_load_tests_for_model(params.model.path, params, test_compact_view);
     const bool all_passed = suite.all_passed();
     if (all_passed) {
         LOG("\nAll tests passed.\n");

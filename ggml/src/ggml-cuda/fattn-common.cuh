@@ -1187,12 +1187,12 @@ void launch_fattn(
         const int n_kv_blocks  = (K->ne[1] + nbatch_fa - 1) / nbatch_fa;
         const int n_block_words = use_block_skip ? (n_kv_blocks + 31) / 32 : 0;
 
-        KV_max.alloc(size_t(ne_KV_max) * (1 + n_block_words));
+        KV_max.alloc(size_t(ne_KV_max) * (use_block_skip ? n_block_words : 1));
         if (use_block_skip) {
             constexpr int nwarps_KV_skip = 8;
             const dim3 blocks_num_KV_skip(n_block_words, ntiles_x, Q->ne[3]);
             const dim3 block_dim_KV_skip(nwarps_KV_skip*WARP_SIZE, 1, 1);
-            uint32_t * KV_skip_ptr = (uint32_t *) (KV_max.ptr + ne_KV_max);
+            uint32_t * KV_skip_ptr = (uint32_t *) KV_max.ptr;
 
             const ggml_cuda_kernel_launch_params launch_params =
                 ggml_cuda_kernel_launch_params(blocks_num_KV_skip, block_dim_KV_skip, 0, main_stream);

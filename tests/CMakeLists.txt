@@ -219,7 +219,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(
         test-save-load-state
         LABEL main
-        ARGS --models "${MODEL_DIR}"
+        ARGS --models "${MODEL_DIR}" --test-kv-compact-view
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 

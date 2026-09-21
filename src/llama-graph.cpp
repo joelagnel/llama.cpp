@@ -467,6 +467,13 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+llm_graph_kv_view::llm_graph_kv_view(const llama_kv_cache_context * mctx) :
+    offset(mctx->get_kv_offset()), compact(mctx->is_attn_compact()) {}
+
+bool llm_graph_kv_view::can_reuse(const llama_kv_cache_context * mctx) const {
+    return offset == mctx->get_kv_offset() && compact == mctx->is_attn_compact();
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
@@ -497,7 +504,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
-    res &= kv_offset == mctx->get_kv_offset();
+    res &= kv_view.can_reuse(mctx);
 
     return res;
 }
@@ -520,7 +527,7 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
-    res &= kv_offset == mctx->get_kv_offset();
+    res &= kv_view.can_reuse(mctx);
 
     return res;
 }
@@ -555,8 +562,8 @@ bool llm_graph_input_attn_kv_msa::can_reuse(const llm_graph_params & params) {
     }
 
     res &= can_reuse_kq_mask(self_kq_mask, this->mctx, params.ubatch, params.cparams);
-    res &= kv_offset == this->mctx->get_kv_offset();
-    res &= kv_offset_idx == mctx_msa->get_idx()->get_kv_offset();
+    res &= kv_view.can_reuse(this->mctx);
+    res &= kv_view_idx.can_reuse(mctx_msa->get_idx());
 
     return res;
 }
@@ -591,8 +598,8 @@ bool llm_graph_input_attn_k_dsa::can_reuse_impl(const llm_graph_params & params)
     res &= can_reuse_kq_mask(self_kq_mask_mla, mctx->get_mla(), params.ubatch, params.cparams);
     res &= can_reuse_kq_mask(self_kq_mask_lid, mctx->get_lid(), params.ubatch, params.cparams);
 
-    res &= kv_offset_mla == mctx->get_mla()->get_kv_offset();
-    res &= kv_offset_lid == mctx->get_lid()->get_kv_offset();
+    res &= kv_view_mla.can_reuse(mctx->get_mla());
+    res &= kv_view_lid.can_reuse(mctx->get_lid());
 
     return res;
 }
@@ -686,8 +693,8 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
     }
 
-    res &= kv_offset     == mctx->get_base()->get_kv_offset();
-    res &= kv_offset_swa == mctx->get_swa()->get_kv_offset();
+    res &= kv_view.can_reuse(mctx->get_base());
+    res &= kv_view_swa.can_reuse(mctx->get_swa());
 
     return res;
 }
@@ -746,8 +753,8 @@ bool llm_graph_input_attn_k_iswa::can_reuse(const llm_graph_params & params) {
         res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
     }
 
-    res &= kv_offset     == mctx->get_base()->get_kv_offset();
-    res &= kv_offset_swa == mctx->get_swa()->get_kv_offset();
+    res &= kv_view.can_reuse(mctx->get_base());
+    res &= kv_view_swa.can_reuse(mctx->get_swa());
 
     return res;
 }
@@ -1137,7 +1144,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
-    res &= inp_attn->kv_offset == mctx->get_attn()->get_kv_offset();
+    res &= inp_attn->kv_view.can_reuse(mctx->get_attn());
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1181,7 +1188,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
-    res &= inp_attn->kv_offset == mctx->get_attn()->get_kv_offset();
+    res &= inp_attn->kv_view.can_reuse(mctx->get_attn());
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1271,8 +1278,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
 
-    res &= inp_attn->kv_offset     == attn_ctx->get_base()->get_kv_offset();
-    res &= inp_attn->kv_offset_swa == attn_ctx->get_swa()->get_kv_offset();
+    res &= inp_attn->kv_view.can_reuse(attn_ctx->get_base());
+    res &= inp_attn->kv_view_swa.can_reuse(attn_ctx->get_swa());
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2854,7 +2861,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     const llama_kv_cache_context * mctx_cur) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
-    inp->kv_offset = mctx_cur->get_kv_offset();
+    inp->kv_view = llm_graph_kv_view(mctx_cur);
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -2963,7 +2970,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
     const llama_kv_cache_context * mctx_cur) {
 
     auto inp = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur);
-    inp->kv_offset = mctx_cur->get_kv_offset();
+    inp->kv_view = llm_graph_kv_view(mctx_cur);
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -3340,8 +3347,8 @@ static std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(
     const llama_kv_cache_dsa_context * mctx_cur) {
 
     auto inp = std::make_unique<llm_graph_input_attn_k_dsa>(hparams, cparams, mctx_cur);
-    inp->kv_offset_mla = mctx_cur->get_mla()->get_kv_offset();
-    inp->kv_offset_lid = mctx_cur->get_lid()->get_kv_offset();
+    inp->kv_view_mla = llm_graph_kv_view(mctx_cur->get_mla());
+    inp->kv_view_lid = llm_graph_kv_view(mctx_cur->get_lid());
 
     {
         inp->self_k_idxs_mla = mctx_cur->get_mla()->build_input_k_idxs(ctx0, ubatch);
@@ -3381,7 +3388,7 @@ llm_graph_input_attn_k_dsa_iswa * llm_graph_context::build_attn_inp_k_dsa_iswa()
 
     // build_attn_inp_k_impl rejects SWA caches, so construct the input directly
     auto inp_swa = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur->get_swa());
-    inp_swa->kv_offset = mctx_cur->get_swa()->get_kv_offset();
+    inp_swa->kv_view = llm_graph_kv_view(mctx_cur->get_swa());
 
     inp_swa->self_k_idxs = mctx_cur->get_swa()->build_input_k_idxs(ctx0, ubatch);
 
@@ -3401,8 +3408,8 @@ llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa(bool msa_
     const auto * mctx_base = mctx_cur->get_base();
     const auto * mctx_idx  = mctx_cur->get_idx();
 
-    inp->kv_offset     = mctx_base->get_kv_offset();
-    inp->kv_offset_idx = mctx_idx->get_kv_offset();
+    inp->kv_view = llm_graph_kv_view(mctx_base);
+    inp->kv_view_idx = llm_graph_kv_view(mctx_idx);
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -3431,8 +3438,8 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
     const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, mctx_cur);
-    inp->kv_offset     = mctx_cur->get_base()->get_kv_offset();
-    inp->kv_offset_swa = mctx_cur->get_swa()->get_kv_offset();
+    inp->kv_view = llm_graph_kv_view(mctx_cur->get_base());
+    inp->kv_view_swa = llm_graph_kv_view(mctx_cur->get_swa());
 
     {
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
@@ -3465,8 +3472,8 @@ llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_attn_k_iswa>(hparams, cparams, mctx_cur);
-    inp->kv_offset     = mctx_cur->get_base()->get_kv_offset();
-    inp->kv_offset_swa = mctx_cur->get_swa()->get_kv_offset();
+    inp->kv_view = llm_graph_kv_view(mctx_cur->get_base());
+    inp->kv_view_swa = llm_graph_kv_view(mctx_cur->get_swa());
 
     {
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
@@ -3670,8 +3677,8 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
     const auto * attn_ctx = mctx_cur->get_attn();
 
     auto inp_attn = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, attn_ctx);
-    inp_attn->kv_offset     = attn_ctx->get_base()->get_kv_offset();
-    inp_attn->kv_offset_swa = attn_ctx->get_swa()->get_kv_offset();
+    inp_attn->kv_view = llm_graph_kv_view(attn_ctx->get_base());
+    inp_attn->kv_view_swa = llm_graph_kv_view(attn_ctx->get_swa());
 
     {
         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);

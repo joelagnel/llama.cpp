@@ -33,7 +33,6 @@ struct llama_kv_cell_ext {
 };
 
 // meta information about KV cells that can be part of multiple sequences at the same time
-// TODO: add unit tests
 class llama_kv_cells {
 public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
@@ -52,7 +51,6 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
-            seq_cell_count[s] = 0;
             seq_cell_first[s] = 0;
             seq_cell_last [s] = 0;
         }
@@ -272,11 +270,14 @@ public:
         assert(i < pos.size());
 
         if (seq[i].test(seq_id)) {
-            seq_pos_rm(i);
-            seq[i].reset();
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (s != seq_id && seq[i].test(s)) {
+                    seq_pos_dec(s, i);
+                }
+            }
 
+            seq[i].reset();
             seq[i].set(seq_id);
-            seq_pos_inc(seq_id, i);
 
             return false;
         }
@@ -322,14 +323,12 @@ public:
         return seq[i].test(seq_id);
     }
 
-    // Return the smallest half-open physical range containing a sequence. The
-    // normal KQ mask handles any holes inside the range. Bounds are maintained
-    // incrementally, including speculative-decoding rollback.
+    // Return the smallest half-open physical range containing a sequence; the KQ mask handles any holes.
     bool seq_cells_range(llama_seq_id seq_id, uint32_t & first, uint32_t & last) const {
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
 
-        if (seq_cell_count[seq_id] == 0) {
+        if (seq_pos[seq_id].empty()) {
             first = 0;
             last  = 0;
             return false;
@@ -341,14 +340,7 @@ public:
         return true;
     }
 
-    bool seq_cells_contiguous(llama_seq_id seq_id, uint32_t & first, uint32_t & last) const {
-        return seq_cells_range(seq_id, first, last) && seq_cell_count[seq_id] == last - first;
-    }
-
-    // Return one physical cell for this sequence whose logical position is in
-    // [p0, p1). This uses the per-sequence position index, so callers that
-    // repeatedly remove the returned cell only visit matching entries instead
-    // of scanning the entire (potentially unified) KV pool.
+    // Find one cell at a position in [p0, p1) without scanning the KV pool.
     bool seq_pos_find(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint32_t & cell) const {
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
@@ -487,14 +479,11 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
-        seq_pos_rm(i);
-
-        pos[i]   += d;
-        shift[i] += d;
-
+        const llama_pos p_new = pos[i] + d;
         has_shift = true;
 
-        if (pos[i] < 0) {
+        if (p_new < 0) {
+            seq_pos_rm(i);
             seq[i].reset();
             pos[i] = -1;
             shift[i] = 0;
@@ -504,7 +493,8 @@ public:
             return true;
         }
 
-        seq_pos_add(i);
+        seq_pos_set(i, p_new);
+        shift[i] += d;
 
         return false;
     }
@@ -518,12 +508,8 @@ public:
 
         const llama_pos p_old = pos[i];
 
-        seq_pos_rm(i);
-
-        pos[i]   /= d;
+        seq_pos_set(i, pos[i] / d);
         shift[i] += p_old - pos[i];
-
-        seq_pos_add(i);
 
         has_shift = true;
     }
@@ -569,10 +555,7 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
-    // Cached physical ranges for fast compact attention views. A sequence can
-    // be fragmented even when its logical positions are ordered, so these are
-    // tracked independently of seq_pos.
-    uint32_t seq_cell_count[LLAMA_MAX_SEQ] = {};
+    // Physical ranges are independent of logical position order.
     uint32_t seq_cell_first[LLAMA_MAX_SEQ] = {};
     uint32_t seq_cell_last [LLAMA_MAX_SEQ] = {};
 
@@ -583,9 +566,7 @@ private:
         assert(n == 1);
         GGML_UNUSED(n);
 
-        assert(seq_cell_count[s] > 0);
-        --seq_cell_count[s];
-        if (seq_cell_count[s] == 0) {
+        if (seq_pos[s].empty()) {
             seq_cell_first[s] = 0;
             seq_cell_last [s] = 0;
         } else if (i == seq_cell_first[s]) {
@@ -602,14 +583,32 @@ private:
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
         seq_pos[s].insert({ pos[i], i });
 
-        if (seq_cell_count[s] == 0) {
+        if (seq_pos[s].size() == 1) {
             seq_cell_first[s] = i;
             seq_cell_last [s] = i + 1;
         } else {
             seq_cell_first[s] = std::min(seq_cell_first[s], i);
             seq_cell_last [s] = std::max(seq_cell_last [s], i + 1);
         }
-        ++seq_cell_count[s];
+    }
+
+    // A position change preserves physical membership and its cached bounds.
+    void seq_pos_set(uint32_t i, llama_pos p) {
+        if (pos[i] == p) {
+            return;
+        }
+
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (seq[i].test(s)) {
+                const auto n = seq_pos[s].erase({ pos[i], i });
+                assert(n == 1);
+                GGML_UNUSED(n);
+
+                seq_pos[s].insert({ p, i });
+            }
+        }
+
+        pos[i] = p;
     }
 
     // remove cell i
