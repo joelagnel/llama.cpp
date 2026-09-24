@@ -2927,17 +2927,28 @@ bool llama_kv_cache_context::apply() {
     kv_offset = 0;
     attn_compact = false;
 
-    // Crop a single sequence's attention view to its padded physical range.
+    // Crop the attention view to the padded range of the active sequences.
     // The attention mask still excludes holes and cells belonging to other sequences.
     const auto & ubatch = ubatches[i_cur];
     if (getenv("LLAMA_DISABLE_KV_COMPACT_VIEW") == nullptr &&
-            kv->is_unified() && ubatch.n_seqs_unq == 1 && ubatch.n_tokens > 0) {
-        const llama_seq_id seq_id = ubatch.seq_id[0][0];
-        const auto & cells = kv->get_cells(seq_id);
-
-        uint32_t first = 0;
+            kv->is_unified() && ubatch.n_seqs_unq > 0 && ubatch.n_tokens > 0) {
+        uint32_t first = n_kv_global;
         uint32_t last  = 0;
-        if (cells.seq_cells_range(seq_id, first, last) && last <= n_kv_global) {
+        bool valid = true;
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+            const auto & cells = kv->get_cells(seq_id);
+            uint32_t seq_first = 0;
+            uint32_t seq_last  = 0;
+            if (!cells.seq_cells_range(seq_id, seq_first, seq_last) || seq_last > n_kv_global) {
+                valid = false;
+                break;
+            }
+            first = std::min(first, seq_first);
+            last  = std::max(last, seq_last);
+        }
+
+        if (valid) {
             constexpr uint32_t attn_pad = 256;
             const uint32_t view_first = first - first % attn_pad;
             const uint32_t view_last  = std::min(n_kv_global, uint32_t(GGML_PAD(last, attn_pad)));
