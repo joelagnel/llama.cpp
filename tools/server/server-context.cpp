@@ -698,6 +698,7 @@ struct telemetry_control_state {
     bool request_content = false;
     bool kv_pressure_detail = false;
     bool native_gpu_gpm = false;
+    bool cuda_graph_detail = false;
     uint64_t generation = 0;
 };
 
@@ -714,6 +715,7 @@ enum telemetry_control_flag : uint8_t {
     TELEMETRY_CONTROL_FLAG_REQUEST_CONTENT     = 1u << 4,
     TELEMETRY_CONTROL_FLAG_KV_PRESSURE_DETAIL  = 1u << 5,
     TELEMETRY_CONTROL_FLAG_NATIVE_GPU_GPM      = 1u << 6,
+    TELEMETRY_CONTROL_FLAG_CUDA_GRAPH_DETAIL   = 1u << 7,
 };
 
 static uint8_t telemetry_control_flags(const telemetry_control_state & control) {
@@ -723,7 +725,8 @@ static uint8_t telemetry_control_flags(const telemetry_control_state & control) 
         (control.prompt_perplexity      ? TELEMETRY_CONTROL_FLAG_PROMPT_PERPLEXITY   : 0) |
         (control.request_content        ? TELEMETRY_CONTROL_FLAG_REQUEST_CONTENT     : 0) |
         (control.kv_pressure_detail     ? TELEMETRY_CONTROL_FLAG_KV_PRESSURE_DETAIL  : 0) |
-        (control.native_gpu_gpm         ? TELEMETRY_CONTROL_FLAG_NATIVE_GPU_GPM      : 0);
+        (control.native_gpu_gpm         ? TELEMETRY_CONTROL_FLAG_NATIVE_GPU_GPM      : 0) |
+        (control.cuda_graph_detail      ? TELEMETRY_CONTROL_FLAG_CUDA_GRAPH_DETAIL   : 0);
 }
 
 static telemetry_control_state telemetry_control_from_flags(
@@ -737,6 +740,7 @@ static telemetry_control_state telemetry_control_from_flags(
         (flags & TELEMETRY_CONTROL_FLAG_REQUEST_CONTENT) != 0,
         (flags & TELEMETRY_CONTROL_FLAG_KV_PRESSURE_DETAIL) != 0,
         (flags & TELEMETRY_CONTROL_FLAG_NATIVE_GPU_GPM) != 0,
+        (flags & TELEMETRY_CONTROL_FLAG_CUDA_GRAPH_DETAIL) != 0,
         props_generation,
     };
 }
@@ -1972,7 +1976,8 @@ public:
         const bool microbatch_changed =
                 telemetry_control.moe_routing != next.moe_routing ||
                 telemetry_control.kv_pressure_detail != next.kv_pressure_detail ||
-                telemetry_control.native_gpu_gpm != next.native_gpu_gpm;
+                telemetry_control.native_gpu_gpm != next.native_gpu_gpm ||
+                telemetry_control.cuda_graph_detail != next.cuda_graph_detail;
         next.generation = telemetry_control.generation + 1;
         telemetry_control = next;
         if (next.output_token_detail || next.prompt_perplexity) {
@@ -1999,6 +2004,7 @@ public:
             {"request_content", control.request_content},
             {"kv_pressure_detail", control.kv_pressure_detail},
             {"native_gpu_gpm", control.native_gpu_gpm},
+            {"cuda_graph_detail", control.cuda_graph_detail},
         };
     }
 
@@ -2019,6 +2025,12 @@ public:
                 : json {
                     {"applicable", false},
                     {"reason", gpu.value("reason", "Native NVML GPM is not available for the active backend.")},
+                }},
+            {"cuda_graph_detail", telemetry_cuda_graph_supported
+                ? json { {"applicable", true} }
+                : json {
+                    {"applicable", false},
+                    {"reason", "No CUDA backend with CUDA graph telemetry is active for the target context."},
                 }},
         };
     }
@@ -2094,6 +2106,13 @@ public:
                     {"privacy_sensitive", false},
                 }},
                 {"native_gpu_gpm", {
+                    {"supported", true},
+                    {"overhead_class", "low"},
+                    {"effective_from", "next_microbatch"},
+                    {"dependencies", json::array()},
+                    {"privacy_sensitive", false},
+                }},
+                {"cuda_graph_detail", {
                     {"supported", true},
                     {"overhead_class", "low"},
                     {"effective_from", "next_microbatch"},
@@ -2403,6 +2422,13 @@ private:
     bool telemetry_target_has_moe = false;
     bool telemetry_draft_has_moe = false;
     bool telemetry_gpu_gpm_active = false;
+    std::atomic<bool> telemetry_cuda_graph_supported = false;
+    bool telemetry_cuda_graph_active = false;
+    uint64_t telemetry_cuda_graph_dropped = 0;
+    // CUDA graph cache keys are heap addresses; journal records carry small
+    // per-context ordinals instead ([0] target, [1] draft).
+    std::unordered_map<uint64_t, uint32_t> telemetry_cuda_graph_ids[2];
+    std::vector<llama_cuda_graph_event> telemetry_cuda_graph_scratch;
     bool telemetry_kv_pressure_active = false;
     bool telemetry_kv_pressure_pending_initialize = false;
     uint64_t telemetry_kv_pressure_pending_generation = 0;
@@ -2448,6 +2474,11 @@ private:
         }
         gpu_telemetry.stop();
         telemetry_gpu_gpm_active = false;
+        telemetry_cuda_graph_supported = false;
+        telemetry_cuda_graph_active = false;
+        telemetry_cuda_graph_dropped = 0;
+        telemetry_cuda_graph_ids[0].clear();
+        telemetry_cuda_graph_ids[1].clear();
         telemetry_kv_pressure_active = false;
         telemetry_kv_pressure_pending_initialize = false;
         telemetry_kv_pressure_pending_generation = 0;
@@ -2498,6 +2529,14 @@ private:
                 gpu_telemetry.stop();
             }
             telemetry_gpu_gpm_active = control.native_gpu_gpm;
+        }
+        if (control.cuda_graph_detail != telemetry_cuda_graph_active) {
+            // Pending events of both contexts are discarded, so every emitted
+            // event ran while the control was on.
+            llama_set_cuda_graph_events(ctx_tgt, control.cuda_graph_detail);
+            llama_set_cuda_graph_events(ctx_dft, control.cuda_graph_detail);
+            telemetry_cuda_graph_active = control.cuda_graph_detail;
+            telemetry_cuda_graph_dropped = 0;
         }
     }
 
@@ -2597,7 +2636,8 @@ private:
         const uint8_t microbatch_flags = notice.decision.effective_flags &
             (TELEMETRY_CONTROL_FLAG_MOE_ROUTING |
              TELEMETRY_CONTROL_FLAG_KV_PRESSURE_DETAIL |
-             TELEMETRY_CONTROL_FLAG_NATIVE_GPU_GPM);
+             TELEMETRY_CONTROL_FLAG_NATIVE_GPU_GPM |
+             TELEMETRY_CONTROL_FLAG_CUDA_GRAPH_DETAIL);
         if (notice.decision.microbatch_generation == 0 ||
                 (microbatch_flags == context_state.applied_microbatch_flags &&
                  (!context_state.has_application ||
@@ -3224,6 +3264,7 @@ private:
                 control.request_content = value("request_content");
                 control.kv_pressure_detail = value("kv_pressure_detail");
                 control.native_gpu_gpm = value("native_gpu_gpm");
+                control.cuda_graph_detail = value("cuda_graph_detail");
                 telemetry_control_apply(control);
                 SRV_INF("%s", "telemetry control: applied router defaults\n");
             } catch (const std::exception & exception) {
@@ -3231,6 +3272,7 @@ private:
             }
         }
         if (telemetry_enabled) {
+            telemetry_cuda_graph_supported = llama_set_cuda_graph_events(ctx_tgt, false);
             telemetry_target_cpu_routed_expert_payload = telemetry_kv_routed_expert_payload_capture(llama_get_model(ctx_tgt));
             telemetry_draft_cpu_routed_expert_payload = ctx_dft && llama_get_model(ctx_tgt) != llama_get_model(ctx_dft)
                 ? telemetry_kv_routed_expert_payload_capture(llama_get_model(ctx_dft))
@@ -7683,6 +7725,95 @@ private:
         }
         telemetry_record_drained_dispatch(
             context->dispatch_drain(), draft, batch_offset, batch_token_count, media_slot);
+        telemetry_emit_cuda_graph_events(context, draft, batch_offset, batch_token_count, media_slot);
+    }
+
+    static const char * telemetry_cuda_graph_kind_name(int32_t kind) {
+        switch (kind) {
+            case GGML_CUDA_GRAPH_EVENT_EAGER_DISABLED:        return "eager_disabled";
+            case GGML_CUDA_GRAPH_EVENT_EAGER_INCOMPATIBLE:    return "eager_incompatible";
+            case GGML_CUDA_GRAPH_EVENT_EAGER_WARMUP:          return "eager_warmup";
+            case GGML_CUDA_GRAPH_EVENT_EAGER_WARMUP_RESET:    return "eager_warmup_reset";
+            case GGML_CUDA_GRAPH_EVENT_CAPTURE_INSTANTIATE:   return "capture_instantiate";
+            case GGML_CUDA_GRAPH_EVENT_CAPTURE_UPDATE:        return "capture_update";
+            case GGML_CUDA_GRAPH_EVENT_CAPTURE_REINSTANTIATE: return "capture_reinstantiate";
+            case GGML_CUDA_GRAPH_EVENT_LAUNCH:                return "launch";
+            default:                                          return "unknown";
+        }
+    }
+
+    // One cuda_graph_event record per CUDA graph compute call. The slots of
+    // the logical target decode are attached to its micro-batch events so
+    // they can be associated with requests; draft events and graph computes
+    // outside a micro-batch carry no slots.
+    void telemetry_emit_cuda_graph_events(
+            llama_context * context,
+            bool draft,
+            int32_t batch_offset,
+            int32_t batch_token_count,
+            server_slot * media_slot) {
+        if (!telemetry_cuda_graph_active) {
+            return;
+        }
+        uint64_t dropped = 0;
+        llama_drain_cuda_graph_events(context, telemetry_cuda_graph_scratch, &dropped);
+        // losses are reported on the next emitted event
+        telemetry_cuda_graph_dropped += dropped;
+        if (telemetry_cuda_graph_scratch.empty()) {
+            return;
+        }
+        json batch_slots = json::array();
+        if (!draft) {
+            std::map<int32_t, std::pair<int32_t, int32_t>> counts; // slot -> (prompt, generated)
+            if (media_slot) {
+                counts[media_slot->id].first += 1;
+            }
+            for (int32_t i = batch_offset; i < batch_offset + batch_token_count; ++i) {
+                auto & count = counts[batch.tokens[i].id_slot];
+                (batch.tokens[i].is_prompt ? count.first : count.second) += 1;
+            }
+            for (const auto & [id_slot, count] : counts) {
+                const server_slot * slot = id_slot >= 0 && id_slot < (int32_t) slots.size() ? &slots[id_slot] : nullptr;
+                batch_slots.push_back({
+                    {"slot", id_slot},
+                    {"trace_id", slot && slot->task ? json(slot->task->trace_id) : json(nullptr)},
+                    {"prompt_tokens", count.first},
+                    {"generated_tokens", count.second},
+                });
+            }
+        }
+        const int64_t timestamp_unix_ms = telemetry_wall_unix_ms();
+        auto & graph_ids = telemetry_cuda_graph_ids[draft ? 1 : 0];
+        for (size_t i = 0; i < telemetry_cuda_graph_scratch.size(); ++i) {
+            const llama_cuda_graph_event & event = telemetry_cuda_graph_scratch[i];
+            const uint32_t graph_id = graph_ids.emplace(event.graph.key, (uint32_t) graph_ids.size()).first->second;
+            telemetry_append({
+                {"schema_version", 1},
+                {"event", "cuda_graph_event"},
+                {"timestamp_unix_ms", timestamp_unix_ms},
+                {"physical_context", draft ? "draft" : "target"},
+                {"operation", event.encode ? "encode" : "decode"},
+                {"in_ubatch", event.in_ubatch},
+                {"physical_step", event.physical_step},
+                {"physical_microbatch", event.physical_microbatch},
+                {"logical_call", event.logical_call},
+                {"kind", telemetry_cuda_graph_kind_name(event.graph.kind)},
+                {"begin_monotonic_us", event.graph.begin_us},
+                {"end_monotonic_us", event.graph.end_us},
+                {"build_us", event.graph.build_us},
+                {"graph_id", graph_id},
+                {"graph_uid", event.graph.uid},
+                {"graph_nodes", event.graph.n_nodes},
+                {"cached_graphs", event.graph.n_cached},
+                {"evicted_graphs", event.graph.n_evicted},
+                {"ubatch_tokens", event.ubatch_tokens},
+                {"ubatch_sequences", event.ubatch_seqs},
+                {"llama_graph_reused", event.llama_graph_reused},
+                {"dropped_before", i == 0 ? telemetry_cuda_graph_dropped : 0},
+                {"batch_slots", event.in_ubatch ? batch_slots : json::array()},
+            });
+        }
+        telemetry_cuda_graph_dropped = 0;
     }
 
     void telemetry_record_drained_dispatch(
@@ -13509,6 +13640,7 @@ void server_routes::init_routes() {
             "request_content",
             "kv_pressure_detail",
             "native_gpu_gpm",
+            "cuda_graph_detail",
         };
         for (const auto & item : source.items()) {
             if (names.count(item.key()) == 0 || !item.value().is_boolean()) {
@@ -13528,6 +13660,7 @@ void server_routes::init_routes() {
         next.request_content = value("request_content");
         next.kv_pressure_detail = value("kv_pressure_detail");
         next.native_gpu_gpm = value("native_gpu_gpm");
+        next.cuda_graph_detail = value("cuda_graph_detail");
         if (next.token_candidates && !next.output_token_detail) {
             res->error(format_error_response(
                 "telemetry_control.token_candidates requires telemetry_control.output_token_detail=true",

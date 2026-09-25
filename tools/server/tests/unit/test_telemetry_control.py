@@ -18,7 +18,18 @@ CONTROL_NAMES = (
     "request_content",
     "kv_pressure_detail",
     "native_gpu_gpm",
+    "cuda_graph_detail",
 )
+CUDA_GRAPH_EVENT_KINDS = {
+    "eager_disabled",
+    "eager_incompatible",
+    "eager_warmup",
+    "eager_warmup_reset",
+    "capture_instantiate",
+    "capture_update",
+    "capture_reinstantiate",
+    "launch",
+}
 
 
 def _controlled_server():
@@ -630,6 +641,59 @@ def test_dense_model_never_emits_moe_routing_chunks():
         )
         assert events.status_code == 200
         assert not any(event["event"] == "moe_routing_chunk" for event in events.body["events"])
+    finally:
+        server.stop()
+
+
+def test_cuda_graph_detail_records_one_event_per_cuda_graph_compute():
+    server = _controlled_server()
+    server.start()
+    try:
+        capabilities = server.make_request("GET", "/telemetry/v1/capabilities", headers=AUTH)
+        feature = capabilities.body["telemetry_control"]["features"]["cuda_graph_detail"]
+        assert feature["effective_from"] == "next_microbatch"
+        assert feature["dependencies"] == []
+
+        control = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"cuda_graph_detail": True}},
+            headers=AUTH,
+        )
+        assert control.status_code == 200
+        assert control.body["telemetry_control"]["effective"]["cuda_graph_detail"] is True
+        assert control.body["telemetry_control"]["effective_from"] == "next_microbatch"
+        applicable = control.body["telemetry_control"]["applicability"]["cuda_graph_detail"]["applicable"]
+
+        completion = server.make_request(
+            "POST",
+            "/completion",
+            data={"prompt": "graph events follow physical microbatches", "n_predict": 4},
+            headers=AUTH,
+        )
+        assert completion.status_code == 200
+        events = [event for event in _telemetry_events(server) if event["event"] == "cuda_graph_event"]
+        if not applicable:
+            assert events == []
+            return
+
+        assert events
+        steps = [event["physical_step"] for event in events
+                 if event["physical_context"] == "target" and event["in_ubatch"]]
+        assert steps == sorted(steps)
+        for event in events:
+            assert event["kind"] in CUDA_GRAPH_EVENT_KINDS
+            assert event["physical_context"] in {"target", "draft"}
+            assert event["begin_monotonic_us"] <= event["end_monotonic_us"]
+            assert event["graph_nodes"] > 0
+            assert isinstance(event["graph_id"], int) and "graph_key" not in event
+            assert (event["build_us"] > 0) == event["kind"].startswith("capture_")
+            if not event["in_ubatch"]:
+                assert event["physical_step"] == 0 and event["batch_slots"] == []
+                continue
+            assert event["ubatch_tokens"] > 0
+            if event["physical_context"] == "target":
+                assert [slot["trace_id"] for slot in event["batch_slots"]] == [completion.body["trace_id"]]
     finally:
         server.stop()
 

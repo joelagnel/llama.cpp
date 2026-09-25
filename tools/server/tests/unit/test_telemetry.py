@@ -92,6 +92,7 @@ def apply_telemetry_control(**features):
         "request_content": features.get("request_content", False),
         "kv_pressure_detail": features.get("kv_pressure_detail", False),
         "native_gpu_gpm": features.get("native_gpu_gpm", False),
+        "cuda_graph_detail": features.get("cuda_graph_detail", False),
     }
     return response.body["telemetry_control"]
 

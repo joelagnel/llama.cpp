@@ -2287,6 +2287,7 @@ void server_models_routes::init_routes() {
             "request_content",
             "kv_pressure_detail",
             "native_gpu_gpm",
+            "cuda_graph_detail",
         };
         for (const auto & item : control.items()) {
             if (names.count(item.key()) == 0 || !item.value().is_boolean()) {
