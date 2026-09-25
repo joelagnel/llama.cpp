@@ -23,6 +23,7 @@
 #include "ggml-common.h"
 
 #include <array>
+#include <atomic>
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -1424,6 +1425,45 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // CUDA graph telemetry ring, see ggml_cuda_graph_event in ggml-cuda.h
+    static constexpr size_t graph_events_capacity = 8192;
+    std::atomic<bool> graph_events_enabled = false;
+    std::mutex graph_events_mutex;
+    std::vector<ggml_cuda_graph_event> graph_events;
+    size_t graph_events_first = 0;
+    size_t graph_events_count = 0;
+    uint64_t graph_events_dropped = 0;
+    int32_t graph_evictions = 0;
+
+    void record_graph_event(const ggml_cuda_graph_event & event) {
+        std::lock_guard<std::mutex> lock(graph_events_mutex);
+        if (graph_events.empty()) {
+            graph_events.resize(graph_events_capacity);
+        }
+        if (graph_events_count == graph_events_capacity) {
+            graph_events_first = (graph_events_first + 1) % graph_events_capacity;
+            graph_events_count--;
+            graph_events_dropped++;
+        }
+        graph_events[(graph_events_first + graph_events_count) % graph_events_capacity] = event;
+        graph_events_count++;
+    }
+
+    size_t drain_graph_events(ggml_cuda_graph_event * out, size_t capacity, uint64_t * dropped) {
+        std::lock_guard<std::mutex> lock(graph_events_mutex);
+        const size_t n = std::min(capacity, graph_events_count);
+        for (size_t i = 0; i < n; i++) {
+            out[i] = graph_events[(graph_events_first + i) % graph_events_capacity];
+        }
+        graph_events_first = (graph_events_first + n) % graph_events_capacity;
+        graph_events_count -= n;
+        if (dropped) {
+            *dropped = graph_events_dropped;
+        }
+        graph_events_dropped = 0;
+        return n;
+    }
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
@@ -1439,6 +1479,7 @@ struct ggml_backend_cuda_context {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= 10'000'000) {
+                    graph_evictions++;
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;

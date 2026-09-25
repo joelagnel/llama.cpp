@@ -2752,7 +2752,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if CUDART_VERSION >= 12000
@@ -2775,9 +2775,10 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-    } else {
-        GGML_ASSERT(stat == cudaSuccess);
+        return true;
     }
+    GGML_ASSERT(stat == cudaSuccess);
+    return false;
 }
 #endif // USE_CUDA_GRAPH
 
@@ -4143,8 +4144,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key, ggml_cuda_graph_event * event) {
     bool graph_evaluated_or_captured = false;
+    int64_t build_start_us = 0;
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4327,6 +4329,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
+            build_start_us = event ? ggml_time_us() : 0;
             if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
                 graph->graph = nullptr;
@@ -4346,16 +4349,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
+        const bool instantiate = graph->instance == nullptr;
+        if (instantiate) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
+        bool reinstantiated = false;
         if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            reinstantiated = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        }
+        if (event && cuda_graph_update_required) {
+            event->kind = instantiate    ? GGML_CUDA_GRAPH_EVENT_CAPTURE_INSTANTIATE :
+                          reinstantiated ? GGML_CUDA_GRAPH_EVENT_CAPTURE_REINSTANTIATE :
+                                           GGML_CUDA_GRAPH_EVENT_CAPTURE_UPDATE;
+            event->build_us = ggml_time_us() - build_start_us;
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else
         GGML_UNUSED(graph_key);
+        GGML_UNUSED(event);
+        GGML_UNUSED(build_start_us);
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
@@ -4387,6 +4400,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
+    ggml_cuda_graph_event event = {};
+    const bool record_event = cuda_ctx->graph_events_enabled.load(std::memory_order_relaxed);
+    const int32_t evictions_before = cuda_ctx->graph_evictions;
+    event.begin_us = record_event ? ggml_time_us() : 0;
+    event.key      = cgraph->n_nodes > 0 ? (uint64_t) (uintptr_t) cgraph->nodes[0] : 0;
+    event.uid      = cgraph->uid;
+    event.n_nodes  = cgraph->n_nodes;
+    event.kind     = GGML_CUDA_GRAPH_EVENT_EAGER_DISABLED;
+
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
@@ -4395,9 +4417,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        event.kind = GGML_CUDA_GRAPH_EVENT_EAGER_INCOMPATIBLE;
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
+            event.kind = GGML_CUDA_GRAPH_EVENT_EAGER_WARMUP;
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
@@ -4412,10 +4436,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    event.kind = GGML_CUDA_GRAPH_EVENT_EAGER_WARMUP_RESET;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
+                    event.kind = GGML_CUDA_GRAPH_EVENT_LAUNCH;
                 }
             }
         }
@@ -4432,7 +4458,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key,
+                                         record_event ? &event : nullptr);
+
+    if (record_event) {
+        event.end_us    = ggml_time_us();
+#ifdef USE_CUDA_GRAPH
+        event.n_cached  = (int32_t) cuda_ctx->cuda_graphs.size();
+#endif // USE_CUDA_GRAPH
+        event.n_evicted = cuda_ctx->graph_evictions - evictions_before;
+        cuda_ctx->record_graph_event(event);
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5609,6 +5645,25 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static void ggml_backend_cuda_graph_events_enable(ggml_backend_t backend, bool enable) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->graph_events_enabled.store(enable, std::memory_order_relaxed);
+}
+
+static size_t ggml_backend_cuda_graph_events_drain(ggml_backend_t backend, ggml_cuda_graph_event * events, size_t capacity, uint64_t * dropped) {
+    if (dropped) {
+        *dropped = 0;
+    }
+    if (!ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return cuda_ctx->drain_graph_events(events, capacity, dropped);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5628,6 +5683,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_graph_events_enable") == 0) {
+        return (void *)ggml_backend_cuda_graph_events_enable;
+    }
+    if (strcmp(name, "ggml_backend_cuda_graph_events_drain") == 0) {
+        return (void *)ggml_backend_cuda_graph_events_drain;
     }
     return nullptr;
 }
