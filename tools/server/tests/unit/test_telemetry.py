@@ -3458,3 +3458,104 @@ def test_mtp_target_candidate_requires_global_control():
     assert detail.body["token_identity_state"] == "not_captured"
     assert detail.body["token_piece_state"] == "not_captured"
     assert detail.body["decisions"] == []
+
+
+def journal_capabilities():
+    capabilities = server.make_request("GET", "/telemetry/v1/capabilities")
+    assert capabilities.status_code == 200
+    return capabilities.body["content_policy"]
+
+
+def test_capabilities_report_the_journal_file_and_server_process(tmp_path):
+    spool = tmp_path / "journal"
+    server.extra_env = {"LLAMA_TELEMETRY_SPOOL_DIR": str(spool)}
+    server.start()
+
+    policy = journal_capabilities()
+    instance = server.make_request("GET", "/telemetry/v1/capabilities").body["server_instance_id"]
+    assert policy["disk_journal_directory"] == str(spool.resolve())
+    assert policy["disk_journal_file"] == str(spool.resolve() / f"{instance}.ndjson")
+    assert os.path.exists(policy["disk_journal_file"])
+    assert policy["disk_journal_keep_previous"] == 1
+    assert policy["disk_journal_keep_env"] == "LLAMA_TELEMETRY_JOURNAL_KEEP"
+    assert policy["server_process_id"] == server.process.pid
+
+
+def test_capabilities_report_no_journal_without_spool_directory():
+    server.start()
+
+    policy = journal_capabilities()
+    assert policy["disk_journal_directory"] is None
+    assert policy["disk_journal_file"] is None
+    assert policy["server_process_id"] == server.process.pid
+
+
+@pytest.mark.parametrize("keep,expected_previous", [(None, 1), ("0", 0), ("2", 2), ("-1", 3)])
+def test_journal_rotates_on_each_server_start(tmp_path, keep, expected_previous):
+    global server
+    spool = tmp_path / "journal"
+    spool.mkdir()
+    (spool / "notes.ndjson").write_text("not a journal\n")
+    (spool / "other.txt").write_text("keep me\n")
+    env = {"LLAMA_TELEMETRY_SPOOL_DIR": str(spool)}
+    if keep is not None:
+        env["LLAMA_TELEMETRY_JOURNAL_KEEP"] = keep
+
+    started = []
+    for _ in range(4):
+        server = ServerPreset.tinyllama2()
+        configure_telemetry_server()
+        server.extra_env = env
+        server.start()
+        policy = journal_capabilities()
+        started.append(os.path.basename(policy["disk_journal_file"]))
+        server.stop()
+
+    journals = sorted(p.name for p in spool.glob("*.ndjson") if p.name != "notes.ndjson")
+    assert journals == sorted(started[len(started) - 1 - expected_previous:])
+    assert (spool / "notes.ndjson").read_text() == "not a journal\n"
+    assert (spool / "other.txt").read_text() == "keep me\n"
+
+
+def test_invalid_journal_keep_uses_the_default(tmp_path):
+    spool = tmp_path / "journal"
+    server.extra_env = {"LLAMA_TELEMETRY_SPOOL_DIR": str(spool), "LLAMA_TELEMETRY_JOURNAL_KEEP": "all"}
+    server.start()
+
+    assert journal_capabilities()["disk_journal_keep_previous"] == 1
+
+
+def test_rotation_keeps_a_journal_another_running_server_writes(tmp_path):
+    global server
+    spool = tmp_path / "journal"
+    env = {"LLAMA_TELEMETRY_SPOOL_DIR": str(spool), "LLAMA_TELEMETRY_JOURNAL_KEEP": "0"}
+    server.extra_env = env
+    server.start()
+    first = journal_capabilities()["disk_journal_file"]
+    first_server = server
+
+    server = ServerPreset.tinyllama2()
+    configure_telemetry_server()
+    server.server_port = first_server.server_port + 1
+    server.extra_env = env
+    try:
+        server.start()
+        second = journal_capabilities()["disk_journal_file"]
+    finally:
+        server.stop()
+        server = first_server
+
+    assert second != first
+    assert os.path.exists(first)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="flock is POSIX")
+def test_live_journal_allows_shared_readers(tmp_path):
+    import fcntl
+    server.extra_env = {"LLAMA_TELEMETRY_SPOOL_DIR": str(tmp_path / "journal")}
+    server.start()
+
+    # .NET opens files for shared reading with flock(LOCK_SH | LOCK_NB).
+    with open(journal_capabilities()["disk_journal_file"], "rb") as journal:
+        fcntl.flock(journal, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        fcntl.flock(journal, fcntl.LOCK_UN)

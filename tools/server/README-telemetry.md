@@ -122,6 +122,14 @@ The ring retains at most 2,048 whole events and 64 MiB of serialized event data 
 
 An events response contains `cursor`, `oldest_sequence`, `next_sequence`, `gap`, `gap_ranges`, `dropped_events`, `last_dropped_sequence`, and `retained_serialized_bytes`. Send the last consumed `cursor` on the next request. `next_sequence` is an allocation watermark, not the continuation cursor. If `gap` is true, retained history is incomplete for the supplied cursor. Each `gap_ranges` item names only the exact missing global event-sequence interval; it does not invent token, layer, or model-position coordinates for lost data. A cursor ahead of the server high-water mark is reset to that mark with `gap: true`; `gap_ranges` stays empty because no unallocated future sequence is reported as lost.
 
+### Disk journal
+
+Set `LLAMA_TELEMETRY_SPOOL_DIR` to also write every event to an append-only, uncapped journal. Each server start creates a new `<server_instance_id>.ndjson` file whose first line is a header with `journal_schema_version`, `server_instance_id`, and `created_unix_ms`. The file holds every event from that server start, so a reader that opens it from the beginning misses nothing emitted before it attached.
+
+Journals rotate on each start. Before creating its file, the server deletes the oldest journals in the directory so that at most `LLAMA_TELEMETRY_JOURNAL_KEEP` previous journals remain (default 1; `0` keeps only the new file; `-1` keeps every journal). Only `.ndjson` files that begin with a journal header are counted or deleted, and each rotation is logged with the number and size of removed files. A journal that another running server is still writing, such as a sibling router child sharing the spool directory, is never deleted; the writer holds a lock on it until it exits. An invalid `LLAMA_TELEMETRY_JOURNAL_KEEP` is ignored with a warning. A journal that still needs `import` must be imported before two more server starts rotate it away, or set a larger `LLAMA_TELEMETRY_JOURNAL_KEEP`.
+
+`GET /telemetry/v1/capabilities` reports the journal under `content_policy`: `disk_journal_directory` and `disk_journal_file` are absolute paths while the journal is active and null otherwise, `disk_journal_keep_previous` is the effective rotation setting, and `server_process_id` is the operating system process ID of llama-server.
+
 ## Response probability
 
 Response probability is conditional on request `n_probs > 0`. Telemetry producer controls never raise an omitted or zero request value. When probabilities are requested, llama-server computes the selected emitted token's log probability from the raw target-model logits before sampler truncation. This adds no model inference, rejected draft tokens never contribute, accepted speculative output tokens contribute once, and replayed/discarded verification passes contribute nothing. The exact event semantic is:

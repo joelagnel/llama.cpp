@@ -64,6 +64,7 @@
 #pragma comment(lib, "Advapi32.lib")
 #else
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -159,6 +160,11 @@ static bool telemetry_create_private_file(
         reason = "private file creation failed with errno " + std::to_string(errno);
         return false;
     }
+    // A shared lock marks the journal as in use so rotation by another server
+    // sharing the spool directory never deletes it; it ends with the process.
+    // Readers such as .NET, which emulates file sharing with shared flock
+    // locks, can still open the file.
+    flock(file, LOCK_SH | LOCK_NB);
     stream = fdopen(file, "w");
     if (stream == nullptr) {
         reason = "private stream creation failed with errno " + std::to_string(errno);
@@ -169,8 +175,104 @@ static bool telemetry_create_private_file(
 }
 #endif
 
+// Whether a running server is still writing this journal. On POSIX a reader
+// holding a shared lock, such as a capture draining it, also counts; Windows
+// readers share deletion and cannot be seen.
+static bool telemetry_journal_in_use(const std::filesystem::path & path) {
+#if defined(_WIN32)
+    // The writer holds GENERIC_WRITE and shares only reads.
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return GetLastError() == ERROR_SHARING_VIOLATION;
+    }
+    CloseHandle(file);
+    return false;
+#else
+    const int file = open(path.c_str(), O_RDONLY);
+    if (file < 0) {
+        return false;
+    }
+    const bool locked = flock(file, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+    close(file);
+    return locked;
+#endif
+}
+
+// Deletes the oldest journals in a spool directory so that at most
+// keep_previous earlier journals remain next to the one about to be created.
+// Only files that start with a journal header are considered, and journals
+// another running server still writes are left alone.
+static void telemetry_rotate_journals(const std::filesystem::path & directory, int keep_previous) {
+    if (keep_previous < 0) {
+        return;
+    }
+    try {
+        struct journal_file {
+            int64_t created_unix_ms;
+            std::filesystem::path path;
+            uintmax_t bytes;
+        };
+        std::vector<journal_file> journals;
+        std::error_code error;
+        for (const auto & entry : std::filesystem::directory_iterator(directory, error)) {
+            if (!entry.is_regular_file(error) || entry.path().extension() != ".ndjson") {
+                continue;
+            }
+            std::ifstream input(entry.path(), std::ios::binary);
+            std::string line(64 * 1024, '\0');
+            input.read(line.data(), (std::streamsize) line.size());
+            line.resize((size_t) input.gcount());
+            const size_t end = line.find('\n');
+            if (end == std::string::npos) {
+                continue;
+            }
+            line.resize(end);
+            json header;
+            try {
+                header = json::parse(line);
+            } catch (const std::exception &) {
+                continue;
+            }
+            if (!header.is_object() || !header.contains("journal_schema_version")
+                    || !header.contains("server_instance_id") || !header["server_instance_id"].is_string()
+                    || telemetry_journal_in_use(entry.path())) {
+                continue;
+            }
+            const json created = header.value("created_unix_ms", json());
+            journals.push_back({
+                created.is_number_integer() ? created.get<int64_t>() : 0,
+                entry.path(),
+                entry.file_size(error),
+            });
+        }
+        if (journals.size() <= (size_t) keep_previous) {
+            return;
+        }
+        std::sort(journals.begin(), journals.end(), [](const journal_file & a, const journal_file & b) {
+            return a.created_unix_ms != b.created_unix_ms ? a.created_unix_ms > b.created_unix_ms : a.path > b.path;
+        });
+        size_t removed = 0;
+        uintmax_t removed_bytes = 0;
+        for (size_t i = (size_t) keep_previous; i < journals.size(); ++i) {
+            if (std::filesystem::remove(journals[i].path, error)) {
+                ++removed;
+                removed_bytes += journals[i].bytes;
+            } else if (error) {
+                SRV_WRN("telemetry journal: could not remove old journal %s: %s\n",
+                    journals[i].path.string().c_str(), error.message().c_str());
+            }
+        }
+        SRV_INF("telemetry journal: rotated, removed %zu old journal(s) (%.1f MiB), kept %d previous (LLAMA_TELEMETRY_JOURNAL_KEEP)\n",
+            removed, removed_bytes / (1024.0 * 1024.0), keep_previous);
+    } catch (const std::exception & exception) {
+        // A failed rotation must not disable the journal.
+        SRV_WRN("telemetry journal: rotation stopped: %s\n", exception.what());
+    }
+}
+
 // Disk-backed trace journal: inference enqueues serialized envelopes into a
 // byte-bounded shock absorber while a dedicated writer drains an uncapped file.
+// Each server start writes a new <server_instance_id>.ndjson file.
 class telemetry_event_journal {
 public:
     struct loss_snapshot {
@@ -185,7 +287,8 @@ public:
     void start(
             const std::filesystem::path & directory,
             const std::string & server_instance_id,
-            size_t pending_max_bytes) {
+            size_t pending_max_bytes,
+            int keep_previous) {
         stop();
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -199,7 +302,8 @@ public:
         }
         try {
             std::filesystem::create_directories(directory);
-            path_ = directory / (server_instance_id + ".ndjson");
+            telemetry_rotate_journals(directory, keep_previous);
+            path_ = std::filesystem::absolute(directory) / (server_instance_id + ".ndjson");
             std::string permission_reason;
             if (!telemetry_create_private_file(path_, stream_, permission_reason)) {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -225,7 +329,10 @@ public:
                 failed_ = true;
                 return;
             }
-            active_ = true;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                active_ = true;
+            }
             writer_ = std::thread([this]() { writer_loop(); });
             SRV_INF("telemetry journal: writing uncapped trace envelopes to %s (memory queue %zu MiB, flush interval %lld ms)\n",
                 path_.string().c_str(), pending_max_bytes_ / (1024 * 1024), (long long) FLUSH_INTERVAL.count());
@@ -274,6 +381,12 @@ public:
     bool active() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return active_;
+    }
+
+    // Absolute path of the file being written, or empty when inactive.
+    std::filesystem::path path() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return active_ ? path_ : std::filesystem::path();
     }
 
     void append(uint64_t sequence, std::shared_ptr<const std::string> serialized) {
@@ -2151,6 +2264,20 @@ public:
         return telemetry_event_max_bytes;
     }
 
+    json telemetry_journal_file_json() const {
+        const std::filesystem::path path = telemetry_journal.path();
+        return path.empty() ? json() : json(path.string());
+    }
+
+    json telemetry_journal_directory_json() const {
+        const std::filesystem::path path = telemetry_journal.path();
+        return path.empty() ? json() : json(path.parent_path().string());
+    }
+
+    int telemetry_journal_keep_previous() const {
+        return telemetry_journal_keep;
+    }
+
     size_t telemetry_moe_chunk_limit_value() const {
         return telemetry_moe_chunk_limit_bytes();
     }
@@ -2345,6 +2472,7 @@ private:
     };
     std::deque<telemetry_event_entry> telemetry_events;
     telemetry_event_journal telemetry_journal;
+    int telemetry_journal_keep = 1;
     std::deque<telemetry_kv_pressure_event_entry> telemetry_kv_pressure_events;
     std::deque<telemetry_kv_request_window> telemetry_kv_request_windows;
     std::deque<telemetry_token_candidate_block_entry> telemetry_token_candidate_blocks;
@@ -3219,12 +3347,25 @@ private:
             telemetry_event_max_bytes = (size_t) mib * 1024 * 1024;
         }
         const char * telemetry_spool_dir_env = getenv("LLAMA_TELEMETRY_SPOOL_DIR");
+        const char * telemetry_journal_keep_env = getenv("LLAMA_TELEMETRY_JOURNAL_KEEP");
+        if (telemetry_journal_keep_env && *telemetry_journal_keep_env) {
+            // A typo must not turn into 0, which deletes every previous journal.
+            char * end = nullptr;
+            const long keep = strtol(telemetry_journal_keep_env, &end, 10);
+            if (end != telemetry_journal_keep_env && *end == '\0' && keep >= -1 && keep <= 1000) {
+                telemetry_journal_keep = (int) keep;
+            } else {
+                SRV_WRN("telemetry journal: ignoring LLAMA_TELEMETRY_JOURNAL_KEEP=%s; expected -1..1000, keeping %d\n",
+                    telemetry_journal_keep_env, telemetry_journal_keep);
+            }
+        }
         if (telemetry_enabled && telemetry_spool_dir_env && *telemetry_spool_dir_env) {
             try {
                 telemetry_journal.start(
                     std::filesystem::path(telemetry_spool_dir_env),
                     telemetry_server_instance_id,
-                    telemetry_event_max_bytes);
+                    telemetry_event_max_bytes,
+                    telemetry_journal_keep);
             } catch (const std::exception & exception) {
                 SRV_ERR("telemetry journal: path resolution failed: %s\n", exception.what());
             }
@@ -13289,6 +13430,15 @@ void server_routes::init_routes() {
                 {"event_buffer_env", "LLAMA_TELEMETRY_EVENT_BUFFER_MIB"},
                 {"disk_journal", "append_only_uncapped"},
                 {"disk_journal_env", "LLAMA_TELEMETRY_SPOOL_DIR"},
+                {"disk_journal_directory", ctx_server.telemetry_journal_directory_json()},
+                {"disk_journal_file", ctx_server.telemetry_journal_file_json()},
+                {"disk_journal_keep_previous", ctx_server.telemetry_journal_keep_previous()},
+                {"disk_journal_keep_env", "LLAMA_TELEMETRY_JOURNAL_KEEP"},
+#if defined(_WIN32)
+                {"server_process_id", (int64_t) GetCurrentProcessId()},
+#else
+                {"server_process_id", (int64_t) getpid()},
+#endif
                 {"request_capture_limit_bytes", 4 * 1024 * 1024},
                 {"legacy_completion_output_token_cache_limit", ctx_server.telemetry_output_tokens_limit()},
                 {"legacy_live_token_candidate_cache_max_serialized_bytes", ctx_server.telemetry_token_candidate_max_bytes()},
