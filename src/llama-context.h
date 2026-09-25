@@ -333,6 +333,9 @@ struct llama_context {
 
     llama_ubatch_stats ubatch_stats_get_data() const;
 
+    bool   cuda_graph_events_enable(bool enable);
+    size_t cuda_graph_events_drain(std::vector<llama_cuda_graph_event> & events, uint64_t * dropped);
+
     llama_memory_breakdown memory_breakdown() const;
     llama_memory_primary_occupancy memory_primary_occupancy() const;
     llama_memory_primary_distribution memory_primary_distribution() const;
@@ -624,6 +627,20 @@ private:
     void *              abort_callback_data = nullptr;
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
+
+    // CUDA graph telemetry, see llama_cuda_graph_event
+    std::vector<std::pair<ggml_backend_t, ggml_backend_cuda_graph_events_drain_t>> cuda_graph_drain_fns;
+    bool     cuda_graph_events_enabled = false;
+    bool     cuda_graph_ubatch_reused = false;
+    uint32_t cuda_graph_ubatch_tokens = 0;
+    uint32_t cuda_graph_ubatch_seqs = 0;
+    std::vector<llama_cuda_graph_event> cuda_graph_events;  // ready to drain
+    std::vector<llama_cuda_graph_event> cuda_graph_pending; // current ubatch, awaiting dispatch_success
+    uint64_t cuda_graph_events_dropped = 0;
+
+    void cuda_graph_events_collect(std::vector<llama_cuda_graph_event> & dst, bool in_ubatch);
+    void cuda_graph_events_ubatch_begin();
+    void cuda_graph_events_ubatch_success(uint64_t physical_step, uint32_t physical_microbatch);
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;

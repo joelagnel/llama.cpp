@@ -1420,6 +1420,9 @@ void llama_context::dispatch_pre_ubatch() {
 void llama_context::dispatch_success(uint32_t physical_microbatch) {
     const uint64_t physical_step = ++dispatch_physical_step;
     const int64_t dispatch_monotonic_us = ggml_time_us();
+    if (cuda_graph_events_enabled) {
+        cuda_graph_events_ubatch_success(physical_step, physical_microbatch);
+    }
     if (dispatch_first_physical_step == 0) {
         dispatch_first_physical_step = physical_step;
     }
@@ -2117,7 +2120,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const bool graph_reused = !graph_reuse_disable && res->can_reuse(gparams);
+    cuda_graph_ubatch_reused = graph_reused;
+    cuda_graph_ubatch_tokens = ubatch.n_tokens;
+    cuda_graph_ubatch_seqs   = ubatch.n_seqs_unq;
+
+    if (graph_reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2163,7 +2171,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (cuda_graph_events_enabled) {
+        cuda_graph_events_ubatch_begin();
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (cuda_graph_events_enabled) {
+        cuda_graph_events_collect(cuda_graph_pending, true);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -4553,6 +4567,92 @@ llama_ubatch_stats llama_context::ubatch_stats_get_data() const {
     return ubatch_stats;
 }
 
+bool llama_context::cuda_graph_events_enable(bool enable) {
+    cuda_graph_drain_fns.clear();
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg) {
+            continue;
+        }
+        auto enable_fn = (ggml_backend_cuda_graph_events_enable_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_events_enable");
+        auto drain_fn  = (ggml_backend_cuda_graph_events_drain_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_events_drain");
+        if (enable_fn && drain_fn) {
+            enable_fn(backend.get(), enable);
+            // discard events recorded before this transition
+            ggml_cuda_graph_event discard[64];
+            while (drain_fn(backend.get(), discard, 64, nullptr) == 64) {
+            }
+            cuda_graph_drain_fns.emplace_back(backend.get(), drain_fn);
+        }
+    }
+    cuda_graph_events_enabled = enable && !cuda_graph_drain_fns.empty();
+    cuda_graph_events.clear();
+    cuda_graph_pending.clear();
+    cuda_graph_events_dropped = 0;
+    return !cuda_graph_drain_fns.empty();
+}
+
+void llama_context::cuda_graph_events_collect(std::vector<llama_cuda_graph_event> & dst, bool in_ubatch) {
+    static constexpr size_t max_pending = 65536;
+    for (const auto & [backend, drain_fn] : cuda_graph_drain_fns) {
+        ggml_cuda_graph_event buf[64];
+        size_t n;
+        do {
+            uint64_t dropped = 0;
+            n = drain_fn(backend, buf, 64, &dropped);
+            cuda_graph_events_dropped += dropped;
+            for (size_t i = 0; i < n; i++) {
+                if (cuda_graph_events.size() + cuda_graph_pending.size() >= max_pending) {
+                    cuda_graph_events_dropped++;
+                    continue;
+                }
+                llama_cuda_graph_event event;
+                event.graph = buf[i];
+                if (in_ubatch) {
+                    event.in_ubatch          = true;
+                    event.logical_call       = dispatch_logical_call;
+                    event.ubatch_tokens      = cuda_graph_ubatch_tokens;
+                    event.ubatch_seqs        = cuda_graph_ubatch_seqs;
+                    event.encode             = dispatch_operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE;
+                    event.llama_graph_reused = cuda_graph_ubatch_reused;
+                }
+                dst.push_back(event);
+            }
+        } while (n == 64);
+    }
+}
+
+void llama_context::cuda_graph_events_ubatch_begin() {
+    // events of a ubatch that never reached dispatch_success are lost
+    cuda_graph_events_dropped += cuda_graph_pending.size();
+    cuda_graph_pending.clear();
+    // anything recorded since the last ubatch ran outside one (e.g. a K-shift)
+    cuda_graph_events_collect(cuda_graph_events, false);
+}
+
+void llama_context::cuda_graph_events_ubatch_success(uint64_t physical_step, uint32_t physical_microbatch) {
+    for (auto & event : cuda_graph_pending) {
+        event.physical_step       = physical_step;
+        event.physical_microbatch = physical_microbatch;
+        cuda_graph_events.push_back(event);
+    }
+    cuda_graph_pending.clear();
+}
+
+size_t llama_context::cuda_graph_events_drain(std::vector<llama_cuda_graph_event> & events, uint64_t * dropped) {
+    if (cuda_graph_events_enabled) {
+        cuda_graph_events_ubatch_begin();
+    }
+    events.clear();
+    events.swap(cuda_graph_events);
+    if (dropped) {
+        *dropped = cuda_graph_events_dropped;
+    }
+    cuda_graph_events_dropped = 0;
+    return events.size();
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -5588,6 +5688,21 @@ const std::array<uint32_t, LLAMA_UBATCH_HISTOGRAM_BUCKET_COUNT> & llama_ubatch_h
 
 llama_ubatch_stats llama_get_ubatch_stats(const struct llama_context * ctx) {
     return ctx ? ctx->ubatch_stats_get_data() : llama_ubatch_stats {};
+}
+
+bool llama_set_cuda_graph_events(struct llama_context * ctx, bool enable) {
+    return ctx && ctx->cuda_graph_events_enable(enable);
+}
+
+size_t llama_drain_cuda_graph_events(struct llama_context * ctx, std::vector<llama_cuda_graph_event> & events, uint64_t * dropped) {
+    if (!ctx) {
+        events.clear();
+        if (dropped) {
+            *dropped = 0;
+        }
+        return 0;
+    }
+    return ctx->cuda_graph_events_drain(events, dropped);
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

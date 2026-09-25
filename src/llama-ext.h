@@ -5,6 +5,7 @@
 // try as much as possible to not include this header in the rest of the codebase
 
 #include "llama.h"
+#include "ggml-cuda.h"
 
 #include <array>
 #include <cstdint>
@@ -121,6 +122,30 @@ struct llama_ubatch_stats {
 
 LLAMA_API const std::array<uint32_t, LLAMA_UBATCH_HISTOGRAM_BUCKET_COUNT> & llama_ubatch_histogram_bounds();
 LLAMA_API llama_ubatch_stats llama_get_ubatch_stats(const struct llama_context * ctx);
+
+// CUDA graph lifecycle events: one per CUDA backend graph compute call (see
+// ggml_cuda_graph_event), tagged with the physical micro-batch that ran it.
+// physical_step and physical_microbatch match the dispatch coordinates of the
+// context. Graph computes outside a micro-batch (e.g. a KV cache K-shift) have
+// in_ubatch == false and no micro-batch fields; events of a micro-batch that
+// failed are counted as dropped. Enabling returns false when no backend of the
+// context supports it.
+struct llama_cuda_graph_event {
+    ggml_cuda_graph_event graph;
+    uint64_t physical_step = 0;
+    uint64_t logical_call = 0;
+    uint32_t physical_microbatch = 0;
+    uint32_t ubatch_tokens = 0;
+    uint32_t ubatch_seqs = 0;
+    bool     in_ubatch = false;
+    bool     encode = false;
+    bool     llama_graph_reused = false; // llama reused the previous ggml graph without rebuilding it
+};
+
+LLAMA_API bool   llama_set_cuda_graph_events(struct llama_context * ctx, bool enable);
+// Moves pending events into events (replacing its contents) and reports events
+// lost to buffer overflow since the last drain in *dropped.
+LLAMA_API size_t llama_drain_cuda_graph_events(struct llama_context * ctx, std::vector<llama_cuda_graph_event> & events, uint64_t * dropped);
 
 // Optional diagnostic output containing the selected routed expert IDs for the
 // most recent logical llama_decode() batch. Disabled collection changes no graph
