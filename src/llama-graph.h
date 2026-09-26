@@ -922,7 +922,8 @@ public:
 
     void reset();
 
-    void set_inputs(const llama_ubatch * ubatch);
+    // timings, when given, receives the host time of each input by its dynamic type name
+    void set_inputs(const llama_ubatch * ubatch, std::vector<std::pair<const char *, int64_t>> * timings = nullptr);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it

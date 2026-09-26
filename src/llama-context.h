@@ -334,6 +334,11 @@ struct llama_context {
     llama_ubatch_stats ubatch_stats_get_data() const;
 
     bool   cuda_graph_events_enable(bool enable);
+
+    bool   step_profile_enable(bool enable, uint32_t op_sample_interval);
+    size_t step_profile_drain(std::vector<llama_step_profile> & profiles, uint64_t * dropped);
+    void   step_profile_call_begin();
+    void   step_profile_call_end(int32_t status);
     size_t cuda_graph_events_drain(std::vector<llama_cuda_graph_event> & events, uint64_t * dropped);
 
     llama_memory_breakdown memory_breakdown() const;
@@ -641,6 +646,46 @@ private:
     void cuda_graph_events_collect(std::vector<llama_cuda_graph_event> & dst, bool in_ubatch);
     void cuda_graph_events_ubatch_begin();
     void cuda_graph_events_ubatch_success(uint64_t physical_step, uint32_t physical_microbatch);
+
+    // step profiling, see llama_step_profile
+    struct step_profile_backend {
+        ggml_backend_t backend;
+        ggml_backend_cuda_profile_next_t  next;
+        ggml_backend_cuda_profile_drain_t drain;
+    };
+    std::vector<step_profile_backend> step_profile_backends;
+    ggml_backend_cuda_nvtx_push_t step_profile_nvtx_push = nullptr;
+    ggml_backend_cuda_nvtx_pop_t  step_profile_nvtx_pop  = nullptr;
+    bool     step_profile_enabled = false;
+    bool     step_profile_call_open = false; // the last profile belongs to the running call
+    bool     step_profile_in_call = false;   // a llama_decode()/llama_encode() call is running
+    int64_t  step_profile_call_begin_us = 0;
+    uint32_t step_profile_op_interval = 0;
+    std::array<uint32_t, 4> step_profile_class_counts = {};
+    uint64_t step_profile_last_tag = 0;
+    std::vector<llama_step_profile> step_profiles;
+    // set_inputs time per input type name of the running micro-batch
+    std::vector<std::pair<const char *, int64_t>> step_profile_inputs;
+    uint64_t step_profile_dropped = 0;
+    uint32_t step_profile_ranges = 0; // open NVTX ranges
+
+    struct step_profile_scope;
+
+    // the running micro-batch, or nullptr when not profiling
+    llama_step_profile_ubatch * step_profile_ubatch() {
+        return step_profile_call_open && !step_profiles.back().ubatches.empty() ? &step_profiles.back().ubatches.back() : nullptr;
+    }
+    // ggml_time_us() when profiling the running call, otherwise 0
+    int64_t step_profile_now() const {
+        return step_profile_call_open ? ggml_time_us() : 0;
+    }
+    void step_profile_ubatch_begin(const llama_ubatch & ubatch);
+    void step_profile_ubatch_end(int64_t output_begin_us, uint32_t physical_microbatch);
+    void step_profile_add_inputs(llama_step_profile_ubatch & profile);
+    void step_profile_set_tag(uint64_t tag, bool ops);
+    void step_profile_open_call();
+    void step_profile_range_push(const char * name);
+    void step_profile_range_pop();
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;

@@ -22,6 +22,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <typeinfo>
 #include <unordered_set>
 
 // dedup helpers
@@ -1351,9 +1352,13 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
-void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+void llm_graph_result::set_inputs(const llama_ubatch * ubatch, std::vector<std::pair<const char *, int64_t>> * timings) {
     for (auto & input : inputs) {
+        const int64_t t_start_us = timings ? ggml_time_us() : 0;
         input->set_input(ubatch);
+        if (timings) {
+            timings->emplace_back(typeid(*input).name(), ggml_time_us() - t_start_us);
+        }
     }
 }
 

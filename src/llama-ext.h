@@ -147,6 +147,70 @@ LLAMA_API bool   llama_set_cuda_graph_events(struct llama_context * ctx, bool en
 // lost to buffer overflow since the last drain in *dropped.
 LLAMA_API size_t llama_drain_cuda_graph_events(struct llama_context * ctx, std::vector<llama_cuda_graph_event> & events, uint64_t * dropped);
 
+// Step profile: where the time of one llama_decode()/llama_encode() call goes.
+// Host phases are ggml_time_us() durations. On CUDA backends every graph
+// compute call is also timed on the GPU, and a sample of micro-batches times
+// every kernel launch; those micro-batches run eagerly without CUDA graphs.
+struct llama_step_profile_op {
+    std::string name;                 // ggml node name, e.g. "ffn_down-12"
+    std::string kernel;               // CUDA kernel path, e.g. "mmvq"; empty when not recorded
+    int32_t op = 0;                   // enum ggml_op
+    int32_t n_fused = 0;              // further nodes fused into the launch
+    int32_t src0_type = -1;           // enum ggml_type of src[0], -1 when absent
+    std::array<int64_t, 4> ne = {};
+    std::array<int64_t, 4> src0_ne = {};
+    std::array<int64_t, 4> src1_ne = {};
+    float gpu_us = -1.0f;
+};
+
+struct llama_step_profile_ubatch {
+    uint64_t physical_step = 0;       // 0 when the micro-batch failed
+    uint32_t physical_microbatch = 0;
+    uint32_t tokens = 0;
+    uint32_t sequences = 0;
+    uint32_t outputs = 0;
+    bool     graph_reused = false;
+    int64_t  begin_us = 0;
+    int64_t  end_us = 0;
+    int64_t  memory_apply_us = 0;     // memory context apply (KV cell writes)
+    int64_t  graph_build_us = 0;      // graph reset and build, 0 when reused
+    int64_t  graph_alloc_us = 0;      // scheduler split and allocation, 0 when reused
+    int64_t  set_inputs_us = 0;       // host input tensors (masks, positions, ...)
+    std::vector<std::pair<std::string, int64_t>> inputs; // set_inputs time per input type, e.g. "attn_kv"
+    int64_t  compute_us = 0;          // host graph compute: submission on GPU backends
+    int64_t  output_us = 0;           // host output extraction after compute
+    double   gpu_us = -1.0;           // stream span of the micro-batch's graph computes (includes CUDA graph capture and eager launch gaps), -1 without CUDA
+    uint32_t gpu_computes = 0;
+    bool     ops_profiled = false;
+    std::vector<llama_step_profile_op> ops;
+    uint64_t tag = 0;                 // matches CUDA graph computes to the micro-batch
+};
+
+struct llama_step_profile {
+    uint64_t logical_call = 0;
+    bool     encode = false;
+    int32_t  status = 0;              // llama_decode()/llama_encode() return value
+    int64_t  begin_us = 0;
+    int64_t  end_us = 0;
+    int64_t  batch_validate_us = 0;   // batch validation and auto-fill
+    int64_t  memory_update_us = 0;    // pending KV shifts and copies, and cache optimization retries
+    int64_t  batch_split_us = 0;      // micro-batch split and memory slot search
+    int64_t  sync_wait_us = 0;        // host blocked waiting for the GPU after the call: in llama_synchronize() before the next call, and draining
+    bool     gpu_timing = false;      // a CUDA backend timed the computes
+    std::vector<llama_step_profile_ubatch> ubatches;
+};
+
+// Enables step profiles. op_sample_interval > 0 times every kernel launch of
+// the first and then every op_sample_interval-th micro-batch of each token
+// count class (1, 2-16, 17-128, more). Enabling during a call, from the
+// dispatch observer, records the call from its next micro-batch on; phases of
+// that call before the micro-batch are then zero.
+// Returns whether a backend supports GPU timing.
+LLAMA_API bool   llama_set_step_profile(struct llama_context * ctx, bool enable, uint32_t op_sample_interval);
+// Moves completed profiles into profiles (replacing its contents), waiting for
+// their GPU timings, and reports profiles lost to overflow since the last drain.
+LLAMA_API size_t llama_drain_step_profiles(struct llama_context * ctx, std::vector<llama_step_profile> & profiles, uint64_t * dropped);
+
 // Optional diagnostic output containing the selected routed expert IDs for the
 // most recent logical llama_decode() batch. Disabled collection changes no graph
 // outputs and performs no host copy. Enabling it changes graph topology and is

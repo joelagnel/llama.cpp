@@ -13,12 +13,37 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+
+// Times a host phase of the profiled call into dst and marks it with an NVTX
+// range. A null dst, or a call that is not profiled, records nothing.
+struct llama_context::step_profile_scope {
+    llama_context & ctx;
+    int64_t * dst;
+    int64_t t_start_us = 0;
+
+    step_profile_scope(llama_context & ctx, const char * name, int64_t * dst) :
+            ctx(ctx), dst(ctx.step_profile_call_open ? dst : nullptr) {
+        if (this->dst) {
+            ctx.step_profile_range_push(name);
+            t_start_us = ggml_time_us();
+        }
+    }
+
+    ~step_profile_scope() {
+        if (dst) {
+            *dst += ggml_time_us() - t_start_us;
+            ctx.step_profile_range_pop();
+        }
+    }
+};
 
 //
 // llama_context
@@ -720,7 +745,12 @@ void llama_context::synchronize() {
         return;
     }
 
+    // a synchronization inside a call is part of its host time instead
+    const int64_t t_sync_us = step_profile_enabled && !step_profile_in_call && !step_profiles.empty() ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
+    if (t_sync_us != 0) {
+        step_profiles.back().sync_wait_us += ggml_time_us() - t_sync_us;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2107,10 +2137,15 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
+    llama_step_profile_ubatch * profile = step_profile_ubatch();
+
+    if (mctx) {
+        step_profile_scope scope(*this, "memory_apply", profile ? &profile->memory_apply_us : nullptr);
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     auto * res = gf_res_prev.get();
@@ -2124,6 +2159,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     cuda_graph_ubatch_reused = graph_reused;
     cuda_graph_ubatch_tokens = ubatch.n_tokens;
     cuda_graph_ubatch_seqs   = ubatch.n_seqs_unq;
+    if (profile) {
+        profile->graph_reused = graph_reused;
+    }
 
     if (graph_reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -2137,16 +2175,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        res->reset();
+        {
+            step_profile_scope scope(*this, "graph_build", profile ? &profile->graph_build_us : nullptr);
 
-        ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            res->reset();
 
-        //const auto t_start_us = ggml_time_us();
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+            gf = model.build_graph(gparams);
+        }
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -2154,6 +2192,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        step_profile_scope scope(*this, "graph_alloc", profile ? &profile->graph_alloc_us : nullptr);
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2163,18 +2202,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
+        step_profile_scope scope(*this, "set_inputs", profile ? &profile->set_inputs_us : nullptr);
+        step_profile_inputs.clear();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        res->set_inputs(&ubatch, profile ? &step_profile_inputs : nullptr);
+    }
+    if (profile) {
+        step_profile_add_inputs(*profile);
     }
 
     if (cuda_graph_events_enabled) {
         cuda_graph_events_ubatch_begin();
     }
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    ggml_status status;
+    {
+        step_profile_scope scope(*this, "compute", profile ? &profile->compute_us : nullptr);
+        status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    }
     if (cuda_graph_events_enabled) {
         cuda_graph_events_collect(cuda_graph_pending, true);
     }
@@ -2210,18 +2255,25 @@ int llama_context::encode(const llama_batch & batch_inp) {
     std::unique_ptr<void, decltype(dispatch_guard_deleter)> dispatch_guard(this, dispatch_guard_deleter);
 
     // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd,
-            cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true,
-            dispatch_moe_routing_source_indices)) {
-        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
-        return -1;
+    {
+        step_profile_scope scope(*this, "batch_validate", step_profile_call_open ? &step_profiles.back().batch_validate_us : nullptr);
+        if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd,
+                cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true,
+                dispatch_moe_routing_source_indices)) {
+            LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+            return -1;
+        }
     }
 
     const uint32_t n_tokens = balloc->get_n_tokens();
 
     // [TAG_NO_CACHE_PAD]
     // TODO: add new split mode where we pad the input sequences so that ubatch.equal_seqs == true
-    const llama_ubatch ubatch = balloc->split_simple(n_tokens);
+    llama_ubatch ubatch;
+    {
+        step_profile_scope scope(*this, "batch_split", step_profile_call_open ? &step_profiles.back().batch_split_us : nullptr);
+        ubatch = balloc->split_simple(n_tokens);
+    }
 
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
@@ -2260,8 +2312,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/12181#issuecomment-2730451223
     cparams.causal_attn = false;
 
+    step_profile_ubatch_begin(ubatch);
+
     ggml_status status;
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    const int64_t t_output_us = step_profile_now();
 
     cparams.causal_attn = causal_attn_org;
 
@@ -2359,6 +2414,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         extract_moe_routing(res, 0, ubatch);
     }
     dispatch_success(0);
+    step_profile_ubatch_end(t_output_us, 0);
 
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
@@ -2504,10 +2560,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all,
-            dispatch_moe_routing_source_indices)) {
-        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
-        return -1;
+    {
+        step_profile_scope scope(*this, "batch_validate", step_profile_call_open ? &step_profiles.back().batch_validate_us : nullptr);
+        if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all,
+                dispatch_moe_routing_source_indices)) {
+            LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+            return -1;
+        }
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
@@ -2543,12 +2602,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    {
+        step_profile_scope scope(*this, "memory_update", step_profile_call_open ? &step_profiles.back().memory_update_us : nullptr);
+        memory_update(false);
+    }
 
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        {
+            step_profile_scope scope(*this, "batch_split", step_profile_call_open ? &step_profiles.back().batch_split_us : nullptr);
+            mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        }
         if (!mctx) {
             return -2;
         }
@@ -2568,7 +2633,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
-                        if (memory_update(true)) {
+                        bool optimized;
+                        {
+                            step_profile_scope scope(*this, "memory_update", step_profile_call_open ? &step_profiles.back().memory_update_us : nullptr);
+                            optimized = memory_update(true);
+                        }
+                        if (optimized) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;
@@ -2628,9 +2698,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
+        step_profile_ubatch_begin(ubatch);
+
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const int64_t t_output_us = step_profile_now();
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2804,6 +2877,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        step_profile_ubatch_end(t_output_us, physical_ubatch_index);
         ++physical_ubatch_index;
     } while (mctx->next());
 
@@ -4653,6 +4727,219 @@ size_t llama_context::cuda_graph_events_drain(std::vector<llama_cuda_graph_event
     return events.size();
 }
 
+bool llama_context::step_profile_enable(bool enable, uint32_t op_sample_interval) {
+    while (step_profile_ranges > 0) {
+        step_profile_range_pop();
+    }
+    step_profile_backends.clear();
+    step_profile_nvtx_push = nullptr;
+    step_profile_nvtx_pop  = nullptr;
+    bool supported = false;
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg) {
+            continue;
+        }
+        auto enable_fn = (ggml_backend_cuda_profile_enable_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_profile_enable");
+        auto next_fn   = (ggml_backend_cuda_profile_next_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_profile_next");
+        auto drain_fn  = (ggml_backend_cuda_profile_drain_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_profile_drain");
+        if (!enable_fn || !next_fn || !drain_fn) {
+            continue;
+        }
+        supported = true;
+        enable_fn(backend.get(), enable);
+        if (enable) {
+            step_profile_backends.push_back({ backend.get(), next_fn, drain_fn });
+            step_profile_nvtx_push = (ggml_backend_cuda_nvtx_push_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nvtx_push");
+            step_profile_nvtx_pop  = (ggml_backend_cuda_nvtx_pop_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nvtx_pop");
+        }
+    }
+    step_profile_enabled     = enable;
+    step_profile_call_open   = false;
+    step_profile_op_interval = op_sample_interval;
+    step_profile_class_counts = {};
+    step_profile_last_tag    = 0;
+    step_profiles.clear();
+    step_profile_dropped     = 0;
+    // enabled by the dispatch observer before a micro-batch: record the running call from here
+    if (enable && step_profile_in_call) {
+        step_profile_open_call();
+    }
+    return supported;
+}
+
+void llama_context::step_profile_range_push(const char * name) {
+    if (step_profile_nvtx_push && step_profile_nvtx_pop) {
+        step_profile_nvtx_push(name);
+        ++step_profile_ranges;
+    }
+}
+
+void llama_context::step_profile_range_pop() {
+    if (step_profile_nvtx_pop && step_profile_ranges > 0) {
+        step_profile_nvtx_pop();
+        --step_profile_ranges;
+    }
+}
+
+void llama_context::step_profile_set_tag(uint64_t tag, bool ops) {
+    for (const auto & backend : step_profile_backends) {
+        backend.next(backend.backend, tag, ops);
+    }
+}
+
+void llama_context::step_profile_call_begin() {
+    step_profile_in_call = true;
+    step_profile_call_begin_us = ggml_time_us();
+    if (step_profile_enabled) {
+        step_profile_open_call();
+    }
+}
+
+void llama_context::step_profile_open_call() {
+    static constexpr size_t max_pending = 4096;
+    if (step_profiles.size() >= max_pending) {
+        step_profiles.erase(step_profiles.begin());
+        step_profile_dropped++;
+    }
+    llama_step_profile profile;
+    profile.begin_us   = step_profile_call_begin_us;
+    profile.gpu_timing = !step_profile_backends.empty();
+    step_profiles.push_back(std::move(profile));
+    step_profile_call_open = true;
+    step_profile_range_push("llama_decode");
+}
+
+void llama_context::step_profile_call_end(int32_t status) {
+    step_profile_in_call = false;
+    if (!step_profile_call_open) {
+        return;
+    }
+    llama_step_profile & profile = step_profiles.back();
+    if (!profile.ubatches.empty() && profile.ubatches.back().end_us == 0) {
+        // the micro-batch failed before reaching its end
+        profile.ubatches.back().end_us = ggml_time_us();
+        step_profile_set_tag(0, false);
+        step_profile_range_pop();
+    }
+    profile.status       = status;
+    profile.end_us       = ggml_time_us();
+    profile.logical_call = dispatch_logical_call;
+    profile.encode       = dispatch_operation == LLAMA_CONTEXT_DISPATCH_OPERATION_ENCODE;
+    step_profile_call_open = false;
+    step_profile_range_pop();
+}
+
+void llama_context::step_profile_ubatch_begin(const llama_ubatch & ubatch) {
+    if (!step_profile_call_open) {
+        return;
+    }
+    llama_step_profile_ubatch profile;
+    profile.begin_us  = ggml_time_us();
+    profile.tokens    = ubatch.n_tokens;
+    profile.sequences = ubatch.n_seqs_unq;
+    profile.outputs   = (uint32_t) n_outputs;
+    profile.tag       = ++step_profile_last_tag;
+    const size_t token_class = ubatch.n_tokens <= 1 ? 0 : ubatch.n_tokens <= 16 ? 1 : ubatch.n_tokens <= 128 ? 2 : 3;
+    profile.ops_profiled = !step_profile_backends.empty() && step_profile_op_interval > 0 &&
+        step_profile_class_counts[token_class]++ % step_profile_op_interval == 0;
+    step_profile_set_tag(profile.tag, profile.ops_profiled);
+    char name[64];
+    snprintf(name, sizeof(name), "ubatch %u tokens%s", ubatch.n_tokens, profile.ops_profiled ? " (ops timed)" : "");
+    step_profile_range_push(name);
+    step_profiles.back().ubatches.push_back(std::move(profile));
+}
+
+void llama_context::step_profile_ubatch_end(int64_t output_begin_us, uint32_t physical_microbatch) {
+    llama_step_profile_ubatch * profile = step_profile_ubatch();
+    if (!profile) {
+        return;
+    }
+    profile->end_us              = ggml_time_us();
+    profile->output_us           = profile->end_us - output_begin_us;
+    profile->physical_step       = dispatch_physical_step;
+    profile->physical_microbatch = physical_microbatch;
+    // graph computes outside a micro-batch, such as a KV cache shift, are not attributed
+    step_profile_set_tag(0, false);
+    step_profile_range_pop();
+}
+
+void llama_context::step_profile_add_inputs(llama_step_profile_ubatch & profile) {
+    static const std::string prefix = "llm_graph_input_";
+    for (const auto & [type_name, us] : step_profile_inputs) {
+        // dynamic type names are compiler specific, e.g. "22llm_graph_input_embd"
+        std::string name = type_name;
+        const size_t pos = name.find(prefix);
+        if (pos != std::string::npos) {
+            name = name.substr(pos + prefix.size());
+        }
+        auto it = std::find_if(profile.inputs.begin(), profile.inputs.end(), [&](const auto & input) { return input.first == name; });
+        if (it == profile.inputs.end()) {
+            profile.inputs.emplace_back(name, us);
+        } else {
+            it->second += us;
+        }
+    }
+}
+
+size_t llama_context::step_profile_drain(std::vector<llama_step_profile> & profiles, uint64_t * dropped) {
+    profiles.clear();
+    const size_t n = step_profiles.size() - (step_profile_call_open ? 1 : 0);
+    std::unordered_map<uint64_t, llama_step_profile_ubatch *> ubatches;
+    for (size_t i = 0; i < n; i++) {
+        for (auto & ubatch : step_profiles[i].ubatches) {
+            ubatches[ubatch.tag] = &ubatch;
+        }
+    }
+    // Draining waits for the GPU work of calls nobody synchronized, such as
+    // prompt chunks without outputs; that wait is the last call's sync wait.
+    const int64_t t_drain_us = ggml_time_us();
+    for (const auto & backend : step_profile_backends) {
+        ggml_cuda_profile_compute computes[64];
+        size_t n_computes;
+        do {
+            n_computes = backend.drain(backend.backend, computes, 64, nullptr);
+            for (size_t i = 0; i < n_computes; i++) {
+                const ggml_cuda_profile_compute & compute = computes[i];
+                auto it = ubatches.find(compute.tag);
+                if (compute.tag == 0 || it == ubatches.end()) {
+                    continue;
+                }
+                llama_step_profile_ubatch & ubatch = *it->second;
+                if (compute.gpu_us >= 0.0f) {
+                    ubatch.gpu_us = std::max(ubatch.gpu_us, 0.0) + compute.gpu_us;
+                }
+                ubatch.gpu_computes++;
+                for (int32_t j = 0; j < compute.n_ops; j++) {
+                    const ggml_cuda_profile_op & src = compute.ops[j];
+                    llama_step_profile_op op;
+                    op.name      = src.name;
+                    op.kernel    = src.kernel ? src.kernel : "";
+                    op.op        = src.op;
+                    op.n_fused   = src.n_fused;
+                    op.src0_type = src.src0_type;
+                    op.gpu_us    = src.gpu_us;
+                    std::copy(std::begin(src.ne),      std::end(src.ne),      op.ne.begin());
+                    std::copy(std::begin(src.src0_ne), std::end(src.src0_ne), op.src0_ne.begin());
+                    std::copy(std::begin(src.src1_ne), std::end(src.src1_ne), op.src1_ne.begin());
+                    ubatch.ops.push_back(std::move(op));
+                }
+            }
+        } while (n_computes == 64);
+    }
+    if (n > 0 && !step_profile_backends.empty()) {
+        step_profiles[n - 1].sync_wait_us += ggml_time_us() - t_drain_us;
+    }
+    profiles.assign(std::make_move_iterator(step_profiles.begin()), std::make_move_iterator(step_profiles.begin() + n));
+    step_profiles.erase(step_profiles.begin(), step_profiles.begin() + n);
+    if (dropped) {
+        *dropped = step_profile_dropped;
+    }
+    step_profile_dropped = 0;
+    return profiles.size();
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -5548,10 +5835,25 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
 
 ///
 
+// Ends the step profile of a call also when it throws.
+struct llama_step_profile_call_guard {
+    llama_context & ctx;
+    int32_t status = -3;
+
+    explicit llama_step_profile_call_guard(llama_context & ctx) : ctx(ctx) {
+        ctx.step_profile_call_begin();
+    }
+
+    ~llama_step_profile_call_guard() {
+        ctx.step_profile_call_end(status);
+    }
+};
+
 int32_t llama_encode(
         llama_context * ctx,
           llama_batch   batch) {
-    const int ret = ctx->encode(batch);
+    llama_step_profile_call_guard guard(*ctx);
+    const int ret = guard.status = ctx->encode(batch);
     if (ret != 0) {
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
     }
@@ -5562,7 +5864,8 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
-    const int ret = ctx->decode(batch);
+    llama_step_profile_call_guard guard(*ctx);
+    const int ret = guard.status = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
@@ -5703,6 +6006,21 @@ size_t llama_drain_cuda_graph_events(struct llama_context * ctx, std::vector<lla
         return 0;
     }
     return ctx->cuda_graph_events_drain(events, dropped);
+}
+
+bool llama_set_step_profile(struct llama_context * ctx, bool enable, uint32_t op_sample_interval) {
+    return ctx && ctx->step_profile_enable(enable, op_sample_interval);
+}
+
+size_t llama_drain_step_profiles(struct llama_context * ctx, std::vector<llama_step_profile> & profiles, uint64_t * dropped) {
+    if (!ctx) {
+        profiles.clear();
+        if (dropped) {
+            *dropped = 0;
+        }
+        return 0;
+    }
+    return ctx->step_profile_drain(profiles, dropped);
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
