@@ -639,6 +639,8 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
+    ctx.profile_kernel = "mmvf";
+
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);
     const size_t ts_dst  = ggml_type_size(dst->type);

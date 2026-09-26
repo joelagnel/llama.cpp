@@ -1260,6 +1260,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
+    ctx.profile_kernel = "mmvq";
     cudaStream_t stream = ctx.stream();
 
     const size_t ts_src0 = ggml_type_size(src0->type);

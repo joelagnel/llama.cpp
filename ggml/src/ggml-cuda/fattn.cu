@@ -573,12 +573,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
+            ctx.profile_kernel = "fattn_tile";
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
+            ctx.profile_kernel = "fattn_vec";
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
+            ctx.profile_kernel = "fattn_mma_f16";
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }

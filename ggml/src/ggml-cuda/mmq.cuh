@@ -1425,6 +1425,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
+        ctx.profile_kernel = "mmq";
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
@@ -1444,6 +1445,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+    ctx.profile_kernel = fixup_needed ? "mmq_stream_k_fixup" : "mmq_stream_k";
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);

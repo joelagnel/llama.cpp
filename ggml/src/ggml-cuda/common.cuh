@@ -1464,6 +1464,25 @@ struct ggml_backend_cuda_context {
         return n;
     }
 
+    // Step profiling, see ggml_cuda_profile_compute in ggml-cuda.h. Computes
+    // and drains run on the thread that owns the backend.
+    struct profile_record {
+        ggml_cuda_profile_compute compute = {};
+        cudaEvent_t begin = nullptr;
+        cudaEvent_t end = nullptr;
+        std::vector<ggml_cuda_profile_op> ops;
+        std::vector<cudaEvent_t> op_events; // begin and end per op
+    };
+    static constexpr size_t profile_capacity = 4096;
+    std::atomic<bool> profile_enabled = false;
+    uint64_t profile_tag = 0;
+    bool profile_ops = false;
+    const char * profile_kernel = nullptr; // kernel path of the node being launched
+    std::vector<profile_record> profile_pending;
+    std::vector<profile_record> profile_drained; // owns the ops returned by the last drain
+    std::vector<cudaEvent_t> profile_free_events;
+    uint64_t profile_dropped = 0;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

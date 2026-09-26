@@ -11,6 +11,7 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
 }
 
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    ctx.profile_kernel = "mmf";
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
