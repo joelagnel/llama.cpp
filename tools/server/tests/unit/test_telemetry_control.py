@@ -19,6 +19,7 @@ CONTROL_NAMES = (
     "kv_pressure_detail",
     "native_gpu_gpm",
     "cuda_graph_detail",
+    "step_profile",
 )
 CUDA_GRAPH_EVENT_KINDS = {
     "eager_disabled",
@@ -641,6 +642,79 @@ def test_dense_model_never_emits_moe_routing_chunks():
         )
         assert events.status_code == 200
         assert not any(event["event"] == "moe_routing_chunk" for event in events.body["events"])
+    finally:
+        server.stop()
+
+
+def test_step_profile_attributes_each_decode_to_host_phases():
+    server = _controlled_server()
+    server.start()
+    try:
+        capabilities = server.make_request("GET", "/telemetry/v1/capabilities", headers=AUTH)
+        feature = capabilities.body["telemetry_control"]["features"]["step_profile"]
+        assert feature["effective_from"] == "next_microbatch"
+        assert feature["dependencies"] == []
+
+        control = server.make_request(
+            "POST",
+            "/props",
+            data={"telemetry_control": {"step_profile": True}},
+            headers=AUTH,
+        )
+        assert control.status_code == 200
+        assert control.body["telemetry_control"]["effective"]["step_profile"] is True
+        applicability = control.body["telemetry_control"]["applicability"]["step_profile"]
+        assert applicability["applicable"] is True
+        gpu_op_timing = applicability["gpu_op_timing"]
+
+        completion = server.make_request(
+            "POST",
+            "/completion",
+            data={"prompt": "where does the time of a decode step go", "n_predict": 4},
+            headers=AUTH,
+        )
+        assert completion.status_code == 200
+        profiles = [event for event in _telemetry_events(server) if event["event"] == "step_profile"]
+        target = [profile for profile in profiles if profile["physical_context"] == "target"]
+        # one prompt decode and three single-token decodes
+        assert len(target) >= 4
+        assert any(profile["post_decode_us"] is not None for profile in target)
+        for profile in target:
+            assert profile["operation"] == "decode" and profile["status"] == 0
+            assert profile["begin_monotonic_us"] <= profile["end_monotonic_us"]
+            host_us = profile["end_monotonic_us"] - profile["begin_monotonic_us"]
+            for phase in ("batch_validate_us", "memory_update_us", "batch_split_us", "sync_wait_us"):
+                assert profile[phase] >= 0
+            assert profile["gpu_timing"] == ("cuda" if gpu_op_timing else "none")
+            assert [slot["trace_id"] for slot in profile["batch_slots"]] == [completion.body["trace_id"]]
+            assert profile["ubatches"]
+            phases_us = profile["batch_validate_us"] + profile["memory_update_us"] + profile["batch_split_us"]
+            for ubatch in profile["ubatches"]:
+                assert ubatch["physical_step"] > 0 and ubatch["tokens"] > 0
+                assert profile["begin_monotonic_us"] <= ubatch["begin_monotonic_us"] <= ubatch["end_monotonic_us"] <= profile["end_monotonic_us"]
+                parts = ("graph_build_us", "graph_alloc_us", "set_inputs_us", "compute_us", "output_us")
+                assert all(ubatch[part] >= 0 for part in parts)
+                assert sum(ubatch[part] for part in parts) <= ubatch["end_monotonic_us"] - ubatch["begin_monotonic_us"]
+                phases_us += ubatch["end_monotonic_us"] - ubatch["begin_monotonic_us"]
+                if ubatch["graph_reused"]:
+                    assert ubatch["graph_build_us"] == 0 and ubatch["graph_alloc_us"] == 0
+                inputs = ubatch["inputs"]
+                assert "embd" in inputs and "attn_kv" in inputs
+                assert all(not name[0].isdigit() and not name.startswith("llm_graph_input") for name in inputs)
+                assert sum(inputs.values()) <= ubatch["set_inputs_us"]
+                if not gpu_op_timing:
+                    assert ubatch["gpu_us"] is None and ubatch["ops_profiled"] is False and ubatch["ops"] == []
+            assert phases_us <= host_us
+        prompt = target[0]["ubatches"][0]
+        assert prompt["tokens"] > 1
+        # a graph is built for the prompt, then reused by later single-token decodes
+        assert prompt["graph_reused"] is False and prompt["graph_build_us"] > 0
+        assert any(ubatch["graph_reused"] for profile in target[2:] for ubatch in profile["ubatches"])
+
+        server.make_request("POST", "/props", data={"telemetry_control": {}}, headers=AUTH)
+        count = len(profiles)
+        server.make_request("POST", "/completion", data={"prompt": "off", "n_predict": 2}, headers=AUTH)
+        assert len([event for event in _telemetry_events(server) if event["event"] == "step_profile"]) == count
     finally:
         server.stop()
 

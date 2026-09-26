@@ -39,7 +39,7 @@ struct llama_context_dispatch_decision {
     uint32_t version = 0;
     uint64_t props_generation = 0;
     uint64_t microbatch_generation = 0;
-    uint8_t effective_flags = 0;
+    uint16_t effective_flags = 0;
     bool native_moe_routing_enabled = false;
     bool moe_routing_applicable = false;
     bool report_control_boundary = false;
