@@ -72,7 +72,7 @@ class LiLiCorrDraftModel(DFlashModel):
         try:
             if target_arch == "NemotronHForCausalLM":
                 self.is_moe = "num_experts_per_tok" in target_text_config
-            target_cls.set_vocab(self)
+            target_cls.set_vocab(self)  # ty: ignore[unresolved-attribute]
         finally:
             self.dir_model = original_dir
         self.gguf_writer.add_mask_token_id(self.hparams["dflash_config"]["mask_token_id"])
