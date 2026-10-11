@@ -1736,7 +1736,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
-    if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
+    const bool dflash_encoder_batch = model.arch == LLM_ARCH_DFLASH && model.lilicorr_pass_hidden_proj &&
+            batch_inp.tokens[0].id == LLAMA_TOKEN_NULL && batch_inp.n_embd == batch_inp.n_embd_inp_enc;
+    if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp && !dflash_encoder_batch) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
                 __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
         return -1;

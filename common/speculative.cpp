@@ -999,6 +999,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
 
+    bool    is_lilicorr    = false;
+    int32_t lilicorr_top_k = 0;
+    std::vector<std::map<llama_pos, std::vector<float>>> lilicorr_embd;
+
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
@@ -1053,6 +1057,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
+        char lilicorr_meta[32] = {};
+        is_lilicorr = llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", lilicorr_meta, sizeof(lilicorr_meta)) >= 0;
+        if (is_lilicorr) {
+            if (n_embd_dec != n_embd_tgt) {
+                throw std::runtime_error("LiLiCorr draft and target hidden sizes must match");
+            }
+            lilicorr_top_k = std::atoi(lilicorr_meta);
+            lilicorr_embd.resize(n_seq);
+        }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         if (is_dspark && this->params.p_min > 0.0f) {
@@ -1098,7 +1111,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !is_dflash2) {
+        if (this->params.backend_sampling && !is_dflash2 && !is_lilicorr) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1118,7 +1131,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
     }
 
@@ -1233,6 +1246,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
+                if (is_lilicorr) {
+                    const float * projected = llama_get_embeddings_nextn(ctx_dft);
+                    if (projected) {
+                        auto & rows = lilicorr_embd[seq_id];
+                        rows.erase(rows.lower_bound(batch_inject.tokens[0].pos[0]), rows.end());
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            const float * row = projected + (size_t) i * n_embd_dec;
+                            rows[batch_inject.tokens[i].pos[0]].assign(row, row + n_embd_dec);
+                        }
+                        while (rows.size() > (size_t) block_size + 1) {
+                            rows.erase(rows.begin());
+                        }
+                    }
+                }
             }
         }
 
@@ -1261,11 +1288,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n_draft = params.n_max;
 
-            const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            const std::vector<float> * anchor = nullptr;
+            if (is_lilicorr) {
+                const auto it = lilicorr_embd[seq_id].find(dp.pos0 - 1);
+                if (it == lilicorr_embd[seq_id].end()) {
+                    LOG_WRN("%s: LiLiCorr target anchor is unavailable for sequence %d\n", __func__, seq_id);
+                    continue;
+                }
+                anchor = &it->second;
+            }
+            const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2);
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2);
+                if (anchor) {
+                    if (!batch.set_embd(idx, { anchor->data(), 1, (size_t) n_embd_dec })) {
+                        GGML_ABORT("LiLiCorr: failed to attach target anchor embedding");
+                    }
+                }
             }
         }
 
@@ -1317,6 +1358,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.push_back((llama_token) row[predecessor]);
                 }
 
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                }
+                continue;
+            }
+
+            if (is_lilicorr) {
+                const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT(lattice && "LiLiCorr head produced no lattice");
+                int32_t previous = 0;
+                for (int32_t s = 0; s < std::min(block_size - 1, params.n_max); ++s) {
+                    const float * row = lattice + (size_t) (beg + s + 1) * n_embd_dec;
+                    const float * scores = row + lilicorr_top_k + (s ? previous * lilicorr_top_k : 0);
+                    const int32_t rank = (int32_t) std::distance(scores, std::max_element(scores, scores + lilicorr_top_k));
+                    if (params.p_min > 0.0f) {
+                        float sum = 0.0f;
+                        for (int32_t k = 0; k < lilicorr_top_k; ++k) {
+                            sum += std::exp(scores[k] - scores[rank]);
+                        }
+                        if (1.0f / sum < params.p_min) {
+                            break;
+                        }
+                    }
+                    const llama_token id = (llama_token) row[rank];
+                    common_sampler_accept(smpl, id, true);
+                    result.push_back(id);
+                    previous = rank;
+                }
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
                 }

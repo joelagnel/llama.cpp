@@ -182,6 +182,51 @@ class TensorNameMap:
         MODEL_TENSOR.A_QF_PROJ_LINEAR: (
             "projector.linear",
         ),
+        MODEL_TENSOR.LILICORR_TOKEN_PROJ: (
+            "model.lilicorr.token_proj",
+        ),
+        MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ: (
+            "model.lilicorr.pass_hidden_proj",
+        ),
+        MODEL_TENSOR.LILICORR_FEATURE_NORM: (
+            "model.lilicorr.feature_norm",
+        ),
+        MODEL_TENSOR.LILICORR_FEATURE_MLP_1: (
+            "model.lilicorr.feature_mlp.up_proj",
+        ),
+        MODEL_TENSOR.LILICORR_FEATURE_MLP_3: (
+            "model.lilicorr.feature_mlp.down_proj",
+        ),
+        MODEL_TENSOR.LILICORR_SLOT_EMBD: (
+            "model.lilicorr.slot_embedding",
+        ),
+        MODEL_TENSOR.LILICORR_RANK_EMBD: (
+            "model.lilicorr.rank_embedding",
+        ),
+        MODEL_TENSOR.LILICORR_ATTN_BIAS: (
+            "model.lilicorr.attention_bias",
+        ),
+        MODEL_TENSOR.LILICORR_CONTEXT_PROJ: (
+            "model.lilicorr.context_proj",
+        ),
+        MODEL_TENSOR.LILICORR_OUTPUT_NORM: (
+            "model.lilicorr.output_norm",
+        ),
+        MODEL_TENSOR.LILICORR_ANCHOR_NORM: (
+            "model.lilicorr.anchor_norm",
+        ),
+        MODEL_TENSOR.LILICORR_FACTOR_INPUT_PROJ: (
+            "model.lilicorr.factor_input_proj",
+        ),
+        MODEL_TENSOR.LILICORR_OUT_HEAD: (
+            "model.lilicorr.out_head",
+        ),
+        MODEL_TENSOR.LILICORR_IN_HEAD: (
+            "model.lilicorr.in_head",
+        ),
+        MODEL_TENSOR.LILICORR_ANCHOR_OUT_HEAD: (
+            "model.lilicorr.anchor_out_head",
+        ),
     }
 
     block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
@@ -1531,6 +1576,24 @@ class TensorNameMap:
 
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN: (
             "model.candidate_selector.hidden_projection",
+        ),
+        MODEL_TENSOR.LILICORR_ATTN_NORM: (
+            "model.lilicorr.layers.{bid}.attn_norm",
+        ),
+        MODEL_TENSOR.LILICORR_MLP_NORM: (
+            "model.lilicorr.layers.{bid}.mlp_norm",
+        ),
+        MODEL_TENSOR.LILICORR_ATTN_IN_PROJ: (
+            "model.lilicorr.layers.{bid}.attn.in_proj",
+        ),
+        MODEL_TENSOR.LILICORR_ATTN_OUT_PROJ: (
+            "model.lilicorr.layers.{bid}.attn.out_proj",
+        ),
+        MODEL_TENSOR.LILICORR_MLP_0: (
+            "model.lilicorr.layers.{bid}.mlp.up_proj",
+        ),
+        MODEL_TENSOR.LILICORR_MLP_2: (
+            "model.lilicorr.layers.{bid}.mlp.down_proj",
         ),
 
         MODEL_TENSOR.CLS: (
