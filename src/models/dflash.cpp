@@ -734,22 +734,17 @@ static void build_lilicorr_scores(llm_graph_context & g, const llama_model & mod
         ggml_tensor * attn_input = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), weights.lilicorr_attn_norm);
         ggml_tensor * qkv = ggml_add(ctx0, g.build_lora_mm(weights.lilicorr_attn_in_proj, attn_input), weights.lilicorr_attn_in_proj_b);
         qkv = ggml_reshape_3d(ctx0, qkv, 3 * hidden, nodes, n_blocks);
-        ggml_tensor * joined = nullptr;
-        for (int64_t h = 0; h < heads; ++h) {
-            ggml_tensor * q = ggml_cont(ctx0, ggml_view_3d(ctx0, qkv, head_dim, nodes, n_blocks,
-                    qkv->nb[1], qkv->nb[2], h * head_dim * qkv->nb[0]));
-            ggml_tensor * k = ggml_cont(ctx0, ggml_view_3d(ctx0, qkv, head_dim, nodes, n_blocks,
-                    qkv->nb[1], qkv->nb[2], (hidden + h * head_dim) * qkv->nb[0]));
-            ggml_tensor * v = ggml_cont(ctx0, ggml_view_3d(ctx0, qkv, head_dim, nodes, n_blocks,
-                    qkv->nb[1], qkv->nb[2], (2 * hidden + h * head_dim) * qkv->nb[0]));
-            ggml_tensor * bias = ggml_view_2d(ctx0, model.lilicorr_attention_bias, nodes, nodes,
-                    model.lilicorr_attention_bias->nb[1], h * model.lilicorr_attention_bias->nb[2]);
-            ggml_tensor * attn = ggml_soft_max_ext(ctx0, ggml_mul_mat(ctx0, k, q), bias,
-                    1.0f / std::sqrt(static_cast<float>(head_dim)), 0.0f);
-            ggml_tensor * y = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, v)), attn);
-            joined = joined ? ggml_concat(ctx0, joined, y, 0) : y;
-        }
-        ggml_tensor * attn_output = ggml_reshape_2d(ctx0, joined, hidden, nodes * n_blocks);
+        ggml_tensor * q = ggml_cont(ctx0, ggml_view_4d(ctx0, qkv, head_dim, nodes, heads, n_blocks,
+                qkv->nb[1], head_dim * qkv->nb[0], qkv->nb[2], 0));
+        ggml_tensor * k = ggml_cont(ctx0, ggml_view_4d(ctx0, qkv, head_dim, nodes, heads, n_blocks,
+                qkv->nb[1], head_dim * qkv->nb[0], qkv->nb[2], hidden * qkv->nb[0]));
+        ggml_tensor * v = ggml_view_4d(ctx0, qkv, head_dim, nodes, heads, n_blocks,
+                qkv->nb[1], head_dim * qkv->nb[0], qkv->nb[2], 2 * hidden * qkv->nb[0]);
+        ggml_tensor * attn = ggml_soft_max_ext(ctx0, ggml_mul_mat(ctx0, k, q), model.lilicorr_attention_bias,
+                1.0f / std::sqrt(static_cast<float>(head_dim)), 0.0f);
+        ggml_tensor * joined = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, v)), attn);
+        joined = ggml_permute(ctx0, joined, 0, 2, 1, 3);
+        ggml_tensor * attn_output = ggml_cont_2d(ctx0, joined, hidden, nodes * n_blocks);
         attn_output = ggml_add(ctx0, g.build_lora_mm(weights.lilicorr_attn_out_proj, attn_output, weights.lilicorr_attn_out_proj_s), weights.lilicorr_attn_out_proj_b);
         x = ggml_add(ctx0, x, attn_output);
         ggml_tensor * mlp = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), weights.lilicorr_mlp_norm);
