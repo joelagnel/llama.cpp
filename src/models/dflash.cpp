@@ -796,9 +796,7 @@ static void build_lilicorr_scores(llm_graph_context & g, const llama_model & mod
 
     ggml_tensor * row = ggml_concat(ctx0, ggml_cast(ctx0, ggml_reshape_3d(ctx0, cand_run, top_k, slots, n_blocks),
             GGML_TYPE_F32), scores, 0);
-    row = ggml_pad(ctx0, row, n_embd - row_used, 0, 0, 0);
-    ggml_tensor * packed = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, 1, n_blocks), 0.0f);
-    packed = ggml_concat(ctx0, packed, row, 1);
+    ggml_tensor * packed = ggml_pad_ext(ctx0, row, 0, n_embd - row_used, 1, 0, 0, 0, 0, 0);
     packed = ggml_reshape_2d(ctx0, packed, n_embd, n_tokens);
     g.cb(packed, "lilicorr_lattice", -1);
     res->t_h_nextn = packed;
