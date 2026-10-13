@@ -1289,7 +1289,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n_draft = params.n_max;
 
             const std::vector<float> * anchor = nullptr;
-               if (const auto it = lilicorr_embd[seq_id].find(dp.pos0 - 1); it != lilicorr_embd[seq_id].end()) {
+            if (is_lilicorr) {
+                if (const auto it = lilicorr_embd[seq_id].find(dp.pos0 - 1); it != lilicorr_embd[seq_id].end()) {
                     anchor = &it->second;
                 } else {
                     LOG_WRN("%s: LiLiCorr target anchor is unavailable for sequence %d\n", __func__, seq_id);
