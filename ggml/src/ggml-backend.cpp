@@ -2018,6 +2018,16 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+bool ggml_backend_sched_share_buffer(ggml_backend_sched_t dst, ggml_backend_sched_t src, ggml_backend_t backend) {
+    GGML_ASSERT(dst->n_backends == src->n_backends);
+    GGML_ASSERT(dst->n_copies == 1 && src->n_copies == 1);
+    for (int i = 0; i < dst->n_backends; i++) {
+        GGML_ASSERT(dst->backends[i] == src->backends[i]);
+        GGML_ASSERT(dst->bufts[i] == src->bufts[i]);
+    }
+    return ggml_gallocr_share_buffer(dst->galloc, src->galloc, ggml_backend_sched_backend_id(src, backend));
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;

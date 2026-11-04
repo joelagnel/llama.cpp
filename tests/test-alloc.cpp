@@ -1099,6 +1099,83 @@ static void test_buft_get_alloc_size_n_does_not_allocate() {
     GGML_ASSERT(x[1]->data == nullptr);
 }
 
+static void test_shared_buffers() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    auto owner_graph = make_context();
+    auto * x = make_input_with_size(owner_graph.ctx, 64);
+    auto owner = allocate_graph(owner_graph.graph, ggml_dup(owner_graph.ctx, x), &backend.buffer_type);
+    const size_t reserved = backend.context->allocated_total();
+
+    auto graph = make_context();
+    auto * input = make_input_with_size(graph.ctx, 16);
+    auto * output = ggml_dup(graph.ctx, input);
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph.graph, output);
+    ggml_gallocr_ptr borrower(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_ptr empty(ggml_gallocr_new(&backend.buffer_type));
+    GGML_ASSERT(!ggml_gallocr_share_buffer(borrower.get(), empty.get(), 0));
+    x->buffer->iface.reset = [](ggml_backend_buffer_t) {};
+    GGML_ASSERT(!ggml_gallocr_share_buffer(borrower.get(), owner.get(), 0));
+    x->buffer->iface.reset = nullptr;
+    GGML_ASSERT(ggml_gallocr_share_buffer(borrower.get(), owner.get(), 0));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(borrower.get(), graph.graph));
+    GGML_ASSERT(backend.context->allocated_total() == reserved);
+    GGML_ASSERT(input->buffer == x->buffer);
+
+    ggml_gallocr_ptr peer(ggml_gallocr_new(&backend.buffer_type));
+    GGML_ASSERT(ggml_gallocr_share_buffer(peer.get(), owner.get(), 0));
+    auto * shared_buffer = input->buffer;
+    auto * shared_data = input->data;
+
+    auto larger = make_context();
+    auto * large_input = make_input_with_size(larger.ctx, 256);
+    ggml_build_forward_expand(larger.graph, ggml_dup(larger.ctx, large_input));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(owner.get(), larger.graph));
+    GGML_ASSERT(large_input->buffer != shared_buffer);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(borrower.get(), graph.graph));
+    GGML_ASSERT(input->buffer == shared_buffer && input->data == shared_data);
+
+    owner.reset();
+    GGML_ASSERT(backend.context->allocated_total() == reserved);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(borrower.get(), graph.graph));
+    GGML_ASSERT(input->buffer == shared_buffer && input->data == shared_data);
+
+    auto largest = make_context();
+    auto * largest_input = make_input_with_size(largest.ctx, 1024);
+    ggml_build_forward_expand(largest.graph, ggml_dup(largest.ctx, largest_input));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(borrower.get(), largest.graph));
+    GGML_ASSERT(largest_input->buffer != shared_buffer);
+    const size_t detached = ggml_gallocr_get_buffer_size(borrower.get(), 0);
+    GGML_ASSERT(backend.context->allocated_total() == reserved + detached);
+    peer.reset();
+    GGML_ASSERT(backend.context->allocated_total() == detached);
+    borrower.reset();
+    GGML_ASSERT(backend.context->buffers.empty());
+}
+
+static void test_shared_buffer_aliases() {
+    dummy_backend backend = dummy_backend_init(64);
+    ggml_backend_buffer_type_t bufts[] = { &backend.buffer_type, &backend.buffer_type };
+    ggml_gallocr_ptr owner(ggml_gallocr_new_n(bufts, 2));
+    ggml_gallocr_ptr borrower(ggml_gallocr_new_n(bufts, 2));
+    auto graph = make_context();
+    auto * x = make_input_with_size(graph.ctx, 64);
+    ggml_build_forward_expand(graph.graph, ggml_dup(graph.ctx, x));
+    const int nodes[] = { 1 };
+    const int leafs[] = { 0 };
+    GGML_ASSERT(ggml_gallocr_reserve_n(owner.get(), graph.graph, nodes, leafs));
+    const size_t reserved = backend.context->allocated_total();
+    GGML_ASSERT(backend.context->buffers.size() == 2);
+    GGML_ASSERT(ggml_gallocr_share_buffer(borrower.get(), owner.get(), 1));
+    owner.reset();
+    GGML_ASSERT(backend.context->allocated_total() == reserved);
+    GGML_ASSERT(ggml_gallocr_reserve_n(borrower.get(), graph.graph, nodes, leafs));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(borrower.get(), graph.graph));
+    GGML_ASSERT(backend.context->allocated_total() == reserved);
+    borrower.reset();
+    GGML_ASSERT(backend.context->buffers.empty());
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1107,6 +1184,8 @@ static void run(const char * name, void (*f)()) {
 }
 
 int main() {
+    run("test_shared_buffers", test_shared_buffers);
+    run("test_shared_buffer_aliases", test_shared_buffer_aliases);
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
     run("test_tensor_larger_than_max_size", test_tensor_larger_than_max_size);

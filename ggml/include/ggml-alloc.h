@@ -49,6 +49,10 @@ GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
 GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
 
+// Share a reservation with a fresh allocator. Growth detaches it without moving the other allocator's tensors.
+// Callers must serialize access to the shared storage and consume outputs before overwriting it.
+GGML_API bool ggml_gallocr_share_buffer(ggml_gallocr_t dst, ggml_gallocr_t src, int buffer_id);
+
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations
 // not strictly required for single buffer usage: ggml_gallocr_alloc_graph will reallocate the buffers automatically if needed

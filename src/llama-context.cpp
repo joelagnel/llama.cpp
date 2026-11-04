@@ -754,6 +754,8 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     gf_res_prev.clear();
+    sched_small.clear();
+    sched_active = nullptr;
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_invalidate();
 
@@ -1548,6 +1550,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             sched_small.push_back({ key, ggml_backend_sched_ptr(ggml_backend_sched_new(
                     backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), graph_max_nodes(8), false, cparams.op_offload)), nullptr });
             ss = &sched_small.back();
+            // Share only single-GPU CUDA storage; host inputs stay private.
+            if (!cparams.pipeline_parallel && backend_ptrs.size() == 2 &&
+                    strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ptrs[0]))), "CUDA") == 0) {
+                ggml_backend_sched_share_buffer(ss->sched.get(), sched.get(), backend_ptrs[0]);
+            }
             ggml_backend_sched_set_copy_callback(ss->sched.get(), sched_copy_experts, this);
             ggml_backend_sched_set_realloc_callback(ss->sched.get(), sched_graph_realloc, this);
         }

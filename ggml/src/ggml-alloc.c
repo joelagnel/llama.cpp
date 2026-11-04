@@ -396,11 +396,12 @@ static size_t ggml_dyn_tallocr_max_size(struct ggml_dyn_tallocr * alloc, int chu
 // virtual buffer with contiguous memory range, split into multiple backend buffers (chunks)
 
 struct vbuffer {
+    size_t refs;
     ggml_backend_buffer_t chunks[GGML_VBUFFER_MAX_CHUNKS];
 };
 
 static void ggml_vbuffer_free(struct vbuffer * buf) {
-    if (buf == NULL) {
+    if (buf == NULL || --buf->refs != 0) {
         return;
     }
     for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS; ++i) {
@@ -426,6 +427,7 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
     if (buf == NULL) {
         return NULL;
     }
+    buf->refs = 1;
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
@@ -533,6 +535,32 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
 ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
+}
+
+bool ggml_gallocr_share_buffer(ggml_gallocr_t dst, ggml_gallocr_t src, int buffer_id) {
+    GGML_ASSERT(dst != src && dst->n_buffers == src->n_buffers);
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < src->n_buffers);
+    GGML_ASSERT(dst->n_nodes == 0 && dst->n_leafs == 0);
+    GGML_ASSERT(dst->bufts[buffer_id] == src->bufts[buffer_id]);
+
+    struct vbuffer * buf = src->buffers[buffer_id];
+    if (buf == NULL) {
+        return false;
+    }
+    // A reset callback could invalidate tensors in the other allocator.
+    for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS && buf->chunks[i]; i++) {
+        if (buf->chunks[i]->iface.reset != NULL) {
+            return false;
+        }
+    }
+    for (int i = 0; i < dst->n_buffers; i++) {
+        if (dst->bufts[i] == dst->bufts[buffer_id]) {
+            GGML_ASSERT(dst->buffers[i] == NULL);
+            dst->buffers[i] = buf;
+        }
+    }
+    buf->refs++;
+    return true;
 }
 
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
